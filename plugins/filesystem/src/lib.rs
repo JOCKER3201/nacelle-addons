@@ -4,7 +4,7 @@
 
 use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_NONE,
-    ACTION_OPEN_DIR, ACTION_OPEN_FILE,
+    ACTION_OPEN_DIR, ACTION_OPEN_FILE, MASK_QUAD_ADD,
 };
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -69,6 +69,21 @@ fn token(api: &HostApi, name: &str) -> u32 {
     (api.theme_token)(name.as_ptr(), name.len() as u32)
 }
 
+/// The WORD an enum token currently resolves to — ABI 6's appended
+/// `theme_enum_word` entry. Init-time like `theme_token`: asked when the
+/// ids are resolved, cached for the epoch, never in the draw loop. An
+/// empty answer — a host whose table ends before the entry, a missing
+/// token, a token with no word — degrades exactly like MISSING: the
+/// caller draws by its pre-word guess.
+fn enum_word(api: &HostApi, ctx: *mut c_void, id: u32) -> String {
+    if !api.has_theme_enum_word() || id == u32::MAX {
+        return String::new();
+    }
+    let mut buf = [0u8; 64];
+    let n = (api.theme_enum_word)(ctx, id, buf.as_mut_ptr(), buf.len() as u32) as usize;
+    String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
+}
+
 /// Token ids this widget draws from, resolved by NAME once per epoch.
 ///
 /// No header tokens: `FILESYSTEM` and the cwd moved to the HOST's title
@@ -80,6 +95,15 @@ struct ThemeIds {
     // ink
     error: u32,          // severity.critical.text — an I/O error is critical, not chrome
     error_on: u32,       // severity.critical.on — legible ink over that bed
+    error_fill: u32,     // severity.critical.fill — the hollow pill's bed
+    error_edge: u32,     // severity.critical.edge — the hollow pill's ring
+    badge_border: u32,   // badge.border — the hollow pill's ring width
+    /// Whether the error pill draws solid — `severity.critical.badge_style`'s
+    /// WORD (ABI 6), no longer this arrangement's guess. `hatched` and
+    /// `hollow_dashed` degrade to hollow, as the host's `ui::badge` degrades
+    /// them; no word at all (an old host, a missing token) keeps the
+    /// pre-word guess: solid, the master's own critical style.
+    error_solid: bool,
     glyph_dir: u32,      // component.file.glyph_dir
     glyph_file: u32,     // component.file.glyph_file
     glyph_link: u32,     // component.file.glyph_link
@@ -125,14 +149,47 @@ struct ThemeIds {
     tile_class: u32,
     /// The scroll thumb's row in the same matrix.
     thumb_class: u32,
+    // The glow class the tile's ring wears — `shape.icon_tile.glow`, the
+    // master's `@glow.icon_idle` (image 1's bordered launcher squares).
+    // The reference crosses ABI 6 as its WORD ("glow.icon_idle"), and the
+    // class's own tokens are resolved from it, so which class glows is the
+    // theme's sentence, never this file's. No word — the `none` other
+    // presets carry, an old host — resolves nothing and the ring stays bare.
+    tile_glow_enabled: u32, // glow.<class>.enabled
+    tile_glow_radius: u32,  // glow.<class>.radius
+    tile_glow_alpha: u32,   // glow.<class>.alpha
+    glow_scale: u32,        // glow.alpha_scale — the one global knob
 }
 
 impl ThemeIds {
-    fn resolve(api: &HostApi, epoch: u32) -> ThemeIds {
+    fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ThemeIds {
+        let style_word = enum_word(api, ctx, token(api, "severity.critical.badge_style"));
+        // Without `mask_quad` the glow cannot be drawn at all, so the
+        // class is not even asked for — the same degrade as `none`.
+        let glow_class = if api.has_mask_quad() {
+            enum_word(api, ctx, token(api, "shape.icon_tile.glow"))
+        } else {
+            String::new()
+        };
+        let g = |suffix: &str| {
+            if glow_class.is_empty() {
+                u32::MAX
+            } else {
+                token(api, &format!("{glow_class}.{suffix}"))
+            }
+        };
         ThemeIds {
             epoch,
             error: token(api, "severity.critical.text"),
             error_on: token(api, "severity.critical.on"),
+            error_fill: token(api, "severity.critical.fill"),
+            error_edge: token(api, "severity.critical.edge"),
+            badge_border: token(api, "badge.border"),
+            error_solid: style_word.is_empty() || style_word == "solid",
+            tile_glow_enabled: g("enabled"),
+            tile_glow_radius: g("radius"),
+            tile_glow_alpha: g("alpha"),
+            glow_scale: token(api, "glow.alpha_scale"),
             glyph_dir: token(api, "component.file.glyph_dir"),
             glyph_file: token(api, "component.file.glyph_file"),
             glyph_link: token(api, "component.file.glyph_link"),
@@ -184,6 +241,16 @@ impl ThemeIds {
 struct Look {
     error: ColorC,
     error_on: ColorC,
+    error_fill: ColorC,
+    error_edge: ColorC,
+    badge_border: f32,
+    error_solid: bool,
+    /// The tile ring's glow, mirrored from `object::window::panel_edge_glow`:
+    /// the class flag, the reach, and `alpha * glow.alpha_scale` already
+    /// folded. Off — the default, every class disabled — is three zeros.
+    glow_on: bool,
+    glow_radius: f32,
+    glow_alpha: f32,
     glyph_dir: ColorC,
     glyph_file: ColorC,
     glyph_link: ColorC,
@@ -243,6 +310,14 @@ impl Look {
         Look {
             error: RAW_INK,
             error_on: RAW_INK,
+            error_fill: NO_COLOR,
+            error_edge: RAW_INK,
+            badge_border: 0.0,
+            // The raw pill keeps the pre-word arrangement: solid.
+            error_solid: true,
+            glow_on: false,
+            glow_radius: 0.0,
+            glow_alpha: 0.0,
             glyph_dir: RAW_INK,
             glyph_file: RAW_INK,
             glyph_link: RAW_INK,
@@ -288,6 +363,10 @@ impl Look {
     fn read(api: &HostApi, ctx: *mut c_void, t: &ThemeIds) -> Look {
         let col = |id| (api.theme_color)(ctx, id);
         let px = |id| (api.theme_px)(ctx, id);
+        // A colour used as a BED — the hollow pill's interior. Missing,
+        // it answers the engine's raw near-black rather than the mid grey.
+        let bed = |id| (api.theme_bed)(ctx, id);
+        let flag = |id| (api.theme_flag)(ctx, id) != 0;
         // A rung of a class's ladder, whole. A missing class answers the
         // matrix's own raw rung, so no fallback lives here.
         let rung = |class: u32, state: u32| {
@@ -313,6 +392,13 @@ impl Look {
         Look {
             error: col(t.error),
             error_on: col(t.error_on),
+            error_fill: bed(t.error_fill),
+            error_edge: col(t.error_edge),
+            badge_border: px(t.badge_border),
+            error_solid: t.error_solid,
+            glow_on: flag(t.tile_glow_enabled),
+            glow_radius: px(t.tile_glow_radius),
+            glow_alpha: (px(t.tile_glow_alpha) * px(t.glow_scale)).clamp(0.0, 1.0),
             glyph_dir: col(t.glyph_dir),
             glyph_file: col(t.glyph_file),
             glyph_link: col(t.glyph_link),
@@ -538,7 +624,7 @@ impl Filesystem {
         }
         let epoch = (api.theme_epoch)(ctx);
         if self.theme.as_ref().map(|t| t.epoch) != Some(epoch) {
-            self.theme = Some(ThemeIds::resolve(api, epoch));
+            self.theme = Some(ThemeIds::resolve(api, ctx, epoch));
         }
         match &self.theme {
             Some(t) => Look::read(api, ctx, t),
@@ -559,10 +645,14 @@ impl Filesystem {
 
         if let Some(err) = &self.error {
             // An I/O error is critical, not chrome: an alert.banner
-            // string in a solid severity.critical pill (u2 §2.10). Solid
-            // is this arrangement's choice — matching the master's
-            // critical.badge_style; the style words cannot be told apart
-            // across the ABI's enum indices.
+            // string in a severity.critical pill (u2 §2.10). Its
+            // arrangement is the severity's own badge_style WORD (ABI 6)
+            // — the solid the master declares for critical, or the
+            // hollow a theme may say instead — no longer this file's
+            // guess; the indices alone could not tell the styles apart.
+            // Solid mirrors `ui::badge`: the text colour is the bed and
+            // `on` is the ink. Hollow is the ring-and-bed form the
+            // SCROLL pill wears.
             let text = recase(look.banner_case, err.clone());
             let bpx = look.banner_px;
             let track = bpx * look.banner_tracking;
@@ -575,12 +665,24 @@ impl Filesystem {
                 w,
                 h,
             };
+            let (fill, ink) = if look.error_solid {
+                (look.error, look.error_on)
+            } else {
+                (look.error_fill, look.error)
+            };
             let cut = look.badge_corner;
             if cut > 0.0 {
-                chamfer_fill(api, ctx, pill, cut.min(h / 2.0), look.error);
+                let cut = cut.min(h / 2.0);
+                chamfer_fill(api, ctx, pill, cut, fill);
+                if !look.error_solid && look.badge_border > 0.0 {
+                    chamfer_frame(api, ctx, pill, cut, look.badge_border, look.error_edge);
+                }
             } else {
                 // `pill` is a negative sentinel until R5 lands: square.
-                (api.rect)(ctx, pill, look.error);
+                (api.rect)(ctx, pill, fill);
+                if !look.error_solid && look.badge_border > 0.0 {
+                    (api.rect_outline)(ctx, pill, look.badge_border, look.error_edge);
+                }
             }
             draw_text(
                 api,
@@ -589,7 +691,7 @@ impl Filesystem {
                 pill.x + pill.w / 2.0,
                 pill.y + (pill.h - bpx * look.banner_leading) / 2.0,
                 &text,
-                look.error_on,
+                ink,
                 track,
                 1,
             );
@@ -694,6 +796,17 @@ impl Filesystem {
                     chamfer_frame(api, ctx, cell, cut, rung.edge_width, rung.edge);
                 } else {
                     (api.rect_outline)(ctx, cell, rung.edge_width, rung.edge);
+                }
+                // Right after the stroke, the ring's glow — the class
+                // `shape.icon_tile.glow` names (ABI 6), tinted with the
+                // edge's own resolved colour (the `element` rule, the
+                // only arm the host honours either) at the class's alpha
+                // times `glow.alpha_scale`: `panel_edge_glow`'s recipe,
+                // reached over `mask_quad`. Every shipped default is
+                // off; a theme opts a class in and the squares light up.
+                if look.glow_on && look.glow_radius > 0.0 && look.glow_alpha > 0.0 {
+                    let c = ColorC { a: look.glow_alpha, ..rung.edge };
+                    chamfer_glow(api, ctx, cell, cut, look.glow_radius, c);
                 }
             }
 
@@ -837,11 +950,12 @@ fn chamfer_fill(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, c: ColorC) 
     (api.quad)(ctx, bottom.as_ptr(), c);
 }
 
-/// The ring of the same shape — a closed polyline through eight points.
-fn chamfer_frame(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, t: f32, c: ColorC) {
+/// The eight points of the chamfer outline, flat, clockwise from the
+/// top-left cut. `cut = 0` collapses each corner's pair to one point.
+fn octagon(r: RectC, cut: f32) -> [f32; 16] {
     let cut = cut.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
     let (x, y, w, h) = (r.x, r.y, r.w, r.h);
-    let pts: [f32; 16] = [
+    [
         x + cut, y,
         x + w - cut, y,
         x + w, y + cut,
@@ -850,8 +964,53 @@ fn chamfer_frame(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, t: f32, c:
         x + cut, y + h,
         x, y + h - cut,
         x, y + cut,
-    ];
+    ]
+}
+
+/// The ring of the same shape — a closed polyline through eight points.
+fn chamfer_frame(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, t: f32, c: ColorC) {
+    let pts = octagon(r, cut);
     (api.polyline)(ctx, pts.as_ptr(), 8, t, c, true);
+}
+
+/// Glow OUTSIDE the ring — `DrawList::glow_ring`'s technique reached
+/// through ABI 6's `mask_quad`: the outline extruded outward by `radius`,
+/// one additive quad per segment, the soft disk's 2-texel cardinal strip
+/// laid across the extrusion (u pinned to the stretchable middle, v from
+/// the disk's peak on the path to the sprite's zero at the outer rim).
+/// The outer path is the chamfer octagon of the grown rect with the cut
+/// grown by the same radius — `Corner::inset(-radius)`, as the host grows
+/// it — so a chamfered corner glows along its diagonal and a square
+/// corner (`cut = 0`: the inner pair collapses to one point) mitres.
+/// Nothing is emitted inside the path, so the glow never tints the fill.
+fn chamfer_glow(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, radius: f32, c: ColorC) {
+    if !(radius > 0.0) || c.a <= 0.0 {
+        return;
+    }
+    let inner = octagon(r, cut);
+    let grown = RectC {
+        x: r.x - radius,
+        y: r.y - radius,
+        w: r.w + 2.0 * radius,
+        h: r.h + 2.0 * radius,
+    };
+    let outer = octagon(grown, cut + radius);
+    // The strip's profile in the SPRITE's own space: the mask-band
+    // contract's 31..33 stretchable middle (r1 §4.2), the same numbers
+    // `glow_ring` maps into the atlas band.
+    const SU: f32 = 32.0 / 64.0;
+    const VI: f32 = 31.0 / 64.0;
+    let uv: [f32; 8] = [SU, VI, SU, VI, SU, 0.0, SU, 0.0];
+    for i in 0..8 {
+        let j = (i + 1) % 8;
+        let pts: [f32; 8] = [
+            inner[2 * i], inner[2 * i + 1],
+            inner[2 * j], inner[2 * j + 1],
+            outer[2 * j], outer[2 * j + 1],
+            outer[2 * i], outer[2 * i + 1],
+        ];
+        (api.mask_quad)(ctx, pts.as_ptr(), uv.as_ptr(), c, MASK_QUAD_ADD);
+    }
 }
 
 fn draw_folder_icon(api: &HostApi, ctx: *mut c_void, r: Rect, c: ColorC, stroke: f32) {

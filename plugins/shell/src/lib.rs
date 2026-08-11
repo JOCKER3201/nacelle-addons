@@ -133,12 +133,36 @@ struct Tokens {
     info_fill: u32,    // severity.info.fill — the hollow pill's bed
     info_edge: u32,    // severity.info.edge
     info_text: u32,    // severity.info.text
+    info_on: u32,      // severity.info.on — the solid pill's ink
+    /// Whether the pill draws solid — `severity.info.badge_style`'s WORD
+    /// (ABI 6), no longer this arrangement's guess. Solid mirrors
+    /// `ui::badge`: the severity's text colour becomes the bed and `on`
+    /// the ink. `hatched` and `hollow_dashed` degrade to hollow, as the
+    /// host degrades them; no word at all (an old host, a missing token)
+    /// keeps the pre-word guess: hollow, the master's own info style.
+    pill_solid: bool,
+}
+
+/// The WORD an enum token currently resolves to — ABI 6's appended
+/// `theme_enum_word` entry. Init-time like `theme_token`: asked when the
+/// ids are resolved, cached for the epoch, never in the draw loop. An
+/// empty answer — a host whose table ends before the entry, a missing
+/// token, a token with no word — degrades exactly like MISSING: the
+/// caller draws by its pre-word guess.
+fn enum_word(api: &HostApi, ctx: *mut c_void, id: u32) -> String {
+    if !api.has_theme_enum_word() || id == u32::MAX {
+        return String::new();
+    }
+    let mut buf = [0u8; 64];
+    let n = (api.theme_enum_word)(ctx, id, buf.as_mut_ptr(), buf.len() as u32) as usize;
+    String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
 }
 
 impl Tokens {
     fn resolve(api: &HostApi, ctx: *mut c_void) -> Tokens {
         let t = |n: &str| (api.theme_token)(n.as_ptr(), n.len() as u32);
         let c = |n: &str| (api.theme_class)(n.as_ptr(), n.len() as u32);
+        let style = enum_word(api, ctx, t("severity.info.badge_style"));
         Tokens {
             epoch: (api.theme_epoch)(ctx),
             tab_class: c("tab"),
@@ -177,6 +201,8 @@ impl Tokens {
             info_fill: t("severity.info.fill"),
             info_edge: t("severity.info.edge"),
             info_text: t("severity.info.text"),
+            info_on: t("severity.info.on"),
+            pill_solid: style == "solid",
         }
     }
 }
@@ -609,10 +635,12 @@ impl Shell {
         //
         // A badge with severity.info (u2 §2.9): the same string as ever,
         // in the corner it has always held, now inside the status pill of
-        // images 1, 3 and 4. Hollow is this arrangement's choice — the
-        // ring and text in the severity's own colours over its fill bed —
-        // matching the master's info.badge_style; solid-vs-hollow words
-        // cannot be told apart across the ABI's enum indices.
+        // images 1, 3 and 4. Its arrangement is the severity's own
+        // badge_style WORD (ABI 6) — the hollow the master declares for
+        // info (ring and text in the severity's colours over its fill
+        // bed), or the solid a theme may say instead — no longer this
+        // file's guess; the indices alone could not tell the styles
+        // apart.
         if view.view_offset > 0 {
             let px_s = px(ids.badge_size).max(px(ids.badge_min));
             let lead = px(ids.badge_lead).max(1.0);
@@ -633,15 +661,20 @@ impl Shell {
             };
             let cut = px(ids.badge_corner);
             let border = px(ids.badge_border);
+            let (fill, text_c) = if ids.pill_solid {
+                (ink(ids.info_text), ink(ids.info_on))
+            } else {
+                (bed(ids.info_fill), ink(ids.info_text))
+            };
             if cut > 0.0 {
-                chamfer_fill(api, ctx, pill, cut.min(h / 2.0), bed(ids.info_fill));
-                if border > 0.0 {
+                chamfer_fill(api, ctx, pill, cut.min(h / 2.0), fill);
+                if !ids.pill_solid && border > 0.0 {
                     chamfer(api, ctx, pill, cut.min(h / 2.0), border, ink(ids.info_edge));
                 }
             } else {
                 // `pill` is a negative sentinel until R5 lands: square it is.
-                (api.rect)(ctx, pill, bed(ids.info_fill));
-                if border > 0.0 {
+                (api.rect)(ctx, pill, fill);
+                if !ids.pill_solid && border > 0.0 {
                     (api.rect_outline)(ctx, pill, border, ink(ids.info_edge));
                 }
             }
@@ -653,7 +686,7 @@ impl Shell {
                 pill.x + pill.w / 2.0,
                 pill.y + (pill.h - px_s * lead) / 2.0,
                 &text,
-                ink(ids.info_text),
+                text_c,
                 track,
                 1,
             );
