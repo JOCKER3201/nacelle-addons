@@ -18,7 +18,7 @@
 
 use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_EXIT,
-    ACTION_NONE, ACTION_OPEN_SETTINGS,
+    ACTION_NONE, ACTION_OPEN_SETTINGS, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
 };
 use std::borrow::Cow;
 use std::ffi::c_void;
@@ -92,6 +92,18 @@ fn t_px(api: &HostApi, ctx: *mut c_void, id: u32) -> f32 {
 }
 
 /// The index of a token's word in its declared enum list, or the raw 0.
+/// The word an enum token resolves to right now. The host owns the
+/// vocabulary — an interned index means nothing across this edge — so
+/// the plugin asks for the WORD and matches on it.
+fn t_word(api: &HostApi, ctx: *mut c_void, id: u32) -> String {
+    if !api.has_theme_enum_word() {
+        return String::new();
+    }
+    let mut buf = [0u8; 32];
+    let n = (api.theme_enum_word)(ctx, id, buf.as_mut_ptr(), buf.len() as u32) as usize;
+    String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
+}
+
 fn t_enum(api: &HostApi, ctx: *mut c_void, id: u32) -> u32 {
     if abi5(api) {
         (api.theme_enum)(ctx, id)
@@ -146,6 +158,8 @@ struct ThemeIds {
     button_w_frac: u32,
     button_align: u32,
     skew: u32,
+    corner: u32,
+    corner_style: u32,
     type_size: u32,
     type_min_px: u32,
     type_leading: u32,
@@ -187,6 +201,8 @@ fn resolve_ids(api: &HostApi, epoch: u32) -> ThemeIds {
         // The same shear every parallelogram button reads, so the two
         // objects called "button" finally agree on a shape.
         skew: tok("button.skew"),
+        corner: tok("button.corner"),
+        corner_style: tok("button.corner_style"),
         type_size: tok("type.button.size"),
         type_min_px: tok("type.button.min_px"),
         type_leading: tok("type.button.leading"),
@@ -339,17 +355,34 @@ extern "C" fn draw(
             style.text = t_col(api, ctx, t.crit_text);
             style.glyph = t_col(api, ctx, t.crit_glyph);
         }
-        // A parallelogram, like every other button in the interface —
-        // and ringed like one, which this widget never was before.
-        let pts = [
-            br.x + skew, br.y,
-            br.x + br.w, br.y,
-            br.x + br.w - skew, br.y + br.h,
-            br.x, br.y + br.h,
-        ];
-        (api.quad)(ctx, pts.as_ptr(), style.fill);
-        if style.edge_width > 0.0 {
-            (api.polyline)(ctx, pts.as_ptr(), 4, style.edge_width, style.edge, true);
+        // The same shape as every other button in the interface, which
+        // since the corners moved into the theme means the shape of the
+        // FRAMES around it. A host old enough to lack the ring pair
+        // draws the flat quad it always did — visibly plainer, never
+        // wrong.
+        let rc = RectC { x: br.x, y: br.y, w: br.w, h: br.h };
+        if api.has_ring() && skew <= 0.0 {
+            let radius = t_px(api, ctx, t.corner);
+            let cs = match t_word(api, ctx, t.corner_style).as_str() {
+                "round" => CORNER_ROUND,
+                "chamfer" => CORNER_CHAMFER,
+                _ => CORNER_SQUARE,
+            };
+            (api.ring_fill)(ctx, rc, cs, radius, style.fill);
+            if style.edge_width > 0.0 {
+                (api.ring)(ctx, rc, cs, radius, style.edge_width, style.edge);
+            }
+        } else {
+            let pts = [
+                br.x + skew, br.y,
+                br.x + br.w, br.y,
+                br.x + br.w - skew, br.y + br.h,
+                br.x, br.y + br.h,
+            ];
+            (api.quad)(ctx, pts.as_ptr(), style.fill);
+            if style.edge_width > 0.0 {
+                (api.polyline)(ctx, pts.as_ptr(), 4, style.edge_width, style.edge, true);
+            }
         }
 
         let label = cased(LABELS[i], case);
