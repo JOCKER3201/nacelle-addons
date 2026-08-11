@@ -29,9 +29,18 @@ pub const FONT_MONO: u32 = 1;
 // order (idle, hover, press, selected, selected_hover, dragging,
 // disabled). A tile is a container: every one rests on its class's idle
 // rung, the pointed-at one on hover, and the just-clicked one on press.
+//
+// The two `selected` rungs are the categories list's: a row that is
+// steering the launcher grid is the chosen one of a set, persistently,
+// which is the state the matrix's own comment describes as "this one of
+// a set is the chosen one". `selected_hover` exists in the matrix
+// because "chosen AND pointed at" really happens in a list, so it is
+// asked for rather than approximated from the other two.
 pub const STATE_IDLE: u32 = 0;
 pub const STATE_HOVER: u32 = 1;
 pub const STATE_PRESS: u32 = 2;
+pub const STATE_SELECTED: u32 = 3;
+pub const STATE_SELECTED_HOVER: u32 = 4;
 
 /// `filetile.row_justify` declares `pack | fill`; the baked enum is the
 /// word's index in that list.
@@ -583,10 +592,15 @@ pub struct Layout {
     pub step: f32,
 }
 
-/// The grid `count` items make in `area`, and the scroll offset clamped
-/// to it. `scroll` is the caller's own state and is corrected here,
-/// because the clamp depends on arithmetic only this function does.
-pub fn layout(look: &TileLook, area: Rect, count: usize, scroll: &mut f32) -> Layout {
+/// How big one tile is in `area`, and how many fit across it.
+///
+/// The sizing half of [`layout`], on its own because the alphabetical
+/// index ([`crate::sections`]) lays the SAME tiles out down a column
+/// broken by headings: same edge, same columns, a different vertical
+/// program. Two copies of this arithmetic would be two tile sizes that
+/// disagree the moment the panel is resized, which is the same reason
+/// this module exists at all.
+pub fn cells(look: &TileLook, area: Rect) -> (f32, usize) {
     let gap = look.gap;
     let rows_page = look.rows.max(1.0);
     // filetile.cell names the tile edge directly; rows-per-page is
@@ -613,6 +627,15 @@ pub fn layout(look: &TileLook, area: Rect, count: usize, scroll: &mut f32) -> La
         .min(row_cell)
         .min(area.h.max(look.cell_min))
         .max(look.cell_min);
+    (tile, cols)
+}
+
+/// The grid `count` items make in `area`, and the scroll offset clamped
+/// to it. `scroll` is the caller's own state and is corrected here,
+/// because the clamp depends on arithmetic only this function does.
+pub fn layout(look: &TileLook, area: Rect, count: usize, scroll: &mut f32) -> Layout {
+    let gap = look.gap;
+    let (tile, cols) = cells(look, area);
 
     // Scrolling snaps to whole rows — only fully fitting rows are
     // drawn, nothing sticks out of the panel.

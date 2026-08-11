@@ -1,34 +1,51 @@
-//! CATEGORIES panel — the same installed applications as the launcher
-//! grid, entered through the groups their desktop entries put them in.
+//! CATEGORIES panel — the groups this machine's installed applications
+//! fall into, as a list, and nothing else.
+//!
+//! It draws no applications. Clicking a group does not open it here: it
+//! POINTS THE LAUNCHER GRID at it, and the grid next door redraws
+//! showing that group alone. The chosen row stays visibly chosen, on
+//! the state ladder's own `selected` rung, because a list that steers
+//! something else and does not say which row is doing the steering is a
+//! list of dead ends.
+//!
+//! The top row is ALL APPLICATIONS, with the whole menu's count, and it
+//! is what a launcher nobody has clicked yet is on. Choosing it puts
+//! the grid back on the whole menu, where the grid draws its
+//! alphabetical index.
+//!
+//! # How the two widgets reach each other
+//!
+//! Through [`nacelle_widget_appgrid::selection`], and the long comment
+//! at the head of that module is the one worth reading: the host has no
+//! channel between widgets, this is a static cell that works only
+//! because both widgets are linked into one binary, and the real fix is
+//! an ABI in `libnacelle`. This file is one of that cell's two callers
+//! — the writing one.
 //!
 //! It is the grid's sister, not its copy. The menu is found by the
-//! grid's own XDG scanner, a tile is drawn by the grid's own tile, and
-//! a click starts an application through the grid's own detached
-//! launch; what this widget adds is one question the grid does not ask
-//! — *which group is this in* — and the two-level view that answers it.
-//! Everything about a desktop entry that could be parsed twice in this
-//! tree is parsed once, in [`nacelle_widget_appgrid::desktop`].
+//! grid's own XDG scanner, the groups are read by the grid's own
+//! reading of the menu specification ([`cats`]), and the chamfer, the
+//! glow, the caption role and the scrollbar are the grid's own. What
+//! this widget adds is one question the grid does not ask — *which
+//! group is this in* — and the row that answers it.
 //!
-//! Two views, one panel. The first is the list of groups this machine
-//! actually has, alphabetically, each with how many applications it
-//! holds. Clicking one opens it: a row that names where you are and
-//! takes you back, and under it the applications as tiles. Which group
-//! is open, and how far each view is scrolled, belong to the widget
-//! INSTANCE — two of these panels on two boards are two independent
-//! places to be.
+//! Which group is chosen belongs to the SELECTION and not to the widget
+//! instance: two of these panels on two boards are two views of one
+//! launcher, so they show the same row chosen, because there is one
+//! grid for them to be steering. How far each is scrolled is still the
+//! instance's own.
 //!
 //! Every colour, length, duration and word comes from the theme through
 //! ABI 5/6 tokens. Nothing here knows what a colour is: a missing token
 //! degrades through the raw answers the ABI itself gives (grey ink,
 //! zero lengths), never through a number that used to be the design.
 
-pub mod cats;
-
-use cats::Category;
 use nacelle::runtime::{
     ActionC, ChromeC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_NONE,
 };
+use nacelle_widget_appgrid::cats::{self, Category};
 use nacelle_widget_appgrid::desktop::{self, AppEntry};
+use nacelle_widget_appgrid::selection::{self, Selection};
 use nacelle_widget_appgrid::tile::{self, Rect, TileLook, TileTheme};
 use std::ffi::c_void;
 use std::time::Instant;
@@ -38,10 +55,10 @@ use std::time::Instant;
 /// times have MOVED, so this is a handful of `stat` calls.
 const RESCAN_SECS: u64 = 5;
 
-/// The mark on the row that leaves a category. A chevron rather than a
-/// word, because the row already carries a word — the category's name —
-/// and two would be one too many at this size.
-const BACK_MARK: &str = "\u{2039}";
+/// The top row's name. English in the code, as every string in this
+/// tree is: what a user reads is the theme's and the locale's business,
+/// not this file's.
+const ALL_LABEL: &str = "ALL APPLICATIONS";
 
 /// The host's interface, kept from the attach call.
 static mut HOST: Option<&'static HostApi> = None;
@@ -127,6 +144,8 @@ struct ListLook {
     idle: StateStyleC,
     hover: StateStyleC,
     press: StateStyleC,
+    selected: StateStyleC,
+    selected_hover: StateStyleC,
     row_h: f32,
     row_gap: f32,
     pad_x: f32,
@@ -161,6 +180,8 @@ impl ListLook {
             idle: raw_state,
             hover: raw_state,
             press: raw_state,
+            selected: raw_state,
+            selected_hover: raw_state,
             row_h: 0.0,
             row_gap: 0.0,
             pad_x: 0.0,
@@ -183,6 +204,8 @@ impl ListLook {
             idle: tile::rung(api, ctx, t.item_class, tile::STATE_IDLE),
             hover: tile::rung(api, ctx, t.item_class, tile::STATE_HOVER),
             press: tile::rung(api, ctx, t.item_class, tile::STATE_PRESS),
+            selected: tile::rung(api, ctx, t.item_class, tile::STATE_SELECTED),
+            selected_hover: tile::rung(api, ctx, t.item_class, tile::STATE_SELECTED_HOVER),
             row_h: px(t.row_h),
             row_gap: px(t.row_gap),
             pad_x: px(t.pad_x),
@@ -208,35 +231,33 @@ struct Look {
 
 // ----------------------------------------------------------- the widget
 
-/// What the pointer can be over. The press flash and the click path
-/// both speak in these rather than in indices, so "the third row"
-/// cannot be mistaken for "the third tile" across a view change.
+/// What the pointer can be over. The press flash, the selection test
+/// and the click path all speak in these rather than in row numbers, so
+/// that the top row cannot be confused with the first group.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hit {
-    /// The row that leaves the open category.
-    Back,
-    /// A group in the list, by its place in [`Appcats::cats`].
+    /// The top row: the whole menu, whatever it is grouped under.
+    All,
+    /// A group, by its place in [`Appcats::cats`].
     Cat(usize),
-    /// An application in the open group, by its place in
-    /// [`Appcats::entries`].
-    App(usize),
 }
 
 pub struct Appcats {
     /// The installed applications, sorted by display name — the grid's
-    /// own list, scanned by the grid's own scanner.
+    /// own list, scanned by the grid's own scanner. Kept for the count
+    /// on the ALL APPLICATIONS row, which has to be the menu's own
+    /// figure and not the sum of the groups: an entry in both
+    /// `AudioVideo` and `Audio` is counted by both of those and once by
+    /// this one.
     entries: Vec<AppEntry>,
     /// The groups those entries fall into, alphabetically.
     cats: Vec<Category>,
-    /// Which group is open, BY NAME. A name rather than an index
-    /// because a rescan rebuilds the groups: installing a game where
-    /// there were none moves every group after it by one, and an index
-    /// would quietly become a different category under the reader.
-    open: Option<&'static str>,
-    /// Scroll offset in pixels for each view, kept apart so that going
-    /// back lands where you left rather than at the top.
-    scroll_cats: f32,
-    scroll_apps: f32,
+    /// What the launcher is pointed at, as of this frame. Read from the
+    /// shared cell rather than held here: another panel of this widget
+    /// may have been the one that set it.
+    sel: Selection,
+    /// Scroll offset in pixels; whole rows.
+    scroll: f32,
     /// What was where in the last frame, for the hit test.
     hits: Vec<(Rect, Hit)>,
     /// What was clicked and when — WHICH state a thing is in is this
@@ -268,9 +289,11 @@ impl Appcats {
         Appcats {
             entries,
             cats,
-            open: None,
-            scroll_cats: 0.0,
-            scroll_apps: 0.0,
+            // Whatever the launcher is already on. NOT reset to ALL:
+            // a second categories panel opened later must show the
+            // choice already made, not undo it.
+            sel: selection::get(),
+            scroll: 0.0,
             hits: Vec::new(),
             pressed: None,
             last_look: Instant::now(),
@@ -301,52 +324,61 @@ impl Appcats {
             self.cats.len(),
             self.entries.len()
         );
-    }
-
-    /// Where the open category is in the current grouping, or None when
-    /// nothing is open — or when what was open no longer exists,
-    /// because the last application in it was uninstalled while it was
-    /// being looked at. Being returned to the list is the honest
-    /// answer to that; an empty group would be a lie about the machine.
-    fn open_index(&self) -> Option<usize> {
-        let want = self.open?;
-        self.cats.iter().position(|c| c.name == want)
+        // The chosen group can have stopped existing — its last
+        // application uninstalled while it was being looked at. Being
+        // put back on the whole menu is the honest answer to that; a
+        // row chosen in a list that no longer holds it would be a
+        // selection pointing at nothing, and an empty grid with no way
+        // to say why.
+        if let Some(name) = selection::get().name() {
+            if !self.cats.iter().any(|c| c.name == name) {
+                selection::set(Selection::All);
+            }
+        }
     }
 
     pub fn wheel(&mut self, delta: f32) {
-        let s = if self.open.is_some() { &mut self.scroll_apps } else { &mut self.scroll_cats };
-        *s = (*s - delta).max(0.0);
+        self.scroll = (self.scroll - delta).max(0.0);
     }
 
-    /// A click on a group opens it, a click on the back row closes it,
-    /// and a click on a tile runs its application, detached. There is
-    /// no action for the host to take in any of the three: the two
-    /// navigations are this widget's own state, and `ActionC` has no
-    /// code for "run this command" — inventing one would be an ABI
-    /// change for one caller.
+    /// A click on a row points the launcher grid at what that row says,
+    /// and nothing else — the grid reads the same cell on its next
+    /// frame. There is no action for the host to take: `ActionC` has no
+    /// code that means "another widget should now show something else",
+    /// and inventing one is the ABI change this widget is working
+    /// around rather than pre-empting (see
+    /// [`nacelle_widget_appgrid::selection`]).
     pub fn click(&mut self, x: f32, y: f32) {
         let Some(hit) = self.hits.iter().find(|(r, _)| r.contains(x, y)).map(|&(_, h)| h)
         else {
             return;
         };
         self.pressed = Some((hit, Instant::now()));
-        match hit {
-            Hit::Back => {
-                self.open = None;
-            }
+        let what = match hit {
+            Hit::All => Selection::All,
             Hit::Cat(i) => {
                 let Some(c) = self.cats.get(i) else { return };
-                self.open = Some(c.name);
-                // A group is entered at its top, always: the scroll of
-                // the group looked at before it means nothing here.
-                self.scroll_apps = 0.0;
+                Selection::Named(c.name.to_string())
             }
-            Hit::App(i) => {
-                let Some(app) = self.entries.get(i) else { return };
-                if let Err(e) = desktop::launch(app) {
-                    eprintln!("appcats: {} \u{2014} {e}", app.name);
-                }
+        };
+        // Kept here as well as written to the cell, so that the rest of
+        // THIS frame's hit list and the next draw agree without waiting
+        // for a read back.
+        self.sel = what.clone();
+        selection::set(what);
+    }
+
+    /// Whether a row is the chosen one. By NAME and not by row number,
+    /// for the reason the selection holds a name: a rescan rebuilds the
+    /// groups, and installing a game where there were none moves every
+    /// group after it by one.
+    fn chosen(&self, hit: Hit) -> bool {
+        match (hit, self.sel.name()) {
+            (Hit::All, None) => true,
+            (Hit::Cat(i), Some(name)) => {
+                self.cats.get(i).map(|c| c.name == name).unwrap_or(false)
             }
+            _ => false,
         }
     }
 
@@ -378,6 +410,8 @@ impl Appcats {
     fn draw(&mut self, api: &HostApi, ctx: *mut c_void, r: Rect) {
         self.hits.clear();
         self.follow();
+        // The chosen row can have been chosen in the other panel.
+        self.sel = selection::get();
         let look = self.look(api, ctx);
         self.wheel_px = look.tile.wheel_px;
 
@@ -392,100 +426,41 @@ impl Appcats {
             .map(|(h, _)| h);
         let pointer = Pointer { x: mx, y: my, flashing };
 
-        match self.open_index() {
-            Some(ci) => self.draw_apps(api, ctx, r, &look, ci, pointer),
-            None => self.draw_cats(api, ctx, r, &look, pointer),
-        }
-    }
-
-    /// The list of groups: one row each, alphabetical, the count of
-    /// applications on the right.
-    fn draw_cats(&mut self, api: &HostApi, ctx: *mut c_void, r: Rect, look: &Look, p: Pointer) {
-        if self.cats.is_empty() {
-            empty(api, ctx, r, look, "no applications");
+        if self.entries.is_empty() {
+            empty(api, ctx, r, &look, "no applications");
             return;
         }
-        let pitch = look.list.row_h + look.list.row_gap;
-        let s = rows(pitch, look.list.row_gap, r.h, self.cats.len(), &mut self.scroll_cats);
 
-        for (i, c) in self.cats.iter().enumerate().skip(s.off).take(s.nvis) {
-            let rect =
-                Rect::new(r.x, r.y + (i - s.off) as f32 * pitch, r.w, look.list.row_h);
-            let rung = p.rung(look.rows(), rect, Hit::Cat(i));
-            row(
-                api,
-                ctx,
-                look,
-                rect,
-                rung,
-                &tile::initial(c.name),
-                c.name,
-                &c.apps.len().to_string(),
-            );
-            self.hits.push((rect, Hit::Cat(i)));
+        // ALL APPLICATIONS at the top, then the groups. One list and
+        // one scroll: the top row is a row like any other, so it
+        // scrolls out of the way like any other rather than being
+        // pinned by a rule this file made up.
+        let pitch = look.list.row_h + look.list.row_gap;
+        let count = self.cats.len() + 1;
+        let s = rows(pitch, look.list.row_gap, r.h, count, &mut self.scroll);
+
+        for n in s.off..(s.off + s.nvis).min(count) {
+            let rect = Rect::new(r.x, r.y + (n - s.off) as f32 * pitch, r.w, look.list.row_h);
+            let (hit, label, right) = match n {
+                // The whole menu's own figure: how many applications
+                // are installed, which is what the grid then shows.
+                0 => (Hit::All, ALL_LABEL, self.entries.len()),
+                _ => {
+                    let c = &self.cats[n - 1];
+                    (Hit::Cat(n - 1), c.name, c.apps.len())
+                }
+            };
+            let rung = pointer.rung(look.rows(), rect, hit, self.chosen(hit));
+            // The chip's mark is the label's own initial, the same rule
+            // every row follows and the same one a tile follows for its
+            // application. ALL APPLICATIONS gets an `A` by that rule and
+            // is not given a symbol of its own: a mark this file
+            // invented would be a glyph the shipped faces may not have,
+            // and the row's name is beside it either way.
+            row(api, ctx, &look, rect, rung, &tile::initial(label), label, &right.to_string());
+            self.hits.push((rect, hit));
         }
         tile::scrollbar(api, ctx, &look.tile, r, s);
-    }
-
-    /// One group's applications: the row that says where you are and
-    /// takes you back, and the grid's own tiles under it.
-    fn draw_apps(
-        &mut self,
-        api: &HostApi,
-        ctx: *mut c_void,
-        r: Rect,
-        look: &Look,
-        ci: usize,
-        p: Pointer,
-    ) {
-        let cat = &self.cats[ci];
-        // The way out is drawn FIRST and unconditionally, whatever is
-        // left for the tiles: a panel squeezed too short to show one
-        // application must still be a panel you can leave.
-        let back = Rect::new(r.x, r.y, r.w, look.list.row_h);
-        let rung = p.rung(look.rows(), back, Hit::Back);
-        row(
-            api,
-            ctx,
-            look,
-            back,
-            rung,
-            BACK_MARK,
-            cat.name,
-            &cat.apps.len().to_string(),
-        );
-        self.hits.push((back, Hit::Back));
-
-        let top = look.list.row_h + look.list.row_gap;
-        let area = Rect::new(r.x, r.y + top, r.w, r.h - top);
-        if area.h <= 0.0 {
-            return;
-        }
-        if cat.apps.is_empty() {
-            // Unreachable through the list, which only offers groups
-            // that hold something — but a rescan between the click and
-            // this frame can empty one, and an empty box that says
-            // nothing is a defect whatever led to it.
-            empty(api, ctx, area, look, "no applications");
-            return;
-        }
-        let grid = tile::layout(&look.tile, area, cat.apps.len(), &mut self.scroll_apps);
-        for (n, &i) in cat.apps.iter().enumerate() {
-            let Some(trect) = grid.place(area, n) else { continue };
-            let Some(app) = self.entries.get(i) else { continue };
-            let rung = p.rung(look.tiles(), trect, Hit::App(i));
-            tile::tile_face(
-                api,
-                ctx,
-                &look.tile,
-                trect,
-                rung,
-                &tile::initial(&app.name),
-                &app.name,
-            );
-            self.hits.push((trect, Hit::App(i)));
-        }
-        tile::scrollbar(api, ctx, &look.tile, area, grid.scroll());
     }
 }
 
@@ -497,7 +472,7 @@ impl Default for Appcats {
 
 /// Everything the state ladder needs to know about this frame's
 /// pointer, so that picking a rung is one call rather than the same
-/// three-armed `if` at every drawing site.
+/// five-armed `if` at every drawing site.
 #[derive(Clone, Copy)]
 struct Pointer {
     x: f32,
@@ -507,38 +482,49 @@ struct Pointer {
 
 impl Pointer {
     /// Which rung of a ladder the thing in `r` is resting on this
-    /// frame. A container is on its class's idle rung, the pointed-at
-    /// one on hover, and the just-clicked one on press — the same three
-    /// for a row and for a tile, which is why the ladder is a parameter
-    /// and not two copies of this function.
-    fn rung<'a>(&self, l: Ladder<'a>, r: Rect, what: Hit) -> &'a StateStyleC {
-        if self.flashing == Some(what) {
-            l.press
-        } else if r.contains(self.x, self.y) {
-            l.hover
-        } else {
-            l.idle
+    /// frame.
+    ///
+    /// The order is the ladder's own reading of what is momentary and
+    /// what is persistent: `press` first, because a click's flash is
+    /// the answer to the click and lasts only as long as
+    /// `motion.press.duration_ms` says; then the two `selected` rungs,
+    /// which say this row is the chosen one whether or not the pointer
+    /// is on it; then `hover`; then rest. The theme's own
+    /// `selected_hover` exists precisely because "chosen AND pointed
+    /// at" is a state a list produces, so it is asked for rather than
+    /// approximated by one of the other two.
+    fn rung<'a>(&self, l: Ladder<'a>, r: Rect, what: Hit, chosen: bool) -> &'a StateStyleC {
+        let under = r.contains(self.x, self.y);
+        match (self.flashing == Some(what), chosen, under) {
+            (true, _, _) => l.press,
+            (_, true, true) => l.selected_hover,
+            (_, true, false) => l.selected,
+            (_, false, true) => l.hover,
+            (_, false, false) => l.idle,
         }
     }
 }
 
-/// The three rungs of one class's state ladder that this widget uses.
+/// The rungs of one class's state ladder that this widget uses.
 #[derive(Clone, Copy)]
 struct Ladder<'a> {
     idle: &'a StateStyleC,
     hover: &'a StateStyleC,
     press: &'a StateStyleC,
+    selected: &'a StateStyleC,
+    selected_hover: &'a StateStyleC,
 }
 
 impl Look {
     /// `class.list.item` — the ladder a row rests on.
     fn rows(&self) -> Ladder<'_> {
-        Ladder { idle: &self.list.idle, hover: &self.list.hover, press: &self.list.press }
-    }
-
-    /// `class.tile` — the ladder the launcher's own tiles rest on.
-    fn tiles(&self) -> Ladder<'_> {
-        Ladder { idle: &self.tile.idle, hover: &self.tile.hover, press: &self.tile.press }
+        Ladder {
+            idle: &self.list.idle,
+            hover: &self.list.hover,
+            press: &self.list.press,
+            selected: &self.list.selected,
+            selected_hover: &self.list.selected_hover,
+        }
     }
 }
 
@@ -705,9 +691,8 @@ extern "C" fn click_c(
         this.click(x, y);
     }
     if let Some(out) = unsafe { out.as_mut() } {
-        // Opening a group, leaving one, and starting an application are
-        // all this widget's own; the host has nothing to do about any
-        // of them.
+        // Choosing a group is a fact about the launcher, written where
+        // the launcher reads it; the host has nothing to do about it.
         out.kind = ACTION_NONE;
     }
 }
@@ -735,16 +720,18 @@ extern "C" fn grid_c(_: *mut c_void, _: *mut u32, _: *mut u32) {}
 
 extern "C" fn key_feedback_c(_: *mut c_void, _: u32, _: *const u8, _: u32) {}
 
-/// Grows downwards: a taller panel is more groups, or more rows of
-/// applications inside one — never bigger ones.
+/// Grows downwards: a taller panel is more groups on screen, never
+/// bigger ones.
 extern "C" fn sizing(_: *mut c_void, _: *mut c_void, _: *const c_void) -> f32 {
     nacelle::runtime::SIZING_ROWS
 }
 
 /// The header, as chrome: the panel's name on the left, and on the
-/// right how many groups there are — or, inside a group, how many
-/// applications it holds. Which of the two it is, the row under it says
-/// in words.
+/// right how many groups this machine has.
+///
+/// The groups, not the rows: ALL APPLICATIONS is a way to the whole
+/// menu and not a group the machine has, and it carries the menu's own
+/// count on its own row anyway.
 extern "C" fn chrome_c(
     instance: *mut c_void,
     _ctx: *mut c_void,
@@ -756,11 +743,7 @@ extern "C" fn chrome_c(
     let (Some(this), Some(out)) = (state(instance), unsafe { out.as_mut() }) else {
         return 0;
     };
-    let n = match this.open_index() {
-        Some(i) => this.cats[i].apps.len(),
-        None => this.cats.len(),
-    };
-    this.chrome_right = n.to_string().into_bytes();
+    this.chrome_right = this.cats.len().to_string().into_bytes();
     out.title = TITLE.as_ptr();
     out.title_len = TITLE.len() as u32;
     out.right = this.chrome_right.as_ptr();
@@ -858,5 +841,139 @@ mod row_tests {
         // nothing rather than dividing by zero.
         let r = rows(0.0, 0.0, 100.0, 10, &mut 0.0);
         assert_eq!((r.nvis, r.off), (1, 0));
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    fn entry(name: &str, categories: &[&str]) -> AppEntry {
+        AppEntry {
+            id: format!("{}.desktop", name.to_lowercase()),
+            name: name.to_string(),
+            exec: "/bin/true".to_string(),
+            terminal: false,
+            icon: String::new(),
+            categories: categories.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A widget with a menu but no host: enough to exercise the row
+    /// list, the selection and the chosen-row test, none of which touch
+    /// the theme or draw anything.
+    fn panel(entries: Vec<AppEntry>) -> Appcats {
+        let cats = cats::group(&entries);
+        Appcats {
+            entries,
+            cats,
+            sel: Selection::All,
+            scroll: 0.0,
+            hits: Vec::new(),
+            pressed: None,
+            last_look: Instant::now(),
+            stamp: 0,
+            theme: None,
+            wheel_px: 0.0,
+            chrome_right: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_top_row_is_the_whole_menu_and_is_chosen_until_something_else_is() {
+        let p = panel(vec![
+            entry("Player", &["AudioVideo", "Audio"]),
+            entry("Editor", &["Utility"]),
+            entry("Toolkit", &["Qt"]),
+        ]);
+        // The list is the groups plus one, and the one is on top.
+        assert_eq!(p.cats.iter().map(|c| c.name).collect::<Vec<_>>(), [
+            "Audio",
+            "AudioVideo",
+            "Other",
+            "Utility"
+        ]);
+        // ALL APPLICATIONS counts the MENU and not the memberships:
+        // three applications, four group memberships, because the
+        // player is in both AudioVideo and Audio. The top row must show
+        // the three — it is what the grid then draws — and never the
+        // sum of the rows under it.
+        assert_eq!(p.entries.len(), 3);
+        assert_eq!(p.cats.iter().map(|c| c.apps.len()).sum::<usize>(), 4);
+        // Nothing clicked: the top row is the chosen one and no group
+        // is.
+        assert!(p.chosen(Hit::All));
+        for i in 0..p.cats.len() {
+            assert!(!p.chosen(Hit::Cat(i)), "{} is not chosen", p.cats[i].name);
+        }
+    }
+
+    #[test]
+    fn choosing_a_row_points_the_grid_and_moves_the_mark_with_it() {
+        let mut p = panel(vec![
+            entry("Player", &["AudioVideo", "Audio"]),
+            entry("Editor", &["Utility"]),
+        ]);
+        let at = |p: &Appcats, name: &str| {
+            Hit::Cat(p.cats.iter().position(|c| c.name == name).unwrap())
+        };
+        // Clicking a group is written to the cell the grid reads, and
+        // marks that row and only that row.
+        let utility = at(&p, "Utility");
+        p.sel = Selection::Named("Utility".to_string());
+        selection::set(p.sel.clone());
+        assert_eq!(selection::get(), Selection::Named("Utility".to_string()));
+        assert!(p.chosen(utility));
+        assert!(!p.chosen(Hit::All));
+        assert!(!p.chosen(at(&p, "Audio")));
+
+        // Switching moves the mark rather than adding a second one.
+        let audio = at(&p, "Audio");
+        p.sel = Selection::Named("Audio".to_string());
+        assert!(p.chosen(audio));
+        assert!(!p.chosen(utility));
+
+        // And the top row takes it back.
+        p.sel = Selection::All;
+        assert!(p.chosen(Hit::All));
+        assert!(!p.chosen(audio));
+
+        // A chosen group the menu no longer has marks nothing at all —
+        // which is the state `follow` then puts back on ALL.
+        p.sel = Selection::Named("Science".to_string());
+        assert!(!p.chosen(Hit::All));
+        for i in 0..p.cats.len() {
+            assert!(!p.chosen(Hit::Cat(i)));
+        }
+        assert!(!p.cats.iter().any(|c| c.name == "Science"));
+
+        // Put the shared cell back: it is process-wide, and a test that
+        // left it set would be steering every other test's grid.
+        selection::set(Selection::All);
+    }
+
+    #[test]
+    fn an_empty_group_is_a_row_that_can_still_be_chosen() {
+        // A group with nothing in it is never OFFERED — `group` only
+        // returns groups that hold something — so the list cannot make
+        // one. What it can do is be pointed at one by a rescan, and the
+        // grid answers that with an empty page rather than a stale one.
+        let p = panel(vec![entry("Editor", &["Utility"])]);
+        assert!(p.cats.iter().all(|c| !c.apps.is_empty()));
+        assert!(!p.cats.iter().any(|c| c.name == "Game"));
+        let view: Vec<usize> = p
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| cats::holds("Game", e))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(view.is_empty(), "the grid draws nothing for a group nothing is in");
+        // And a machine with no menu at all has no groups, so the panel
+        // has only its top row to draw — which the draw path answers
+        // with the empty state instead.
+        let none = panel(Vec::new());
+        assert!(none.cats.is_empty());
+        assert!(none.entries.is_empty());
     }
 }

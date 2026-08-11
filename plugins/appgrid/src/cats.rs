@@ -15,8 +15,19 @@
 //! Nothing here draws, so all of it is testable without a window —
 //! which is the whole reason it is a module rather than a corner of the
 //! draw path.
+//!
+//! It lives in the GRID's crate rather than in the categories list's,
+//! and that is not where it started. Both widgets need it now and they
+//! need different halves: the list asks [`group`] what groups exist and
+//! how big each is, the grid asks [`holds`] whether one application
+//! belongs to the group the list pointed it at. Two copies of [`MAIN`]
+//! would be two vocabularies that drift apart on the first category the
+//! specification adds, so this joins [`crate::desktop`] and
+//! [`crate::tile`] as a third thing the family shares rather than
+//! duplicates — and `appcats` already depends on this crate, while the
+//! reverse would be a cycle.
 
-use nacelle_widget_appgrid::desktop::AppEntry;
+use crate::desktop::AppEntry;
 
 /// The Desktop Menu Specification's main categories, in the order the
 /// specification's own table lists them. Membership is exact and
@@ -122,6 +133,28 @@ pub fn group(entries: &[AppEntry]) -> Vec<Category> {
         .collect();
     out.sort_by(|a, b| a.name.cmp(b.name));
     out
+}
+
+/// Whether one application belongs to the group called `name` — the
+/// same question [`group`] answers for the whole menu at once, asked of
+/// a single entry.
+///
+/// The grid needs it in this shape because it is handed a NAME and not
+/// a group: the selection travels between two widgets as the name of a
+/// category (see [`crate::selection`]), and the grid then has its own
+/// scan to filter, not the list's. Both paths read [`main_slots`], so
+/// "what is in Utility" cannot mean one thing in the list's count and
+/// another in the grid's page.
+///
+/// [`OTHER`] is not a category any entry claims — it is the ABSENCE of
+/// every main one — so it is answered by asking exactly that.
+pub fn holds(name: &str, e: &AppEntry) -> bool {
+    let slots = main_slots(&e.categories);
+    if name == OTHER {
+        slots.is_empty()
+    } else {
+        slots.iter().any(|&i| MAIN[i] == name)
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +269,40 @@ mod tests {
         assert_eq!(group(&placed).iter().map(|c| c.name).collect::<Vec<_>>(), [
             "Development"
         ]);
+    }
+
+    #[test]
+    fn one_entry_answers_the_same_membership_the_whole_grouping_does() {
+        let entries = [
+            entry("Player", &["AudioVideo", "Audio", "Player"]),
+            entry("Cutter", &["AudioVideo", "Video", "Qt"]),
+            entry("Editor", &["Utility", "TextEditor"]),
+            entry("Nothing", &[]),
+            entry("Toolkit", &["Qt", "KDE"]),
+        ];
+        // The filter the grid runs and the grouping the list draws are
+        // the same answer, group by group — which is the only property
+        // that matters, since one widget writes the name and the other
+        // reads it.
+        for c in group(&entries) {
+            let by_holds: Vec<usize> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| holds(c.name, e))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(by_holds, c.apps, "{} disagrees", c.name);
+        }
+        // Other is the absence of every main category, not a category
+        // an entry can write.
+        assert!(holds(OTHER, &entry("Nothing", &[])));
+        assert!(holds(OTHER, &entry("Toolkit", &["Qt", "KDE"])));
+        assert!(!holds(OTHER, &entry("Editor", &["Utility"])));
+        assert!(holds(OTHER, &entry("Liar", &["Other"])), "`Other` is not main");
+        // A name no grouping ever produced holds nothing — what the
+        // grid sees when the last application of a group is
+        // uninstalled while that group is the selected one.
+        assert!(!holds("Nonesuch", &entry("Editor", &["Utility"])));
+        assert!(!holds("", &entry("Editor", &["Utility"])));
     }
 }

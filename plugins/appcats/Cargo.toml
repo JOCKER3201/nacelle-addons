@@ -14,10 +14,17 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
 
-# The launcher grid, as a library: this widget shows the SAME
-# applications, found by the SAME XDG scanner (appgrid::desktop), drawn
-# as the SAME tiles (appgrid::tile), and started by the SAME detached
-# launch. Nothing about a desktop entry is parsed twice in this tree.
+# The launcher grid, as a library: this widget groups the SAME
+# applications, found by the SAME XDG scanner (appgrid::desktop), read
+# into groups by the SAME categories module (appgrid::cats), and drawn
+# with the SAME chamfer, ladder and scrollbar (appgrid::tile). Nothing
+# about a desktop entry is parsed twice in this tree.
+#
+# It is also how the two widgets reach each other: clicking a row here
+# writes appgrid::selection, and the grid reads it. That works because
+# this is a PATH dependency linked into one binary — see the head of
+# appgrid/src/selection.rs for why that is a deliberate stopgap and
+# what replaces it.
 # `default-features = false` drops appgrid's dlopen attach symbol —
 # two plugins exporting `nacelle_plugin_attach` from one process is
 # exactly the collision that feature exists to prevent.
