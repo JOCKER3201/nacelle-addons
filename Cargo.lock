@@ -230,7 +230,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libnacelle"
 version = "0.1.0"
-source = "git+https://github.com/JOCKER3201/libnacelle#308ec5acbb6cf29c101875c4c2bc12dfa1cece50"
+source = "git+https://github.com/JOCKER3201/libnacelle#3159db0600ee04478bb3f7f286ac71d30f271c43"
 dependencies = [
  "chrono",
  "fontdue",
@@ -238,6 +238,7 @@ dependencies = [
  "rhai",
  "serde_json",
  "taffy",
+ "unicode-segmentation",
  "unicode-width",
  "vte",
 ]
@@ -527,6 +528,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"

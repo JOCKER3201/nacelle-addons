@@ -1208,6 +1208,21 @@ extern "C" fn chrome_c(
     (out_size as usize).min(std::mem::size_of::<ChromeC>()) as u32
 }
 
+/// This widget takes no drags: declining every Begin keeps a press on
+/// the ordinary click path.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn drag_c(
+    _: *mut c_void,
+    _: u32,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+    _: *mut ActionC,
+) {
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -1220,6 +1235,7 @@ static API: PluginApi = PluginApi {
     key_feedback: key_feedback_c,
     sizing,
     chrome: chrome_c,
+    drag: drag_c,
 };
 
 /// In-process attach for a host that links this crate statically. The

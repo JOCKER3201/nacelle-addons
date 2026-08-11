@@ -23,8 +23,10 @@
 
 use nacelle::runtime::{
     ActionC, CellC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, TermReqC,
-    TermViewC, ABI_VERSION, ACTION_NONE, ACTION_SCROLL_TERMINAL, ACTION_SELECT_TAB,
-    CELL_HAS_BG, CELL_UNDERLINE, VIEW_CURSOR, VIEW_LIVE, VIEW_TRUNCATED,
+    TermSelectC, TermViewC, ABI_VERSION, ACTION_NONE, ACTION_SCROLL_TERMINAL,
+    ACTION_SELECT_TAB, ACTION_TERM_SELECT, CELL_ABSENT, CELL_HAS_BG, CELL_SELECTED,
+    CELL_UNDERLINE, DRAG_BEGIN, DRAG_END, SELECT_KIND_CELLS, SELECT_OP_BEGIN, SELECT_OP_END,
+    SELECT_OP_EXTEND, VIEW_CURSOR, VIEW_LIVE, VIEW_TRUNCATED,
 };
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -134,6 +136,12 @@ struct Tokens {
     info_edge: u32,    // severity.info.edge
     info_text: u32,    // severity.info.text
     info_on: u32,      // severity.info.on — the solid pill's ink
+    // the selection (F1 §2.4): the flag arrives per cell from the host
+    // (CELL_SELECTED); the LOOK is entirely these declared tokens
+    sel_wash: u32, // term.selection — the wash behind selected cells
+    sel_fg: u32,   // term.selection_fg — glyphs inside a tinted selection
+    sel_pad: u32,  // terminal.selection_pad — bleed around the wash quad
+    term_bg: u32,  // term.bg — the inverted glyph over a bg-less cell
     /// Whether the pill draws solid — `severity.info.badge_style`'s WORD
     /// (ABI 6), no longer this arrangement's guess. Solid mirrors
     /// `ui::badge`: the severity's text colour becomes the bed and `on`
@@ -141,6 +149,11 @@ struct Tokens {
     /// host degrades them; no word at all (an old host, a missing token)
     /// keeps the pre-word guess: hollow, the master's own info style.
     pill_solid: bool,
+    /// Whether the selection TINTS — `term.selection.mode`'s WORD is
+    /// `tint` (wash + `selection_fg` glyphs). Anything else — `invert`,
+    /// a word this build predates, no word at all — INVERTS, the
+    /// master's own default and the reading that never loses a glyph.
+    sel_tint: bool,
 }
 
 /// The WORD an enum token currently resolves to — ABI 6's appended
@@ -163,6 +176,7 @@ impl Tokens {
         let t = |n: &str| (api.theme_token)(n.as_ptr(), n.len() as u32);
         let c = |n: &str| (api.theme_class)(n.as_ptr(), n.len() as u32);
         let style = enum_word(api, ctx, t("severity.info.badge_style"));
+        let sel_mode = enum_word(api, ctx, t("term.selection.mode"));
         Tokens {
             epoch: (api.theme_epoch)(ctx),
             tab_class: c("tab"),
@@ -202,7 +216,12 @@ impl Tokens {
             info_edge: t("severity.info.edge"),
             info_text: t("severity.info.text"),
             info_on: t("severity.info.on"),
+            sel_wash: t("term.selection"),
+            sel_fg: t("term.selection_fg"),
+            sel_pad: t("terminal.selection_pad"),
+            term_bg: t("term.bg"),
             pill_solid: style == "solid",
+            sel_tint: sel_mode == "tint",
         }
     }
 }
@@ -340,6 +359,19 @@ pub struct Shell {
     /// `terminal.wheel_lines`, kept from the last draw for the same
     /// reason.
     wheel_lines: f32,
+    /// Where the cell grid sat in the last drawn frame — origin and
+    /// cell size in device px — and how many cells were delivered.
+    /// What `drag` maps pixels against: input arrives with no drawing
+    /// context, exactly like the tab strip's `strip`.
+    sel_grid: (f32, f32, f32, f32),
+    sel_dims: (u32, u32),
+    /// The line id of that frame's first view row, echoed back in
+    /// every TermSelect so the host resolves rows against the view
+    /// this widget actually drew (the drag-vs-feed race, F1 §2.7).
+    sel_base: (u32, u32),
+    /// The TermSelect payload handed to the host — owned by the
+    /// instance until its next call, the `last_path` discipline.
+    select_out: TermSelectC,
 }
 
 impl Shell {
@@ -351,6 +383,17 @@ impl Shell {
             tokens: None,
             strip: (0.0, 0.0, 0.0),
             wheel_lines: 0.0,
+            sel_grid: (0.0, 0.0, 0.0, 0.0),
+            sel_dims: (0, 0),
+            sel_base: (0, 0),
+            select_out: TermSelectC {
+                op: 0,
+                kind: 0,
+                col: 0,
+                row: 0,
+                base_lo: 0,
+                base_hi: 0,
+            },
         }
     }
 
@@ -452,10 +495,14 @@ impl Shell {
 
         let gap = px(ids.tab_gap);
         // What the input handlers replay against: input runs with no
-        // drawing context, so the strip's metrics and the wheel step
-        // travel through the instance from the frame that drew them.
+        // drawing context, so the strip's metrics, the wheel step and
+        // the grid's geometry travel through the instance from the
+        // frame that drew them.
         self.strip = (pad, tab_h, gap);
         self.wheel_lines = px(ids.wheel_lines);
+        self.sel_grid = (grid_r.x, grid_r.y, view.cell_w, view.cell_h);
+        self.sel_dims = (view.view_cols, view.view_rows);
+        self.sel_base = (view.first_id_lo, view.first_id_hi);
 
         // No frame here: the container is the host's (u2 §4), already on
         // screen by the time this runs, and `r` is the content box it left.
@@ -560,6 +607,7 @@ impl Shell {
         // here.
         let ul_h = px(ids.cell_ul_h);
         let ul_gap = px(ids.cell_ul_gap);
+        let sel_pad = px(ids.sel_pad);
         let (cw, ch_h) = (view.cell_w, view.cell_h);
         let ncells = (view.view_rows as usize).saturating_mul(view.view_cols as usize);
         let cells = &self.cells[..ncells.min(self.cells.len())];
@@ -569,26 +617,61 @@ impl Shell {
                 let Some(cell) = cells.get(y * view.view_cols as usize + x) else {
                     break;
                 };
+                // The host sends the FLAG, never a baked colour: the
+                // invert mode below needs the original colours, and a
+                // wash baked into `bg` could not be taken apart again.
+                let selected =
+                    cell.flags & CELL_SELECTED != 0 && cell.flags & CELL_ABSENT == 0;
                 // Nothing to draw: the second half of a wide character,
-                // or a position no cell exists at.
-                if cell.width == 0 {
+                // or a position no cell exists at. A SELECTED spacer
+                // still gets its column of wash, so a wide character's
+                // selection has no seam.
+                if cell.width == 0 && !selected {
                     continue;
                 }
                 let cx = grid_r.x + x as f32 * cw;
-                if cell.flags & CELL_HAS_BG != 0 {
+                if cell.flags & CELL_HAS_BG != 0 && cell.width > 0 {
                     let w = (cw * cell.width as f32).min(grid_r.x + grid_r.w - cx);
                     (api.rect)(ctx, RectC { x: cx, y: cy, w, h: ch_h }, cell.bg);
                 }
-                if cell.ch != b' ' as u32 {
-                    glyph(api, ctx, cell.ch, cell.font, cx, cy, view.px, cell.fg);
+                if selected {
+                    // One column per flagged cell; the bleed is the
+                    // theme's terminal.selection_pad (0 by default, so
+                    // the wash follows the cell grid exactly). Tint
+                    // washes term.selection over the cell; invert lays
+                    // the glyph's own colour down as the bed.
+                    let wash = RectC {
+                        x: cx - sel_pad,
+                        y: cy - sel_pad,
+                        w: cw + 2.0 * sel_pad,
+                        h: ch_h + 2.0 * sel_pad,
+                    };
+                    let bed = if ids.sel_tint { ink(ids.sel_wash) } else { cell.fg };
+                    (api.rect)(ctx, wash, bed);
                 }
-                if cell.flags & CELL_UNDERLINE != 0 && ul_h > 0.0 {
+                // The glyph's ink: its own outside a selection; inside
+                // one, selection_fg when tinting, or the cell's own
+                // background (term.bg when it had none) when inverting.
+                let glyph_c = if !selected {
+                    cell.fg
+                } else if ids.sel_tint {
+                    ink(ids.sel_fg)
+                } else if cell.flags & CELL_HAS_BG != 0 {
+                    cell.bg
+                } else {
+                    ink(ids.term_bg)
+                };
+                if cell.width > 0 && cell.ch != b' ' as u32 {
+                    glyph(api, ctx, cell.ch, cell.font, cx, cy, view.px, glyph_c);
+                }
+                if cell.width > 0 && cell.flags & CELL_UNDERLINE != 0 && ul_h > 0.0 {
                     // One cell wide even under a double-width character,
-                    // as it has always been.
+                    // as it has always been — in the glyph's current
+                    // ink, so an inverted selection keeps it visible.
                     (api.rect)(
                         ctx,
                         RectC { x: cx, y: cy + ch_h - ul_gap - ul_h, w: cw, h: ul_h },
-                        cell.fg,
+                        glyph_c,
                     );
                 }
             }
@@ -762,6 +845,60 @@ extern "C" fn wheel_c(
     out.lines = (dy * this.wheel_lines) as i32;
 }
 
+/// A drag over the panel, mapped to cell coordinates — this widget
+/// alone knows its cell metrics and tab-strip offset, so the pixel→cell
+/// translation happens HERE and the host receives cells (F1 §2.4). The
+/// echoed base ties the cells to the frame they were measured against.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn drag_c(
+    instance: *mut c_void,
+    phase: u32,
+    x: f32,
+    y: f32,
+    _r: RectC,
+    _win_w: f32,
+    _win_h: f32,
+    out: *mut ActionC,
+) {
+    let (Some(this), Some(out)) = (state(instance), unsafe { out.as_mut() }) else {
+        return;
+    };
+    out.kind = ACTION_NONE;
+    let (gx, gy, cw, ch) = this.sel_grid;
+    let (cols, rows) = this.sel_dims;
+    if cw <= 0.0 || ch <= 0.0 || cols == 0 || rows == 0 {
+        return; // nothing drawn yet — nothing to select
+    }
+    // A press outside the cell grid is not a selection: declining the
+    // Begin hands the press back to the host's click machinery, which
+    // is how the tab strip keeps its clicks. Move and End clamp
+    // instead — a drag that leaves the grid selects to its edge.
+    if phase == DRAG_BEGIN
+        && !(x >= gx && x < gx + cw * cols as f32 && y >= gy && y < gy + ch * rows as f32)
+    {
+        return;
+    }
+    let col = (((x - gx) / cw).floor() as i64).clamp(0, cols as i64 - 1) as u32;
+    let row = (((y - gy) / ch).floor() as i64).clamp(0, rows as i64 - 1) as u32;
+    this.select_out = TermSelectC {
+        op: match phase {
+            DRAG_BEGIN => SELECT_OP_BEGIN,
+            DRAG_END => SELECT_OP_END,
+            _ => SELECT_OP_EXTEND,
+        },
+        // Always Cells: the HOST owns the double/triple-click kinds —
+        // a widget cannot see click counts.
+        kind: SELECT_KIND_CELLS,
+        col,
+        row,
+        base_lo: this.sel_base.0,
+        base_hi: this.sel_base.1,
+    };
+    out.kind = ACTION_TERM_SELECT;
+    out.data = &this.select_out as *const TermSelectC as *const u8;
+    out.data_len = std::mem::size_of::<TermSelectC>() as u32;
+}
+
 extern "C" fn grid_c(instance: *mut c_void, cols: *mut u32, rows: *mut u32) {
     let Some(this) = (unsafe { (instance as *const Shell).as_ref() }) else { return };
     unsafe {
@@ -807,6 +944,7 @@ static API: PluginApi = PluginApi {
     key_feedback: key_feedback_c,
     sizing,
     chrome: chrome_c,
+    drag: drag_c,
 };
 
 /// # Safety

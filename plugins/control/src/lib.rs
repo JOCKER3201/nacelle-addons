@@ -526,6 +526,21 @@ extern "C" fn chrome(
     0
 }
 
+/// This widget takes no drags: declining every Begin keeps a press on
+/// the ordinary click path.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn drag(
+    _: *mut c_void,
+    _: u32,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+    _: *mut ActionC,
+) {
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -538,6 +553,7 @@ static API: PluginApi = PluginApi {
     key_feedback,
     sizing,
     chrome,
+    drag,
 };
 
 /// The attach point the host looks for. Taking the host's interface here
