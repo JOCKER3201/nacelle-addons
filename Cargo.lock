@@ -230,7 +230,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libnacelle"
 version = "0.1.0"
-source = "git+https://github.com/JOCKER3201/libnacelle#ecf16e98a45ccbaeb92cc7281760e564b073ae78"
+source = "git+https://github.com/JOCKER3201/libnacelle#5155d2fcf27f73a5af918b2f28e4dca6c4f79a71"
 dependencies = [
  "chrono",
  "fontdue",
@@ -254,6 +254,22 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "nacelle-widget-appcats"
+version = "0.1.0"
+dependencies = [
+ "libnacelle",
+ "nacelle-widget-appgrid",
+]
+
+[[package]]
+name = "nacelle-widget-appgrid"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libnacelle",
+]
 
 [[package]]
 name = "nacelle-widget-control"

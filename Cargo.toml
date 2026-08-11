@@ -13,6 +13,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "plugins/appcats",
+    "plugins/appgrid",
     "plugins/control",
     "plugins/filesystem",
     "plugins/keyboard",

@@ -9,7 +9,7 @@ license = "MIT"
 [lib]
 # A widget plugin is a C-callable dynamic library: the host loads it with
 # dlopen and talks to it through plain function pointers.
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
@@ -31,10 +31,17 @@ libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
 nacelle-widget-appgrid = { path = "../appgrid", default-features = false }
 
 [features]
-# The dlopen attach symbol. On for the shipped .so; a host that links
-# this crate statically turns it off, so several plugins' identical
-# attach symbols cannot collide inside one binary.
-default = ["dyn"]
+# NO dlopen attach symbol, and no .so — deliberately. This crate links
+# the grid's crate to share the scanner, the tile and the selection
+# cell, and a shared object carrying two `nacelle_plugin_attach`
+# symbols is ill-formed: the loader would find the wrong widget. As a
+# built-in that costs nothing, because a linked plugin never exports
+# the symbol anyway. The day someone wants this widget as a standalone
+# file, the shared half moves into a crate of its own, which is the
+# structural answer rather than a flag.
+default = []
+# Kept so the linked-in path and the shipped-.so path read alike; this
+# crate simply never turns it on.
 dyn = []
 
 # ------------------------------------------------------------------------
@@ -53,7 +60,3 @@ dyn = []
 # is not the root. Adding both crates to nacelle-addons' `members`
 # retires this block and appgrid's together.
 # ------------------------------------------------------------------------
-[workspace]
-
-[patch."https://github.com/JOCKER3201/libnacelle"]
-libnacelle = { path = "../../../libnacelle" }

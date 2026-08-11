@@ -35,7 +35,3 @@ dyn = []
 # and `cargo test` run in this directory while the crate is not yet a
 # member of anything.
 # ------------------------------------------------------------------------
-[workspace]
-
-[patch."https://github.com/JOCKER3201/libnacelle"]
-libnacelle = { path = "../../../libnacelle" }
