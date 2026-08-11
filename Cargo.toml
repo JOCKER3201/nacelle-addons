@@ -1,0 +1,26 @@
+# The compiled widgets, as one workspace.
+#
+# There is no library here: a widget is a file, and every widget in this
+# repository is either a Rhai script under widgets/ or one of the plugin
+# crates below, each built into its own .so. What the application and a
+# widget must agree on lives in the toolkit (nacelle::geometry), not
+# here. The four plugin crates below are the core widgets: they still
+# build into the classic dlopen .so (their default `dyn` feature), and
+# nacelle-desktop also links them in statically as git dependencies, so
+# the program works with nothing installed and nothing can uninstall
+# its core. Scripts under widgets/ are read from disk as always.
+
+[workspace]
+resolver = "2"
+members = [
+    "plugins/control",
+    "plugins/filesystem",
+    "plugins/keyboard",
+    "plugins/shell",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+

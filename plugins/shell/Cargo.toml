@@ -1,0 +1,24 @@
+[package]
+name = "nacelle-widget-shell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "The nacelle-desktop terminal view, as a compiled widget"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
+
+# Deliberately no panic = "abort" anywhere: this library catches panics
+# at every boundary it exports, and it can only do that if unwinding
+# exists. A panic crossing extern "C" is a dead process.
+
+[features]
+# The dlopen attach symbol. On for the shipped .so; a host that links
+# this crate statically turns it off, so four plugins' identical
+# attach symbols cannot collide inside one binary.
+default = ["dyn"]
+dyn = []

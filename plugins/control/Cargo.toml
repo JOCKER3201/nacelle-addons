@@ -1,0 +1,22 @@
+[package]
+name = "nacelle-widget-control"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "The nacelle-desktop control panel, as a compiled widget"
+license = "MIT"
+
+[lib]
+# A widget plugin is a C-callable dynamic library: the host loads it with
+# dlopen and talks to it through plain function pointers.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
+
+[features]
+# The dlopen attach symbol. On for the shipped .so; a host that links
+# this crate statically turns it off, so four plugins' identical
+# attach symbols cannot collide inside one binary.
+default = ["dyn"]
+dyn = []
