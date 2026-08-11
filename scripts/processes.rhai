@@ -26,6 +26,26 @@ fn draw() {
         1,
         // Striping helps a dense list scan; how often and in what tint
         // is the theme's (script.table_zebra_every, component.table.zebra).
-        #{ zebra: true, severity_col: 4 },
+        //
+        // The table answers the pointer (F2 §2.2): a click on a heading
+        // sorts by that column and clicking it again turns the order
+        // around, a click on a row keeps it — by PID, so the selection
+        // survives the second-by-second rewrite of the process table and
+        // any sort applied to it — and a name the ellipsis cut short
+        // gives itself in full when the pointer rests on it.
+        //
+        // No opening `sort`: the arrangement the collector hands over is
+        // the one this widget has always shown, and the user's first
+        // click is what changes it. No `scroll` either — the table shows
+        // what fits, exactly as before.
+        #{
+            zebra: true,
+            severity_col: 4,
+            id: "procs",
+            interactive: true,
+            select: "row",
+            key: 0,
+            tooltip: true,
+        },
     )]
 }
