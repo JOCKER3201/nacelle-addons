@@ -25,6 +25,7 @@ use nacelle::runtime::{
     ActionC, CellC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, TermReqC,
     TermSelectC, TermViewC, ABI_VERSION, ACTION_NONE, ACTION_SCROLL_TERMINAL,
     ACTION_SELECT_TAB, ACTION_TERM_SELECT, CELL_ABSENT, CELL_HAS_BG, CELL_SELECTED,
+    CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
     CELL_UNDERLINE, DRAG_BEGIN, DRAG_END, SELECT_KIND_CELLS, SELECT_OP_BEGIN, SELECT_OP_END,
     SELECT_OP_EXTEND, VIEW_CURSOR, VIEW_LIVE, VIEW_TRUNCATED,
 };
@@ -98,7 +99,9 @@ struct Tokens {
     tab_pad: u32,   // tab.pad
     tab_h: u32,     // tab.h
     tab_gap: u32,   // tab.gap
-    tab_skew: u32,  // tab.skew — deliberately not button.skew
+    tab_skew: u32,  // tab.skew — 0 in the master: a tab wears the frames' corners
+    tab_corner: u32,
+    tab_corner_style: u32,
     tab_count: u32, // tab.count — the strip before the host has said
     rule_c: u32,    // tab.rule_color — the line under the whole strip
     rule_w: u32,    // tab.rule
@@ -184,6 +187,8 @@ impl Tokens {
             tab_h: t("tab.h"),
             tab_gap: t("tab.gap"),
             tab_skew: t("tab.skew"),
+            tab_corner: t("tab.corner"),
+            tab_corner_style: t("tab.corner_style"),
             tab_count: t("tab.count"),
             rule_c: t("tab.rule_color"),
             rule_w: t("tab.rule"),
@@ -541,18 +546,42 @@ impl Shell {
             });
             let right = tr.x + tr.w;
             let bottom = tr.y + tr.h;
+            // A sheared tab is a quad; without shear it is the family's
+            // shape — the same corners the frames and every other
+            // button wear, drawn by the host so this plugin never has
+            // to know how an arc is tessellated.
+            let ring = skew <= 0.0 && api.has_ring();
+            let (cs, radius) = if ring {
+                let cs = match enum_word(api, ctx, ids.tab_corner_style).as_str() {
+                    "round" => CORNER_ROUND,
+                    "chamfer" => CORNER_CHAMFER,
+                    _ => CORNER_SQUARE,
+                };
+                (cs, px(ids.tab_corner))
+            } else {
+                (CORNER_SQUARE, 0.0)
+            };
             let pts: [f32; 8] = [
                 tr.x + skew, tr.y,
                 right, tr.y,
                 right - skew, bottom,
                 tr.x, bottom,
             ];
-            (api.quad)(ctx, pts.as_ptr(), st.fill);
-            // The rung's ring, drawn at last: this is where a theme's
-            // selected.edge = @border.focus reaches the active tab
-            // (u2 §2.9) — the whole ladder, not a special case here.
-            if st.edge_width > 0.0 && st.edge.a > 0.0 {
-                (api.polyline)(ctx, pts.as_ptr(), 4, st.edge_width, st.edge, true);
+            if ring {
+                let rc = RectC { x: tr.x, y: tr.y, w: tr.w, h: tr.h };
+                (api.ring_fill)(ctx, rc, cs, radius, st.fill);
+                // The rung's ring, drawn at last: this is where a
+                // theme's selected.edge = @border.focus reaches the
+                // active tab (u2 §2.9) — the whole ladder, not a
+                // special case here.
+                if st.edge_width > 0.0 && st.edge.a > 0.0 {
+                    (api.ring)(ctx, rc, cs, radius, st.edge_width, st.edge);
+                }
+            } else {
+                (api.quad)(ctx, pts.as_ptr(), st.fill);
+                if st.edge_width > 0.0 && st.edge.a > 0.0 {
+                    (api.polyline)(ctx, pts.as_ptr(), 4, st.edge_width, st.edge, true);
+                }
             }
 
             let label = if occupied {
