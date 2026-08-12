@@ -31,14 +31,15 @@
 //! `ActionC` has no code for "run this command", so the widget owns it.
 //!
 //! A file is opened here TOO, with the freedesktop opener the host would
-//! have run — and that deserves the argument rather than a shrug.
-//! `ACTION_OPEN_FILE` exists and the file browser rightly takes it, but
-//! it is reachable only from `click`: half of this panel's activations
-//! arrive through `key_feedback`, which carries no `ActionC` at all. One
-//! act reached two ways is how two behaviours are born, and "Enter and a
-//! click open the file differently" is a bug nobody would think to look
-//! for. So both take one path. The day the ABI grows a key entry that
-//! can answer with an action, both move to it together.
+//! have run — and now that `key` can answer with an `ActionC`, that
+//! needs a better argument than "the key path cannot". It is this: the
+//! panel activates TWO kinds of thing and only one of them has an
+//! action. Taking `ACTION_OPEN_FILE` for the file while the application
+//! still goes out of this file would put two owners on one word —
+//! activate — and "Enter opens a file differently from how it launches
+//! an application" is the bug nobody would think to look for. One act,
+//! one path, for both sources; the day `ActionC` can carry a launch,
+//! both move to the host together.
 //!
 //! Every colour, length, duration and word comes from the theme. Nothing
 //! here knows what a colour is: a missing token degrades through the raw
@@ -57,8 +58,8 @@ use crate::rank::Source;
 use nacelle::focus::{Key, KeyEv, Mods};
 use nacelle::object::text_input::InputMsg;
 use nacelle::runtime::{
-    ActionC, ChromeC, HostApi, PluginApi, RectC, ABI_VERSION, ACTION_CAPTURE, ACTION_NONE,
-    DRAG_BEGIN, DRAG_END, DRAG_MOVE,
+    keys, ActionC, ChromeC, HostApi, PluginApi, RectC, ABI_VERSION, ACTION_CAPTURE,
+    ACTION_NONE, DRAG_BEGIN, DRAG_END, DRAG_MOVE,
 };
 use nacelle::view::list::{self, ListState, ListStyle, ListView};
 use nacelle::view::model::{RowBuf, RowModel};
@@ -149,47 +150,53 @@ fn shorten(p: &Path, home: Option<&Path>) -> String {
     }
 }
 
-/// The key words the host spells its named keys with, as the neutral key
-/// set names them.
+/// The key event a boundary call means, if any.
 ///
-/// The list is longer than what the host sends today on purpose: the
-/// arrows and Delete are the words a host WILL send the day keys reach a
-/// focused widget, and a panel that already answers them is a panel that
-/// needs no second change then.
-fn named_key(label: &str) -> Option<Key> {
-    match label.to_ascii_uppercase().as_str() {
-        "ENTER" | "RETURN" => Some(Key::Enter),
-        "ESC" | "ESCAPE" => Some(Key::Escape),
-        "BACK" | "BACKSPACE" => Some(Key::Backspace),
-        "DEL" | "DELETE" => Some(Key::Delete),
-        "SPACE" => Some(Key::Space),
-        "TAB" => Some(Key::Tab),
-        "UP" => Some(Key::Up),
-        "DOWN" => Some(Key::Down),
-        "LEFT" => Some(Key::Left),
-        "RIGHT" => Some(Key::Right),
-        "HOME" => Some(Key::Home),
-        "END" => Some(Key::End),
-        _ => None,
-    }
-}
-
-/// The key event a `key_feedback` call means, if any.
+/// The table of words this used to carry is gone: [`keys::from_name`] is
+/// the ABI's OWN spelling of the neutral key set, so the panel now reads
+/// the words the host actually sends rather than a second list of them
+/// that could drift. It answers `None` for a word from a newer host,
+/// which is what a key this build does not know has to be.
 ///
-/// The entry carries a character OR a name and NO modifier state, so a
-/// chord cannot be built from it: the field's own ctrl shortcuts (select
-/// all, undo, the clipboard) are simply unreachable across this ABI.
-/// Stated here rather than worked around, because working around it
-/// would mean guessing at which chord a bare character came from.
-fn key_ev(ch: u32, label: Option<&str>) -> Option<KeyEv> {
+/// `mods` is the [`nacelle::runtime::MODS_CTRL`] bits. Unknown bits are
+/// dropped by [`Mods::from_bits`] rather than kept: a modifier this build
+/// does not know being held must not stop a chord it DOES know from
+/// matching.
+///
+/// `text` stays `None`, and that is the entry's own limit rather than
+/// this function's: the boundary carries a KEY, so a character is
+/// rebuilt from its scalar and a platform that expanded one press into
+/// several characters never reaches here at all.
+fn key_ev(ch: u32, label: Option<&str>, mods: u32) -> Option<KeyEv> {
     let key = match label {
-        Some(l) => named_key(l)?,
+        Some(l) => keys::from_name(l)?,
         None => {
             let c = char::from_u32(ch).filter(|c| !c.is_control())?;
             Key::Char(c)
         }
     };
-    Some(KeyEv { key, mods: Mods::NONE, repeat: false, text: None })
+    Some(KeyEv {
+        key,
+        mods: Mods::from_bits((mods & 0xff) as u8),
+        repeat: false,
+        text: None,
+    })
+}
+
+/// The label a boundary call passed, as a string — or `None` for a
+/// character key, which is what an empty one means on both key entries.
+///
+/// # Safety
+/// `label` must either be null or point at `label_len` readable bytes
+/// that stay put for the call. That is what both key entries promise,
+/// and it is why this is `unsafe` rather than a tidy helper: a safe
+/// function that dereferences a pointer somebody else chose is a safe
+/// function that can be made to read anything.
+unsafe fn label_of<'a>(label: *const u8, label_len: u32) -> Option<&'a str> {
+    if label.is_null() || label_len == 0 {
+        return None;
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(label, label_len as usize)).ok()
 }
 
 // ----------------------------------------------------------- the widget
@@ -425,8 +432,15 @@ impl Search {
         }
     }
 
-    /// A key, from wherever the host found one.
-    pub fn key(&mut self, ev: &KeyEv) {
+    /// A key delivered to this panel. Answers whether it was CONSUMED —
+    /// what [`nacelle::runtime::PluginApi::key`] returns, and what stops
+    /// the host from also spending it on focus navigation or a shortcut.
+    ///
+    /// [`Outcome::Ignored`] is the only "no": it is the model's word for
+    /// "nothing here answers this key", which is why an arrow at the end
+    /// of the list — a request to leave it — reaches the host rather
+    /// than being eaten by a panel that did nothing with it.
+    pub fn key(&mut self, ev: &KeyEv) -> bool {
         match self.finder.key(ev, self.now) {
             Outcome::Activate(s) => self.activate(s),
             Outcome::Moved => self.reveal(),
@@ -434,8 +448,9 @@ impl Search {
             // starts at its top. What waits for the throttle is the walk
             // of the home directory, which `draw` starts when it is due.
             Outcome::Edited => self.list.scroll.reset(),
-            Outcome::Ignored => {}
+            Outcome::Ignored => return false,
         }
+        true
     }
 
     /// A press. Answers what it activated, if anything.
@@ -592,12 +607,18 @@ impl Search {
                 select: true,
                 scroll: true,
                 tree: false,
-                // A trimmed row name would explain itself through the
-                // host's tooltip manager, which no ABI entry reaches
-                // (`Surface::tooltip` is a no-op on this side). Asking
-                // for one would cost a string comparison per visible row
-                // and buy nothing.
-                tooltip: false,
+                // A row name the ellipsis cut short finishes itself
+                // under the pointer. This panel is where that matters
+                // most: the answers are whatever the query found, so a
+                // long application name and a deep path are the ordinary
+                // case rather than the awkward one, and a row that ends
+                // in an ellipsis is an answer the reader cannot check.
+                // The box is the HOST's — filed over
+                // `HostApi::tooltip`, drawn last of everything, because
+                // a plugin paints in the middle of the frame and
+                // anything it drew outside its own rectangle would go
+                // under the panels drawn after it.
+                tooltip: true,
             }),
         );
     }
@@ -674,30 +695,92 @@ extern "C" fn wheel_c(
 
 extern "C" fn grid_c(_: *mut c_void, _: *mut u32, _: *mut u32) {}
 
-/// The only key channel this ABI has.
+/// Whether this host routes keys to the widget that owns the keyboard.
 ///
-/// It is named for the on-screen keyboard's benefit and the host routes
-/// it there today, which is why the query box is also fully usable with
-/// the pointer alone. The translation is here rather than nowhere so
-/// that the day keys reach a focused widget, the panel already answers
-/// them — and so that what a key MEANS is decided in one tested place
-/// ([`finder::Finder::key`]) rather than at the boundary.
+/// Nothing answers that directly: [`PluginApi::key`] is the PLUGIN's
+/// table, and a plugin cannot see how the host reads its own table. So
+/// the question is put to the HOST's, where `channel_read` was appended
+/// by the same change in the same version — a host whose `api_size`
+/// reaches one reaches both.
+///
+/// It has to be asked at all because `key_feedback` is a BROADCAST that
+/// arrives whatever else the host does. On a host that routes, acting on
+/// both would type every character twice.
+fn routes_keys(api: &HostApi) -> bool {
+    api.has_channel()
+}
+
+/// The BROADCAST, which this panel now listens to only where nothing
+/// else is delivered.
+///
+/// The entry is what it always was — every widget hears every key, so an
+/// on-screen keyboard can light up what somebody else is typing — and it
+/// is the wrong channel for a query box in three ways: it reaches every
+/// instance, so two search panels on one board would eat the same
+/// character; it carries no modifiers, so the field's own chords are
+/// unreachable; and it cannot answer, so a key it used is spent again by
+/// the host. [`key_c`] is the entry with none of those, and where the
+/// host offers it this one steps aside rather than doubling it.
+///
+/// What is left here is the older host's path, kept because it works:
+/// the panel typed through the broadcast before `key` existed, and a
+/// host that never calls `key` would otherwise have a query box with no
+/// keyboard at all.
 extern "C" fn key_feedback_c(
     instance: *mut c_void,
     ch: u32,
     label: *const u8,
     label_len: u32,
 ) {
-    let Some(this) = state(instance) else { return };
-    let label = if label.is_null() || label_len == 0 {
-        None
-    } else {
-        let bytes = unsafe { std::slice::from_raw_parts(label, label_len as usize) };
-        std::str::from_utf8(bytes).ok()
-    };
-    if let Some(ev) = key_ev(ch, label) {
+    let (Some(api), Some(this)) = (host(), state(instance)) else { return };
+    if routes_keys(api) {
+        return;
+    }
+    // No modifier state crosses this entry, so the chords stay out of
+    // reach here — guessing which one a bare character came from would
+    // be inventing input the user did not give.
+    // Safety: the entry's contract — a null pointer or `label_len`
+    // readable bytes that outlive the call.
+    let label = unsafe { label_of(label, label_len) };
+    if let Some(ev) = key_ev(ch, label, 0) {
         this.key(&ev);
     }
+}
+
+/// The key delivered to the widget that OWNS the keyboard, modifiers and
+/// all — the entry this panel was written against before it existed.
+///
+/// What a key MEANS is still decided in one tested place
+/// ([`finder::Finder::key`]) rather than at the boundary; what this
+/// function adds is the answer. Nonzero says the panel used the key, so
+/// the host must not also spend it on focus navigation, a shortcut or
+/// the shell's bytes: a character typed into the query box is not also a
+/// jump to the next panel.
+///
+/// `out` is left at [`ACTION_NONE`] on every path. Enter runs what was
+/// found, and both kinds of thing this panel finds are run from here —
+/// see the module header for why that is one path rather than two.
+extern "C" fn key_c(
+    instance: *mut c_void,
+    ch: u32,
+    label: *const u8,
+    label_len: u32,
+    mods: u32,
+    out: *mut ActionC,
+) -> u32 {
+    if let Some(out) = unsafe { out.as_mut() } {
+        out.kind = ACTION_NONE;
+    }
+    let Some(this) = state(instance) else { return 0 };
+    // Safety: the entry's contract — a null pointer or `label_len`
+    // readable bytes that outlive the call.
+    let label = unsafe { label_of(label, label_len) };
+    let Some(ev) = key_ev(ch, label, mods) else {
+        // A key this build cannot name and cannot spell is not one the
+        // panel used; leaving it to the host is the honest answer.
+        return 0;
+    };
+    this.key(&ev) as u32
 }
 
 /// Grows downwards: a taller panel is more answers, not bigger ones.
@@ -773,6 +856,25 @@ extern "C" fn pointer_c(
     0
 }
 
+/// Filled, and does nothing on purpose. The one gesture this panel takes
+/// is the thumb, and the thumb is `drag`'s — the single capture path, of
+/// which this entry is deliberately not a second. What is left for it is
+/// the press RUNG, and no control here draws one: the rows are a list,
+/// and the thumb's rungs are idle, hover and dragging, which the last
+/// frame's own state already says.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn button_c(
+    _: *mut c_void,
+    _: u32,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+    _: *mut ActionC,
+) {
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -787,6 +889,8 @@ static API: PluginApi = PluginApi {
     chrome: chrome_c,
     drag: drag_c,
     pointer: pointer_c,
+    key: key_c,
+    button: button_c,
 };
 
 /// This addon, for a host that LINKS the crate in instead of loading
@@ -957,20 +1061,170 @@ mod tests {
 
     #[test]
     fn the_key_channel_translates_what_it_can_and_refuses_the_rest() {
-        assert_eq!(key_ev('a' as u32, None).map(|e| e.key), Some(Key::Char('a')));
-        assert_eq!(key_ev(0, Some("ENTER")).map(|e| e.key), Some(Key::Enter));
-        assert_eq!(key_ev(0, Some("esc")).map(|e| e.key), Some(Key::Escape));
-        assert_eq!(key_ev(0, Some("DOWN")).map(|e| e.key), Some(Key::Down));
+        let ev = |ch, label| key_ev(ch, label, 0);
+        assert_eq!(ev('a' as u32, None).map(|e| e.key), Some(Key::Char('a')));
+        assert_eq!(ev(0, Some("ENTER")).map(|e| e.key), Some(Key::Enter));
+        assert_eq!(ev(0, Some("esc")).map(|e| e.key), Some(Key::Escape));
+        // The words the host could never send before this entry, every
+        // one of which the panel has something to do with.
+        assert_eq!(ev(0, Some("DOWN")).map(|e| e.key), Some(Key::Down));
+        assert_eq!(ev(0, Some("UP")).map(|e| e.key), Some(Key::Up));
+        assert_eq!(ev(0, Some("LEFT")).map(|e| e.key), Some(Key::Left));
+        assert_eq!(ev(0, Some("RIGHT")).map(|e| e.key), Some(Key::Right));
+        assert_eq!(ev(0, Some("HOME")).map(|e| e.key), Some(Key::Home));
+        assert_eq!(ev(0, Some("END")).map(|e| e.key), Some(Key::End));
+        assert_eq!(ev(0, Some("DELETE")).map(|e| e.key), Some(Key::Delete));
         // A name this build does not know is not a key, and neither is a
         // control character: guessing at either would type something the
         // user did not press.
-        assert!(key_ev(0, Some("F13")).is_none());
-        assert!(key_ev(0, Some("")).is_none());
-        assert!(key_ev(0x1b, None).is_none());
-        assert!(key_ev(0, None).is_none());
-        // No modifier state crosses this entry, so nothing built here
-        // ever claims one.
-        assert_eq!(key_ev('a' as u32, None).map(|e| e.mods), Some(Mods::NONE));
+        assert!(ev(0, Some("F13")).is_none());
+        assert!(ev(0, Some("")).is_none());
+        assert!(ev(0x1b, None).is_none());
+        assert!(ev(0, None).is_none());
+
+        // The modifiers, which are the whole reason for the second key
+        // entry: the bits cross as a number and rebuild as the set.
+        use nacelle::runtime::{MODS_ALT, MODS_CTRL, MODS_SHIFT};
+        let mods = |m| key_ev('a' as u32, None, m).map(|e| e.mods);
+        assert_eq!(mods(0), Some(Mods::NONE));
+        assert_eq!(mods(MODS_CTRL), Some(Mods::CTRL));
+        assert_eq!(mods(MODS_CTRL | MODS_SHIFT), Some(Mods::CTRL | Mods::SHIFT));
+        assert_eq!(mods(MODS_ALT), Some(Mods::ALT));
+        // A bit from a newer host is DROPPED, not kept: an unknown
+        // modifier held down must not stop a chord this build does know
+        // from matching.
+        assert_eq!(mods(MODS_CTRL | 1 << 20), Some(Mods::CTRL));
+
+        // A label pointer, as the boundary really passes one: empty and
+        // null are both "this is a character key", and bytes that are
+        // not UTF-8 are no key at all.
+        unsafe {
+            assert_eq!(label_of(b"UP".as_ptr(), 2), Some("UP"));
+            assert_eq!(label_of(b"UP".as_ptr(), 0), None);
+            assert_eq!(label_of(std::ptr::null(), 4), None);
+            assert_eq!(label_of([0xffu8, 0xfe].as_ptr(), 2), None);
+        }
+    }
+
+    /// A panel, without a window, a theme or a font: everything below is
+    /// decided in the model, which is what makes it testable at all.
+    fn panel(apps: Vec<AppEntry>, files: Vec<PathBuf>) -> Search {
+        let mut s = Search::new();
+        s.finder = Finder::new(apps);
+        s.finder.set_files(files);
+        s
+    }
+
+    fn app(name: &str) -> AppEntry {
+        AppEntry {
+            id: format!("{}.desktop", name.to_lowercase()),
+            name: name.to_string(),
+            exec: "/bin/true".into(),
+            terminal: false,
+            icon: String::new(),
+            categories: Vec::new(),
+        }
+    }
+
+    /// One key, as the host's table delivers it: a character or a word,
+    /// plus the modifier bits.
+    fn press(s: &mut Search, ch: char, label: Option<&str>, mods: u32) -> bool {
+        let ev = key_ev(ch as u32, label, mods).expect("a key this build knows");
+        s.key(&ev)
+    }
+
+    #[test]
+    fn the_chords_the_broadcast_could_never_carry_reach_the_query_box() {
+        let mut s = panel(vec![app("Firefox"), app("Files")], Vec::new());
+        use nacelle::runtime::MODS_CTRL;
+
+        // Typing, which worked before and still does.
+        for c in "fire".chars() {
+            assert!(press(&mut s, c, None, 0), "a character is the panel's");
+        }
+        assert_eq!(s.finder.query(), "fire");
+
+        // Ctrl+A then a character replaces the whole query — the select
+        // all that was unreachable while no entry carried a modifier.
+        assert!(press(&mut s, 'a', None, MODS_CTRL));
+        assert!(press(&mut s, 'x', None, 0));
+        assert_eq!(s.finder.query(), "x");
+
+        // Undo, and redo, which are the same story.
+        assert!(press(&mut s, 'z', None, MODS_CTRL));
+        assert_eq!(s.finder.query(), "fire", "undo puts back what was replaced");
+        assert!(press(&mut s, 'y', None, MODS_CTRL));
+        assert_eq!(s.finder.query(), "x");
+
+        // A chord the field has no meaning for is NOT consumed: it
+        // belongs to the host's shortcut registry, and a panel that ate
+        // it would make a desktop-wide binding stop working wherever a
+        // search box happened to have the keyboard.
+        assert!(!press(&mut s, 'q', None, MODS_CTRL));
+        assert_eq!(s.finder.query(), "x", "and types nothing either");
+
+        // The clipboard chords reach the field and the field asks for
+        // the clipboard — which no ABI entry hands a plugin. The model
+        // answers the intent with a shrug rather than pretending, so the
+        // key is not consumed and the host's own copy and paste keep
+        // working over this panel. That is a LIMIT of this version, not
+        // of the entry: `mods` arrives, the chord is recognised, and
+        // there is simply nothing on the other end of it yet.
+        assert!(!press(&mut s, 'c', None, MODS_CTRL));
+        assert!(!press(&mut s, 'v', None, MODS_CTRL));
+        assert_eq!(s.finder.query(), "x");
+    }
+
+    #[test]
+    fn the_navigation_keys_walk_the_answers_and_the_caret() {
+        let mut s = panel(
+            vec![app("Firefox"), app("Firewall"), app("Firmware")],
+            Vec::new(),
+        );
+        for c in "fir".chars() {
+            press(&mut s, c, None, 0);
+        }
+        assert_eq!(s.finder.hits().len(), 3);
+        assert_eq!(s.finder.cursor(), Some(0));
+
+        // The arrows walk the answer list — the keys the broadcast never
+        // sent at all, so this is the first time the panel can be driven
+        // without the pointer.
+        assert!(press(&mut s, '\0', Some("DOWN"), 0));
+        assert_eq!(s.finder.cursor(), Some(1));
+        assert!(press(&mut s, '\0', Some("DOWN"), 0));
+        assert_eq!(s.finder.cursor(), Some(2));
+        // Clamped at the end, and NOT consumed there: an arrow that
+        // changed nothing is the request to leave the list that it is,
+        // and the host's focus chain is what answers it.
+        assert!(!press(&mut s, '\0', Some("DOWN"), 0));
+        assert_eq!(s.finder.cursor(), Some(2));
+        assert!(press(&mut s, '\0', Some("UP"), 0));
+        assert_eq!(s.finder.cursor(), Some(1));
+
+        // HOME and END are the FIELD's, because a one-line field has
+        // nowhere vertical to go and the list is walked with the arrows:
+        // they move the caret, and the chosen row stays where it was.
+        assert!(press(&mut s, '\0', Some("HOME"), 0));
+        assert_eq!(s.finder.input.cursor(), 0);
+        assert_eq!(s.finder.cursor(), Some(1), "the answer list did not move");
+        assert!(press(&mut s, '\0', Some("END"), 0));
+        assert_eq!(s.finder.input.cursor(), "fir".len());
+
+        // DELETE forward from HOME, which is the other key that used to
+        // arrive as nothing.
+        press(&mut s, '\0', Some("HOME"), 0);
+        assert!(press(&mut s, '\0', Some("DELETE"), 0));
+        assert_eq!(s.finder.query(), "ir");
+
+        // Escape empties the box; a second Escape is not the panel's,
+        // because it belongs to whatever put the panel on screen.
+        assert!(press(&mut s, '\0', Some("ESC"), 0));
+        assert_eq!(s.finder.query(), "");
+        assert!(!press(&mut s, '\0', Some("ESC"), 0));
+
+        // And Enter over nothing is nobody's key either.
+        assert!(!press(&mut s, '\0', Some("ENTER"), 0));
     }
 
     /// The board this panel may be placed on, read the way the host
@@ -992,5 +1246,71 @@ mod tests {
         assert_ne!(WidgetCategory::default(), WidgetCategory::SearchAi);
         assert!(def.ref_h_vh > 0.0 && def.min_h_vh > 0.0);
         assert!(def.min_h_vh <= def.ref_h_vh);
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use nacelle::runtime::{
+        BUTTON_PRESS, BUTTON_RELEASE, MODS_CTRL, PLUGIN_API_HAS_BUTTON,
+    };
+
+    /// A value no entry of this widget could ever write, so "left alone"
+    /// is something a test can see.
+    fn untouched() -> ActionC {
+        ActionC { kind: u32::MAX, index: 0, lines: 0, data: std::ptr::null(), data_len: 0 }
+    }
+
+    /// The entries appended in this version are filled AND declared, and
+    /// this is the widget where one of them does something.
+    ///
+    /// Filled and declared are two different things, and the host checks
+    /// the second: it reads `api_size` before it calls either, so a table
+    /// that carried the pointers without reaching them would be a widget
+    /// the host never asks.
+    ///
+    /// Driven through the TABLE rather than through `Search::key`, so
+    /// what is proved is the boundary itself — the pointers, the labels
+    /// as bytes with a length, the modifier bits as a number, and the
+    /// answer the host reads.
+    #[test]
+    fn the_appended_entries_are_declared_and_the_key_one_answers() {
+        assert_eq!(API.api_size as usize, std::mem::size_of::<PluginApi>());
+        assert!(API.api_size as usize >= PLUGIN_API_HAS_BUTTON);
+
+        let inst = (API.create)();
+        assert!(!inst.is_null());
+        let mut a = untouched();
+
+        // A character is the panel's, and the answer says so — which is
+        // what stops the host spending it a second time on itself.
+        assert_eq!((API.key)(inst, 'f' as u32, std::ptr::null(), 0, 0, &mut a), 1);
+        assert_eq!(a.kind, ACTION_NONE, "consumed, and nothing asked of the application");
+        // A chord the field understands, over the boundary as bits.
+        a = untouched();
+        assert_eq!((API.key)(inst, 'a' as u32, std::ptr::null(), 0, MODS_CTRL, &mut a), 1);
+        // TAB is NOT the panel's: the host must still be able to move the
+        // focus off a search box, and a panel that ate it would trap the
+        // keyboard where the user put it once.
+        let tab = keys::TAB;
+        assert_eq!((API.key)(inst, 0, tab.as_ptr(), tab.len() as u32, 0, &mut a), 0);
+        // Nor is a word this build cannot name.
+        let unknown = "F13";
+        assert_eq!(
+            (API.key)(inst, 0, unknown.as_ptr(), unknown.len() as u32, 0, &mut a),
+            0
+        );
+
+        // The press entry is filled and deliberately empty — see
+        // `button_c` for why the gesture is `drag`'s alone.
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut b = untouched();
+        for phase in [BUTTON_PRESS, BUTTON_RELEASE] {
+            (API.button)(inst, phase, 1.0, 1.0, r, 100.0, 100.0, &mut b);
+        }
+        assert_eq!(b.kind, u32::MAX, "an entry that does nothing writes nothing");
+
+        (API.destroy)(inst);
     }
 }

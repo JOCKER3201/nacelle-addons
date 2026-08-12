@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
 
 # The launcher's shared half — the XDG scan, the categories, the tile
-# grid, the index and the selection cell — which the categories widget
+# grid, the index and the selection — which the categories widget
 # is built out of too. It exports NO attach symbol, so linking it here
 # leaves this library with exactly one entry point, which is what lets
 # both launcher widgets be shipped as files.

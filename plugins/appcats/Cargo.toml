@@ -20,11 +20,11 @@ libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
 # ladder and scrollbar (`tile`). Nothing about a desktop entry is
 # parsed twice in this tree.
 #
-# It is also how the two widgets reach each other: clicking a row here
-# writes `selection`, and the grid reads it — which works only while a
-# host LINKS both widgets into one binary. See the head of
-# launcher-core/src/selection.rs for why that is a deliberate stopgap,
-# what a `.so` build of each loses, and what replaces it.
+# It is NOT how the two widgets reach each other: clicking a row here
+# publishes the choice on the HOST's channel and the grid reads it from
+# there. See the head of launcher-core/src/selection.rs for why a value
+# in this shared crate could never carry it — two `.so` files carry two
+# copies of the crate, and only the host has one of anything.
 #
 # The crate this depends on exports no attach symbol of its own, so
 # this library has exactly one — which is what the widget used to be

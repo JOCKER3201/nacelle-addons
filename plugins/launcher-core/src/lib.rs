@@ -37,10 +37,11 @@
 //!   arithmetic from a content box to rows of tiles, and the shapes a
 //!   tile is made of.
 //! * [`sections`] — the alphabetical index over those tiles.
-//! * [`selection`] — the cell the two widgets meet in. Read its head
-//!   before either widget: it is the one thing in this tree that is a
-//!   stopgap rather than a design, and splitting the crates has made
-//!   the limit it describes a live one.
+//! * [`selection`] — the ONE fact the two widgets have to agree on, and
+//!   the host channel that carries it between them. Read its head
+//!   before either widget: the choice does not live in this crate at
+//!   all, because two `.so` files carry two copies of this crate and
+//!   only the host has one of anything.
 //!
 //! Nothing here decides a colour, a length or a word: every one arrives
 //! from the theme through ABI 5/6 tokens, and a missing token degrades

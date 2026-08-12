@@ -15,12 +15,13 @@
 //!
 //! # How the two widgets reach each other
 //!
-//! Through [`nacelle_launcher_core::selection`], and the long comment
-//! at the head of that module is the one worth reading: the host has no
-//! channel between widgets, this is a static cell that works only
-//! because both widgets are linked into one binary, and the real fix is
-//! an ABI in `libnacelle`. This file is one of that cell's two callers
-//! — the writing one.
+//! Through the HOST. A click publishes the chosen group's name on
+//! `nacelle::channel` under [`nacelle_launcher_core::selection::TOPIC`],
+//! and the grid next door reads it on its next frame — see the head of
+//! [`nacelle_launcher_core::selection`] for why the value cannot live in
+//! either widget or in the crate they share: two `.so` files carry two
+//! copies of that crate, and only the host has one of anything. This
+//! file is the WRITING end of that channel.
 //!
 //! It is the grid's sister, not its copy. The menu is found by the ONE
 //! XDG scanner, the groups are read by the ONE reading of the menu
@@ -47,7 +48,7 @@ use nacelle::runtime::{
 use nacelle::widget::factory::BuiltinWidget;
 use nacelle_launcher_core::cats::{self, Category};
 use nacelle_launcher_core::desktop::{self, AppEntry};
-use nacelle_launcher_core::selection::{self, Selection};
+use nacelle_launcher_core::selection::{Selection, Watch};
 use nacelle_launcher_core::tile::{self, Rect, TileLook, TileTheme};
 use std::ffi::c_void;
 use std::time::Instant;
@@ -253,10 +254,10 @@ pub struct Appcats {
     entries: Vec<AppEntry>,
     /// The groups those entries fall into, alphabetically.
     cats: Vec<Category>,
-    /// What the launcher is pointed at, as of this frame. Read from the
-    /// shared cell rather than held here: another panel of this widget
-    /// may have been the one that set it.
-    sel: Selection,
+    /// What the launcher is pointed at, as of this frame. A view of the
+    /// host's board rather than a fact of this instance: another panel
+    /// of this widget may have been the one that set it.
+    sel: Watch,
     /// Scroll offset in pixels; whole rows.
     scroll: f32,
     /// What was where in the last frame, for the hit test.
@@ -290,10 +291,11 @@ impl Appcats {
         Appcats {
             entries,
             cats,
-            // Whatever the launcher is already on. NOT reset to ALL:
-            // a second categories panel opened later must show the
+            // A view that has not looked yet; the first frame's poll
+            // adopts whatever the launcher is already on. NOT a reset to
+            // ALL: a second categories panel opened later must show the
             // choice already made, not undo it.
-            sel: selection::get(),
+            sel: Watch::new(),
             scroll: 0.0,
             hits: Vec::new(),
             pressed: None,
@@ -331,10 +333,14 @@ impl Appcats {
         // row chosen in a list that no longer holds it would be a
         // selection pointing at nothing, and an empty grid with no way
         // to say why.
-        if let Some(name) = selection::get().name() {
-            if !self.cats.iter().any(|c| c.name == name) {
-                selection::set(Selection::All);
-            }
+        self.sel.poll();
+        let gone = self
+            .sel
+            .get()
+            .name()
+            .is_some_and(|name| !self.cats.iter().any(|c| c.name == name));
+        if gone {
+            self.sel.set(Selection::All);
         }
     }
 
@@ -343,12 +349,11 @@ impl Appcats {
     }
 
     /// A click on a row points the launcher grid at what that row says,
-    /// and nothing else — the grid reads the same cell on its next
-    /// frame. There is no action for the host to take: `ActionC` has no
-    /// code that means "another widget should now show something else",
-    /// and inventing one is the ABI change this widget is working
-    /// around rather than pre-empting (see
-    /// [`nacelle_launcher_core::selection`]).
+    /// and nothing else — the grid reads the same topic on its next
+    /// frame. There is still no action for the host to take: `ActionC`
+    /// has no code that means "another widget should now show something
+    /// else", and it needs none, because the channel says it without
+    /// naming the widget that listens.
     pub fn click(&mut self, x: f32, y: f32) {
         let Some(hit) = self.hits.iter().find(|(r, _)| r.contains(x, y)).map(|&(_, h)| h)
         else {
@@ -362,11 +367,10 @@ impl Appcats {
                 Selection::Named(c.name.to_string())
             }
         };
-        // Kept here as well as written to the cell, so that the rest of
-        // THIS frame's hit list and the next draw agree without waiting
-        // for a read back.
-        self.sel = what.clone();
-        selection::set(what);
+        // Published and adopted in one call, so the rest of THIS
+        // frame's hit list and the next draw agree without waiting for
+        // a read back — see [`Watch::set`].
+        self.sel.set(what);
     }
 
     /// Whether a row is the chosen one. By NAME and not by row number,
@@ -374,7 +378,7 @@ impl Appcats {
     /// groups, and installing a game where there were none moves every
     /// group after it by one.
     fn chosen(&self, hit: Hit) -> bool {
-        match (hit, self.sel.name()) {
+        match (hit, self.sel.get().name()) {
             (Hit::All, None) => true,
             (Hit::Cat(i), Some(name)) => {
                 self.cats.get(i).map(|c| c.name == name).unwrap_or(false)
@@ -411,8 +415,10 @@ impl Appcats {
     fn draw(&mut self, api: &HostApi, ctx: *mut c_void, r: Rect) {
         self.hits.clear();
         self.follow();
-        // The chosen row can have been chosen in the other panel.
-        self.sel = selection::get();
+        // The chosen row can have been chosen in the other panel, or in
+        // another copy of this one. Cheap on the frames where it was
+        // not: a sequence number, not a copy of the value.
+        self.sel.poll();
         let look = self.look(api, ctx);
         self.wheel_px = look.list.wheel_px;
 
@@ -781,6 +787,38 @@ extern "C" fn pointer_c(
     0
 }
 
+/// Filled and consumes nothing, on purpose: this list is walked with
+/// the pointer and has no keyboard behaviour to take a key away for.
+/// The arrows are the focus chain's until this panel grows a keyboard
+/// cursor of its own, and answering 0 is what leaves them there.
+extern "C" fn key_c(
+    _: *mut c_void,
+    _: u32,
+    _: *const u8,
+    _: u32,
+    _: u32,
+    _: *mut ActionC,
+) -> u32 {
+    0
+}
+
+/// Filled and does nothing, on purpose. The press rung this entry
+/// carries is one this panel already draws from its own clock — a row
+/// marks itself for `motion.press.duration_ms` from the click — so
+/// taking the press here as well would be a second source of one state.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn button_c(
+    _: *mut c_void,
+    _: u32,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+    _: *mut ActionC,
+) {
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -795,6 +833,8 @@ static API: PluginApi = PluginApi {
     chrome: chrome_c,
     drag: drag_c,
     pointer: pointer_c,
+    key: key_c,
+    button: button_c,
 };
 
 /// This addon, for a host that LINKS the crate in instead of loading
@@ -895,7 +935,7 @@ mod list_tests {
         Appcats {
             entries,
             cats,
-            sel: Selection::All,
+            sel: Watch::new(),
             scroll: 0.0,
             hits: Vec::new(),
             pressed: None,
@@ -936,6 +976,11 @@ mod list_tests {
         }
     }
 
+    /// The ONE test in this crate that writes the host's board. The
+    /// board is process-wide, so a second writer would race this one
+    /// under the default harness; every other test here builds a panel
+    /// whose [`Watch`] has not polled, which is why none of them can see
+    /// what this one publishes.
     #[test]
     fn choosing_a_row_points_the_grid_and_moves_the_mark_with_it() {
         let mut p = panel(vec![
@@ -945,39 +990,46 @@ mod list_tests {
         let at = |p: &Appcats, name: &str| {
             Hit::Cat(p.cats.iter().position(|c| c.name == name).unwrap())
         };
-        // Clicking a group is written to the cell the grid reads, and
-        // marks that row and only that row.
+        // Choosing a group publishes it for the grid to read, and marks
+        // that row and only that row. A second view of the board — a
+        // grid in another `.so`, as far as this crate is concerned —
+        // hears exactly what was chosen.
+        let mut grid = Watch::new();
         let utility = at(&p, "Utility");
-        p.sel = Selection::Named("Utility".to_string());
-        selection::set(p.sel.clone());
-        assert_eq!(selection::get(), Selection::Named("Utility".to_string()));
+        p.sel.set(Selection::Named("Utility".to_string()));
+        assert!(grid.poll(), "the grid hears the click");
+        assert_eq!(grid.get().name(), Some("Utility"));
         assert!(p.chosen(utility));
         assert!(!p.chosen(Hit::All));
         assert!(!p.chosen(at(&p, "Audio")));
 
         // Switching moves the mark rather than adding a second one.
         let audio = at(&p, "Audio");
-        p.sel = Selection::Named("Audio".to_string());
+        p.sel.set(Selection::Named("Audio".to_string()));
+        assert!(grid.poll());
+        assert_eq!(grid.get().name(), Some("Audio"));
         assert!(p.chosen(audio));
         assert!(!p.chosen(utility));
 
         // And the top row takes it back.
-        p.sel = Selection::All;
+        p.sel.set(Selection::All);
+        assert!(grid.poll());
+        assert!(grid.get().is_all());
         assert!(p.chosen(Hit::All));
         assert!(!p.chosen(audio));
 
         // A chosen group the menu no longer has marks nothing at all —
         // which is the state `follow` then puts back on ALL.
-        p.sel = Selection::Named("Science".to_string());
+        p.sel.set(Selection::Named("Science".to_string()));
         assert!(!p.chosen(Hit::All));
         for i in 0..p.cats.len() {
             assert!(!p.chosen(Hit::Cat(i)));
         }
         assert!(!p.cats.iter().any(|c| c.name == "Science"));
 
-        // Put the shared cell back: it is process-wide, and a test that
-        // left it set would be steering every other test's grid.
-        selection::set(Selection::All);
+        // Put the board back: it is process-wide, and a test that left
+        // it set would be steering every other test's grid.
+        p.sel.set(Selection::All);
     }
 
     #[test]
@@ -1003,5 +1055,58 @@ mod list_tests {
         let none = panel(Vec::new());
         assert!(none.cats.is_empty());
         assert!(none.entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use nacelle::runtime::{
+        BUTTON_PRESS, BUTTON_RELEASE, MODS_CTRL, PLUGIN_API_HAS_BUTTON,
+    };
+
+    /// A value no entry of this widget could ever write, so "left alone"
+    /// is something a test can see.
+    fn untouched() -> ActionC {
+        ActionC { kind: u32::MAX, index: 0, lines: 0, data: std::ptr::null(), data_len: 0 }
+    }
+
+    /// The entries appended in this version are filled AND declared.
+    ///
+    /// Two different things, and the host checks the second: it reads
+    /// `api_size` before it calls either, so a table that carried the
+    /// pointers without reaching them would be a widget the host never
+    /// asks. `size_of` says it here because the table is one literal.
+    ///
+    /// That they do NOTHING is pinned too. It is a decision, written out
+    /// above `key_c` and `button_c`, and a later change that gave
+    /// this widget a keyboard or a press rung has to come past those
+    /// reasons — and past this test — rather than round them.
+    #[test]
+    fn the_appended_entries_are_declared_and_take_nothing() {
+        assert_eq!(API.api_size as usize, std::mem::size_of::<PluginApi>());
+        assert!(API.api_size as usize >= PLUGIN_API_HAS_BUTTON);
+
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut a = untouched();
+        // A character, a named key and a chord: nothing here is the
+        // widget's, so the host keeps all three.
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 'a' as u32, std::ptr::null(), 0, 0, &mut a),
+            0
+        );
+        let word = nacelle::runtime::keys::DOWN;
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 0, word.as_ptr(), word.len() as u32, 0, &mut a),
+            0
+        );
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 'c' as u32, std::ptr::null(), 0, MODS_CTRL, &mut a),
+            0
+        );
+        for phase in [BUTTON_PRESS, BUTTON_RELEASE] {
+            (API.button)(std::ptr::null_mut(), phase, 1.0, 1.0, r, 100.0, 100.0, &mut a);
+        }
+        assert_eq!(a.kind, u32::MAX, "an entry that does nothing writes nothing");
     }
 }
