@@ -27,7 +27,6 @@
 //! password box, and a masked field that no test covers is a promise
 //! about a secret.
 
-use nacelle::draw::CornerStyle;
 use nacelle::object::text_input::InputModel;
 use nacelle::theme::parse::State;
 use nacelle::ui::Align;
@@ -123,21 +122,33 @@ pub fn draw(
     let hovered = r.contains(mx, my);
 
     // ---- the box ----------------------------------------------------
-    let corner = sf.px("field.corner").max(0.0);
+    // A LENGTH IS NOT A SHAPE: `field.corner` carries how FAR the corner
+    // is cut and `field.corner_style` carries HOW, and both were this
+    // file's own until now — the radius clamped at zero, the cut spelled
+    // `Round` in the code. The clamp ate §5.0's `pill`, which is a word
+    // about this box rather than a length, so a master writing
+    // `@corner.pill` on its search field got the very square it wrote to
+    // avoid; the spelled-in `Round` left the one control you type into
+    // rounded in a theme that chamfers its controls, which is the case
+    // `field.corner_style`'s own comment in the master is about. Both
+    // readers are the toolkit's, so this box and the object layer's
+    // field cut their corners by one rule.
+    let corner = paint::corner_radius(sf, "field.corner", r, 1.0);
+    let cut = paint::corner_style(sf, "field.corner_style");
     let fill = sf.bed("component.field.fill");
-    sf.ring_fill(r, CornerStyle::Round, corner, fill);
+    sf.ring_fill(r, cut, corner, fill);
     // The ladder's wash over the bed — idle is a wash too, the button
     // idiom. The field has no press rung of its own; focus is carried by
     // the ring's width below, which is what `field.border_focused` is.
     let state = if hovered { State::Hover } else { State::Idle };
     let wash = sf.class_state("field", state).fill;
-    sf.ring_fill(r, CornerStyle::Round, corner, wash);
+    sf.ring_fill(r, cut, corner, wash);
     let bw = sf
         .px(if focused { "field.border_focused" } else { "field.border" })
         .max(0.0);
     if bw > 0.0 {
         let c = sf.color("component.field.border");
-        sf.ring(r, CornerStyle::Round, corner, bw, c);
+        sf.ring(r, cut, corner, bw, c);
     }
 
     // ---- type metrics -----------------------------------------------
@@ -305,6 +316,159 @@ pub fn draw(
         match m.value()[at..].chars().next() {
             Some(c) => at += c.len_utf8(),
             None => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+    use nacelle::draw::CornerStyle;
+    use nacelle::theme::{self, Color};
+    use nacelle::view::surface::StateInk;
+    use std::collections::HashMap;
+
+    /// A surface that answers the REAL master and writes down every ring
+    /// it is asked for, with a way to say what ONE token holds — which is
+    /// how a value the shipped theme does not write (`@corner.pill` on a
+    /// search field) can be put in front of this code without a second
+    /// theme file. Everything else comes from the loaded master, so the
+    /// path under test is the drawing path and not a fixture of it.
+    #[derive(Default)]
+    struct Probe {
+        rings: Vec<(Rect, CornerStyle, f32)>,
+        px: HashMap<String, f32>,
+        words: HashMap<String, String>,
+    }
+
+    impl Surface for Probe {
+        fn ring_fill(&mut self, r: Rect, style: CornerStyle, radius: f32, _c: Color) {
+            self.rings.push((r, style, radius));
+        }
+        fn ring(&mut self, r: Rect, style: CornerStyle, radius: f32, _w: f32, _c: Color) {
+            self.rings.push((r, style, radius));
+        }
+        fn rect(&mut self, _r: Rect, _c: Color) {}
+        fn rect_outline(&mut self, _r: Rect, _w: f32, _c: Color) {}
+        fn line(&mut self, _x0: f32, _y0: f32, _x1: f32, _y1: f32, _w: f32, _c: Color) {}
+        fn polyline(&mut self, _p: &[[f32; 2]], _w: f32, _c: Color, _closed: bool) {}
+        fn text(&mut self, _px: f32, _x: f32, _y: f32, _s: &str, _c: Color, _t: f32, _a: Align) {}
+        /// Half an em a character: wrong about fonts, right about
+        /// monotonicity, which is all the caret arithmetic asks.
+        fn measure(&mut self, px: f32, s: &str, _track: f32) -> f32 {
+            s.chars().count() as f32 * px * 0.5
+        }
+        fn clip(&mut self, _r: Rect) -> bool {
+            true
+        }
+        fn unclip(&mut self) {}
+        fn has_token(&mut self, name: &str) -> bool {
+            theme::id(name).is_some()
+        }
+        fn px(&mut self, name: &str) -> f32 {
+            match self.px.get(name) {
+                Some(v) => *v,
+                None => theme::resolved().px(theme::id(name).unwrap_or(theme::TokenId::MISSING)),
+            }
+        }
+        fn color(&mut self, name: &str) -> Color {
+            theme::resolved().color(theme::id(name).unwrap_or(theme::TokenId::MISSING))
+        }
+        fn bed(&mut self, name: &str) -> Color {
+            theme::resolved().bed(theme::id(name).unwrap_or(theme::TokenId::MISSING))
+        }
+        fn flag(&mut self, name: &str) -> bool {
+            theme::resolved().flag(theme::id(name).unwrap_or(theme::TokenId::MISSING))
+        }
+        fn word(&mut self, name: &str) -> String {
+            match self.words.get(name) {
+                Some(w) => w.clone(),
+                None => theme::id(name).and_then(theme::enum_word_of).unwrap_or_default(),
+            }
+        }
+        fn class_state(&mut self, class: &str, state: State) -> StateInk {
+            match theme::class_id(class) {
+                Some(c) => StateInk::from(theme::resolved().class_state(c, state)),
+                None => StateInk::raw(),
+            }
+        }
+        fn epoch(&mut self) -> u32 {
+            theme::epoch()
+        }
+        fn now(&self) -> f64 {
+            0.0
+        }
+        fn mouse(&self) -> (f32, f32) {
+            // Off the box, so the resting rung is the one drawn.
+            (-1.0, -1.0)
+        }
+        fn scale(&self) -> f32 {
+            1.0
+        }
+    }
+
+    /// The box the field is drawn in, and every ring that reached the
+    /// surface for it.
+    const BOX: Rect = Rect { x: 0.0, y: 0.0, w: 300.0, h: 36.0 };
+
+    fn rings(sf: &mut Probe) -> Vec<(Rect, CornerStyle, f32)> {
+        theme::load();
+        let m = InputModel::new();
+        let mut v = FieldView::default();
+        draw(sf, BOX, &m, &mut v, "browser", false);
+        sf.rings.clone()
+    }
+
+    /// `@corner.pill` on the search field is a CAPSULE: half the shorter
+    /// side of the box it is a word about. The clamp this file used to
+    /// carry (`sf.px(..).max(0.0)`) turned §5.0's sentinel into a plain
+    /// zero before the surface could read it, so the master wrote `pill`
+    /// and the screen showed the square it wrote `pill` to avoid.
+    #[test]
+    fn a_pill_corner_reaches_the_surface_as_half_the_short_side() {
+        theme::load();
+        let pill = theme::expr::sentinel("pill").expect("§5.0 declares pill");
+        let mut sf = Probe::default();
+        sf.px.insert("field.corner".into(), pill);
+        let got = rings(&mut sf);
+        assert!(!got.is_empty(), "the box drew no ring at all");
+        for (r, _, radius) in &got {
+            assert_eq!(*radius, r.h / 2.0, "a radius of {radius} where the capsule is {}", r.h / 2.0);
+        }
+    }
+
+    /// The CUT is the master's word, not this file's. Spelled in as
+    /// `Round`, it left the one control you type into rounded in a theme
+    /// that chamfers its controls — the case `field.corner_style`'s own
+    /// comment in the master is about.
+    #[test]
+    fn the_cut_is_the_word_the_master_holds_and_not_a_spelled_in_one() {
+        let mut sf = Probe::default();
+        sf.words.insert("field.corner_style".into(), "chamfer".into());
+        for (_, style, _) in rings(&mut sf) {
+            assert_eq!(style, CornerStyle::Chamfer, "the theme's word was not followed");
+        }
+        let mut sf = Probe::default();
+        sf.words.insert("field.corner_style".into(), "square".into());
+        for (_, style, _) in rings(&mut sf) {
+            assert_eq!(style, CornerStyle::Square, "the theme's word was not followed");
+        }
+    }
+
+    /// And the word the shipped master holds is one this surface can
+    /// actually cut — a renamed or dropped key fails here rather than
+    /// silently squaring the search box.
+    #[test]
+    fn the_masters_own_field_shape_is_a_cut_this_file_can_draw() {
+        theme::load();
+        let id = theme::id("field.corner_style").expect("field.corner_style");
+        let word = theme::enum_word_of(id).expect("the key names no word");
+        assert!(matches!(word.as_str(), "square" | "round" | "chamfer"), "{word}");
+        let mut sf = Probe::default();
+        let drawn = rings(&mut sf);
+        assert!(!drawn.is_empty());
+        for (_, style, _) in drawn {
+            assert_eq!(style, paint::corner_style(&mut Probe::default(), "field.corner_style"));
         }
     }
 }

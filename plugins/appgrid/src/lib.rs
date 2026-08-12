@@ -27,9 +27,9 @@
 //! neutral, legible, and nobody's design.
 //!
 //! Every colour, length, duration and word comes from the theme through
-//! ABI 5/6 tokens. Nothing here knows what a colour is: a missing token
-//! degrades through the raw answers the ABI itself gives (grey ink,
-//! zero lengths), never through a number that used to be the design.
+//! ABI 5/6 tokens. Nothing here knows what a colour is: a token nobody
+//! can answer degrades to no ink and no length — nothing drawn — never
+//! to a number that used to be the design.
 //!
 //! Almost none of the above is written here. The XDG scan, the
 //! categories, the tile grid, the index and the selection are
@@ -239,7 +239,7 @@ impl Appgrid {
         let epoch = (api.theme_epoch)(ctx);
         if self.theme.as_ref().map(|(t, _)| t.epoch) != Some(epoch) {
             self.theme =
-                Some((TileTheme::resolve(api, epoch), HeadTheme::resolve(api, ctx, epoch)));
+                Some((TileTheme::resolve(api, ctx, epoch), HeadTheme::resolve(api, ctx, epoch)));
         }
         match &self.theme {
             Some((t, h)) => {
@@ -681,12 +681,10 @@ mod token_tests {
         "filetile.wheel_px",
         "filetile.row_justify",
         "icon.size.launcher",
-        // type.caption.* — a launcher tile caption
-        "type.caption.size",
-        "type.caption.min_px",
-        "type.caption.tracking",
-        "type.caption.leading",
-        "type.caption.case",
+        // The caption's BINDING. The role's own family is not listed
+        // here — it is spelled `type.<word>.*` at run time, and the
+        // test below chases the word the master actually binds.
+        "tile.caption_role",
         "emptystate.y_frac",
         "motion.press.duration_ms",
         "motion.scale",
