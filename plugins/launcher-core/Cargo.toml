@@ -1,0 +1,23 @@
+[package]
+name = "nacelle-launcher-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "The launcher's shared half: the XDG scan, the categories, the tile grid and the index"
+license = "MIT"
+
+[lib]
+# An `rlib` and nothing else, deliberately. This crate is not an addon:
+# it exports no `nacelle_plugin_attach`, no `WIDGET`, and there is no
+# `launcher-core.so` to install. It is the code the two launcher
+# widgets are BUILT OUT OF, so each of them can be its own file.
+crate-type = ["rlib"]
+
+[dependencies]
+libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
+
+# fork / setsid / execvp / waitpid, for handing an application over to
+# init instead of keeping it as a child of the desktop (src/desktop.rs).
+# The same crate the toolkit already builds on every unix, so this adds
+# nothing new to the tree.
+libc = "0.2"

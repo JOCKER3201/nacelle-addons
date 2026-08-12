@@ -1,23 +1,34 @@
 # The compiled widgets, as one workspace.
 #
-# There is no library here: a widget is a file, and every widget in this
-# repository is either a Rhai script under widgets/ or one of the plugin
-# crates below, each built into its own .so. What the application and a
-# widget must agree on lives in the toolkit (nacelle::geometry), not
-# here. The four plugin crates below are the core widgets: they still
-# build into the classic dlopen .so (their default `dyn` feature), and
-# nacelle-desktop also links them in statically as git dependencies, so
-# the program works with nothing installed and nothing can uninstall
-# its core. Scripts under widgets/ are read from disk as always.
+# A widget is a FILE. Every widget in this repository is either a Rhai
+# script under scripts/ or one of the widget crates below, each
+# built into its own .so and installed beside its .meta, exactly as a
+# third-party compiled addon would be. Where a widget's controls are is
+# the widget's own business: the application asks through the toolkit's
+# widget interface (`pointer`) instead of holding a copy of anybody's
+# geometry.
+#
+# The one crate that is NOT a widget is plugins/launcher-core: the
+# launcher's shared half, which both launcher widgets link and neither
+# owns. It exports no attach symbol and installs nothing, so no .so in
+# this tree ever carries two entry points.
+#
+# Every widget crate also builds with its `dyn` feature off, which
+# drops the dlopen attach symbol and leaves the crate linkable — the
+# path nacelle-desktop takes for a core that no file can uninstall.
+# The two builds are the same code; only the entry point differs.
 
 [workspace]
 resolver = "2"
 members = [
+    "plugins/ai",
     "plugins/appcats",
     "plugins/appgrid",
     "plugins/control",
     "plugins/filesystem",
     "plugins/keyboard",
+    "plugins/launcher-core",
+    "plugins/search",
     "plugins/shell",
 ]
 
@@ -25,3 +36,5 @@ members = [
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# ------------------------------------------------------------------------

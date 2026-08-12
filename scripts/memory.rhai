@@ -1,3 +1,9 @@
+// label: MEMORY
+// ref_h: 12.0
+// min_h: 9.0
+// slot: left
+// order: 4
+// weight: 18
 fn draw() {
     let out = [
         // The heading moves to the host's band (u2 §2.6).

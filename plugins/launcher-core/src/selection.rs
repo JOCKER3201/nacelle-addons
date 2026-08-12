@@ -22,27 +22,36 @@
 //! That belongs in `libnacelle`, and nothing in this directory may write
 //! it.
 //!
-//! What CAN be done from here is what this module does. Both widgets are
-//! BUILT-IN plugins: `nacelle-desktop` links them statically, into one
-//! binary, and `appcats` names `appgrid` as a path dependency, so there
-//! is exactly one copy of this crate — and therefore exactly one copy of
-//! the cell below — in the process. Two widgets reaching the same static
-//! is then not a coincidence to be defended against but the linkage the
-//! build already guarantees.
+//! What CAN be done from here is what this module does, and it works
+//! under exactly one condition: both widgets are LINKED into the same
+//! binary. `nacelle-desktop` can do that — it names both crates with
+//! their `dyn` feature off — and then there is one copy of this crate,
+//! and therefore one copy of the cell below, in the process. Two
+//! widgets reaching the same static is then not a coincidence to be
+//! defended against but the linkage the build guarantees.
 //!
 //! # What this deliberately does NOT survive
 //!
-//! A plugin loaded with `dlopen` links its own copy of this crate. Its
-//! `SELECTED` is a DIFFERENT cell, so a `.so` build of `appcats` would
-//! steer a grid that does not exist and the built-in grid would never
-//! hear it. That is not a bug to be fixed inside this file — it cannot
-//! be — it is the exact shape of the missing ABI, and the reason the
-//! host-side channel is the destination rather than an improvement.
+//! `dlopen`. The loader opens a plugin `RTLD_LOCAL`, on purpose — no
+//! `RTLD_GLOBAL` games between plugins — so `appgrid.so` and
+//! `appcats.so` each carry their own copy of this crate and therefore
+//! their own `SELECTED`. Installed as two files rather than linked in,
+//! the list steers a grid that is not there and the grid never hears
+//! it: the categories panel still marks the row a click chose, and the
+//! applications panel keeps showing the whole menu.
 //!
-//! So: this is a deliberate stopgap for as long as both widgets are
-//! built in, written down here so it reads as a decision and not as an
-//! oversight. When `libnacelle` grows the channel, `set` and `get`
-//! become its two call sites and nothing else in either widget moves.
+//! That is not a bug to be fixed inside this file — it cannot be. It is
+//! the exact shape of the missing ABI, and the reason the host-side
+//! channel is the destination rather than an improvement. Splitting the
+//! launcher into two shippable files made the limit a live one instead
+//! of a hypothetical, which is the honest trade: the widgets became
+//! ordinary addons, and the one thing a widget cannot do without the
+//! host — tell another widget something — stayed impossible.
+//!
+//! So: a deliberate stopgap, written down here so it reads as a
+//! decision and not as an oversight. When `libnacelle` grows the
+//! channel, `set` and `get` become its two call sites and nothing else
+//! in either widget moves.
 //!
 //! # Thread safety
 //!

@@ -1,3 +1,9 @@
+// label: CPU
+// ref_h: 15.5
+// min_h: 9.0
+// slot: left
+// order: 3
+// weight: 26
 // u2 §2.5: the title and model move to the host's band; each core is an
 // instrument row (label + thin track + value — gauge.style, the theme's
 // choice); a rule separates the grid from the footer, where the load

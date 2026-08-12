@@ -29,6 +29,7 @@ use nacelle::runtime::{
     CELL_UNDERLINE, DRAG_BEGIN, DRAG_END, SELECT_KIND_CELLS, SELECT_OP_BEGIN, SELECT_OP_END,
     SELECT_OP_EXTEND, VIEW_CURSOR, VIEW_LIVE, VIEW_TRUNCATED,
 };
+use nacelle::widget::factory::BuiltinWidget;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -961,6 +962,26 @@ extern "C" fn chrome_c(
     0
 }
 
+/// The session tabs are this widget's only controls, so the hand
+/// appears over the strip and nowhere else — over the terminal itself
+/// the ordinary pointer is what a terminal wants. The strip metrics are
+/// the ones the last frame drew with, exactly as the click uses them.
+extern "C" fn pointer_c(
+    instance: *mut c_void,
+    x: f32,
+    y: f32,
+    r: RectC,
+    _win_w: f32,
+    _win_h: f32,
+) -> u32 {
+    let Some(this) = state(instance) else { return 0 };
+    let (pad, tab_h, gap) = this.strip;
+    let count = this.tab_count.max(1);
+    let over = (0..count)
+        .any(|i| contains(&tab_rect(r, pad, tab_h, gap, count, i), x, y));
+    u32::from(over)
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -974,6 +995,19 @@ static API: PluginApi = PluginApi {
     sizing,
     chrome: chrome_c,
     drag: drag_c,
+    pointer: pointer_c,
+};
+
+/// This addon, for a host that LINKS the crate in instead of loading
+/// `shell.so` from the addons directory. The name and the metadata
+/// are the addon's own — the same string the file would be called and
+/// the very bytes of `shell.meta` beside it — so a host never
+/// describes a widget it merely links: it hands this constant over
+/// whole and learns everything from it.
+pub const WIDGET: BuiltinWidget = BuiltinWidget {
+    name: "shell",
+    meta: include_str!("../shell.meta"),
+    attach: builtin_attach,
 };
 
 /// # Safety

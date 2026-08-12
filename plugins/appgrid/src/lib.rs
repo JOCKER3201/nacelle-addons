@@ -30,28 +30,25 @@
 //! degrades through the raw answers the ABI itself gives (grey ink,
 //! zero lengths), never through a number that used to be the design.
 //!
-//! Every module of this crate is public on purpose: [`desktop`] is the
-//! system's ONE XDG scanner, [`tile`] its ONE tile grid, [`cats`] its
-//! ONE reading of the menu specification's categories, and
-//! [`selection`] the cell the two widgets meet in. The categories
-//! widget next door is built out of all four rather than out of copies
-//! of them.
+//! Almost none of the above is written here. The XDG scan, the
+//! categories, the tile grid, the index and the selection cell are
+//! `nacelle-launcher-core`, the launcher's shared half, because the
+//! categories widget is built out of the same five and two copies of
+//! any of them would be two launchers. What this file holds is the one
+//! thing that is only the grid's: which applications the selection
+//! admits, and what a click on a tile does.
 
-pub mod cats;
-pub mod desktop;
-pub mod sections;
-pub mod selection;
-pub mod tile;
-
-use desktop::AppEntry;
 use nacelle::runtime::{
     ActionC, ChromeC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_NONE,
 };
-use sections::{HeadLook, HeadTheme, Section};
-use selection::Selection;
+use nacelle::widget::factory::BuiltinWidget;
+use nacelle_launcher_core::desktop::AppEntry;
+use nacelle_launcher_core::sections::{HeadLook, HeadTheme, Section};
+use nacelle_launcher_core::selection::Selection;
+use nacelle_launcher_core::tile::{Rect, TileLook, TileTheme};
+use nacelle_launcher_core::{cats, desktop, sections, selection, tile};
 use std::ffi::c_void;
 use std::time::Instant;
-use tile::{Rect, TileLook, TileTheme};
 
 /// How often the menu is looked at again. The scan itself only runs
 /// when the directories' modification times have MOVED, so this is the
@@ -544,6 +541,20 @@ extern "C" fn drag_c(
 ) {
 }
 
+/// Nothing of this widget asks for the hand cursor: it is drawn, not
+/// operated. Declining every point is the honest answer, and the panel
+/// keeps the ordinary pointer.
+extern "C" fn pointer_c(
+    _: *mut c_void,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+) -> u32 {
+    0
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -557,6 +568,19 @@ static API: PluginApi = PluginApi {
     sizing,
     chrome: chrome_c,
     drag: drag_c,
+    pointer: pointer_c,
+};
+
+/// This addon, for a host that LINKS the crate in instead of loading
+/// `appgrid.so` from the addons directory. The name and the metadata
+/// are the addon's own — the same string the file would be called and
+/// the very bytes of `appgrid.meta` beside it — so a host never
+/// describes a widget it merely links: it hands this constant over
+/// whole and learns everything from it.
+pub const WIDGET: BuiltinWidget = BuiltinWidget {
+    name: "appgrid",
+    meta: include_str!("../appgrid.meta"),
+    attach: builtin_attach,
 };
 
 /// In-process attach for a host that links this crate statically. The
@@ -640,11 +664,9 @@ mod token_tests {
         "component.table.rule",
     ];
 
-    /// `emptystate.y_frac` is the name the master MEANS, and the
-    /// categories widget already falls back to `boot.y_frac` for it.
-    /// It is listed above rather than here so that the day the section
-    /// header lands, this test stops excusing it.
-    const MAY_BE_MISSING: &[&str] = &["emptystate.y_frac"];
+    /// Nothing is excused any more: the master's missing `[emptystate]`
+    /// header was the one entry this list ever carried, and it landed.
+    const MAY_BE_MISSING: &[&str] = &[];
 
     #[test]
     fn every_token_this_widget_names_is_one_the_master_declares() {

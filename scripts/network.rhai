@@ -1,3 +1,9 @@
+// label: NETWORK
+// ref_h: 8.0
+// min_h: 8.0
+// slot: right
+// order: 3
+// weight: 10
 fn draw() {
     // The script judges the DATA, never the look (§5.10): online is
     // well, offline is the offline severity, and an absent reading is

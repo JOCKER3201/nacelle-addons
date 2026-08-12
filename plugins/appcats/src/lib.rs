@@ -15,19 +15,20 @@
 //!
 //! # How the two widgets reach each other
 //!
-//! Through [`nacelle_widget_appgrid::selection`], and the long comment
+//! Through [`nacelle_launcher_core::selection`], and the long comment
 //! at the head of that module is the one worth reading: the host has no
 //! channel between widgets, this is a static cell that works only
 //! because both widgets are linked into one binary, and the real fix is
 //! an ABI in `libnacelle`. This file is one of that cell's two callers
 //! — the writing one.
 //!
-//! It is the grid's sister, not its copy. The menu is found by the
-//! grid's own XDG scanner, the groups are read by the grid's own
-//! reading of the menu specification ([`cats`]), and the chamfer, the
-//! glow, the caption role and the scrollbar are the grid's own. What
-//! this widget adds is one question the grid does not ask — *which
-//! group is this in* — and the row that answers it.
+//! It is the grid's sister, not its copy. The menu is found by the ONE
+//! XDG scanner, the groups are read by the ONE reading of the menu
+//! specification ([`cats`]), and the chamfer, the glow, the caption
+//! role and the scrollbar are the ONE tile grid — all of it
+//! `nacelle-launcher-core`, the half both widgets are built out of and
+//! neither owns. What this widget adds is one question the grid does
+//! not ask — *which group is this in* — and the row that answers it.
 //!
 //! Which group is chosen belongs to the SELECTION and not to the widget
 //! instance: two of these panels on two boards are two views of one
@@ -43,10 +44,11 @@
 use nacelle::runtime::{
     ActionC, ChromeC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_NONE,
 };
-use nacelle_widget_appgrid::cats::{self, Category};
-use nacelle_widget_appgrid::desktop::{self, AppEntry};
-use nacelle_widget_appgrid::selection::{self, Selection};
-use nacelle_widget_appgrid::tile::{self, Rect, TileLook, TileTheme};
+use nacelle::widget::factory::BuiltinWidget;
+use nacelle_launcher_core::cats::{self, Category};
+use nacelle_launcher_core::desktop::{self, AppEntry};
+use nacelle_launcher_core::selection::{self, Selection};
+use nacelle_launcher_core::tile::{self, Rect, TileLook, TileTheme};
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -75,9 +77,9 @@ fn host() -> Option<&'static HostApi> {
 ///
 /// The family is `list.*`, the theme's own group for "a task,
 /// notification or process row", and the class is `list.item`, which
-/// the state matrix describes in exactly those words. Where the list
-/// group declares nothing for something a row needs, the tile grid's
-/// own token is used rather than a number, and the gap is reported.
+/// the state matrix describes in exactly those words. A row used to
+/// borrow the tile grid's notch for want of one of its own; the list
+/// group now declares `list.wheel_px`, so nothing here borrows.
 struct ListTheme {
     epoch: u32,
     row_h: u32,      // list.row_h
@@ -86,6 +88,7 @@ struct ListTheme {
     chip: u32,       // list.glyph — the leading coloured chip of a row
     chip_gap: u32,   // list.glyph_gap
     status_gap: u32, // list.status_gap — the gap before a row's trailing status
+    wheel: u32,      // list.wheel_px — a row list scrolls by its own notch, not a tile grid's
     // type — the count is a number in a column, which is `data`'s role
     count_size: u32,    // type.data.size
     count_min: u32,     // type.data.min_px
@@ -99,12 +102,9 @@ struct ListTheme {
     /// which is a property of the face and not of this file.
     count_font: u32,
     label_font: u32,
-    /// Where an empty panel says so. `emptystate.y_frac` is the name the
-    /// master MEANS — its own comment reads "where that message sits in
-    /// the empty box" — but the two keys sit under `[boot]` in
-    /// `default.theme` and so are addressable only as `boot.y_frac`.
-    /// Asked for by the right name first, so the day the section header
-    /// lands this widget follows it without an edit.
+    /// Where an empty panel says so. `emptystate.y_frac` — the master's
+    /// `[emptystate]` header landed, so the name this widget always asked
+    /// for is the name that answers.
     empty_y: u32,
     /// A row's row in the class x state matrix.
     item_class: u32,
@@ -112,10 +112,7 @@ struct ListTheme {
 
 impl ListTheme {
     fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ListTheme {
-        let mut empty_y = tile::token(api, "emptystate.y_frac");
-        if empty_y == u32::MAX {
-            empty_y = tile::token(api, "boot.y_frac");
-        }
+        let empty_y = tile::token(api, "emptystate.y_frac");
         ListTheme {
             epoch,
             row_h: tile::token(api, "list.row_h"),
@@ -124,6 +121,7 @@ impl ListTheme {
             chip: tile::token(api, "list.glyph"),
             chip_gap: tile::token(api, "list.glyph_gap"),
             status_gap: tile::token(api, "list.status_gap"),
+            wheel: tile::token(api, "list.wheel_px"),
             count_size: tile::token(api, "type.data.size"),
             count_min: tile::token(api, "type.data.min_px"),
             count_tracking: tile::token(api, "type.data.tracking"),
@@ -152,6 +150,7 @@ struct ListLook {
     chip: f32,
     chip_gap: f32,
     status_gap: f32,
+    wheel_px: f32,
     count_px: f32,
     count_tracking: f32,
     count_leading: f32,
@@ -188,6 +187,7 @@ impl ListLook {
             chip: 0.0,
             chip_gap: 0.0,
             status_gap: 0.0,
+            wheel_px: 0.0,
             count_px: 0.0,
             count_tracking: 0.0,
             count_leading: 1.0,
@@ -212,6 +212,7 @@ impl ListLook {
             chip: px(t.chip),
             chip_gap: px(t.chip_gap),
             status_gap: px(t.status_gap),
+            wheel_px: px(t.wheel),
             count_px: px(t.count_size).max(px(t.count_min)),
             count_tracking: px(t.count_tracking),
             count_leading: px(t.count_leading).max(1.0),
@@ -269,8 +270,8 @@ pub struct Appcats {
     stamp: u64,
     /// Resolved token ids, re-resolved whenever the theme epoch moves.
     theme: Option<(TileTheme, ListTheme)>,
-    /// `filetile.wheel_px`, cached at draw because a wheel event
-    /// arrives with no drawing context to ask the theme through.
+    /// `list.wheel_px`, cached at draw because a wheel event arrives
+    /// with no drawing context to ask the theme through.
     wheel_px: f32,
     /// The count as last handed to the host's title band, alive until
     /// the next `chrome` call.
@@ -347,7 +348,7 @@ impl Appcats {
     /// code that means "another widget should now show something else",
     /// and inventing one is the ABI change this widget is working
     /// around rather than pre-empting (see
-    /// [`nacelle_widget_appgrid::selection`]).
+    /// [`nacelle_launcher_core::selection`]).
     pub fn click(&mut self, x: f32, y: f32) {
         let Some(hit) = self.hits.iter().find(|(r, _)| r.contains(x, y)).map(|&(_, h)| h)
         else {
@@ -413,7 +414,7 @@ impl Appcats {
         // The chosen row can have been chosen in the other panel.
         self.sel = selection::get();
         let look = self.look(api, ctx);
-        self.wheel_px = look.tile.wheel_px;
+        self.wheel_px = look.list.wheel_px;
 
         // Where the pointer is, once per frame; NaN matches nothing.
         let (mut mx, mut my) = (f32::NAN, f32::NAN);
@@ -706,7 +707,7 @@ extern "C" fn wheel_c(
     out: *mut ActionC,
 ) {
     if let Some(this) = state(instance) {
-        // filetile.wheel_px, as the last draw cached it — a wheel event
+        // list.wheel_px, as the last draw cached it — a wheel event
         // arrives with no drawing context to ask the theme through.
         let px = this.wheel_px;
         this.wheel(dy * px);
@@ -766,6 +767,20 @@ extern "C" fn drag_c(
 ) {
 }
 
+/// Nothing of this widget asks for the hand cursor: it is drawn, not
+/// operated. Declining every point is the honest answer, and the panel
+/// keeps the ordinary pointer.
+extern "C" fn pointer_c(
+    _: *mut c_void,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+) -> u32 {
+    0
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -779,6 +794,19 @@ static API: PluginApi = PluginApi {
     sizing,
     chrome: chrome_c,
     drag: drag_c,
+    pointer: pointer_c,
+};
+
+/// This addon, for a host that LINKS the crate in instead of loading
+/// `appcats.so` from the addons directory. The name and the metadata
+/// are the addon's own — the same string the file would be called and
+/// the very bytes of `appcats.meta` beside it — so a host never
+/// describes a widget it merely links: it hands this constant over
+/// whole and learns everything from it.
+pub const WIDGET: BuiltinWidget = BuiltinWidget {
+    name: "appcats",
+    meta: include_str!("../appcats.meta"),
+    attach: builtin_attach,
 };
 
 /// In-process attach for a host that links this crate statically. The

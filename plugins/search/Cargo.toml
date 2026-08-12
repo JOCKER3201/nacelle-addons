@@ -1,9 +1,9 @@
 [package]
-name = "nacelle-widget-appgrid"
+name = "nacelle-widget-search"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
-description = "The nacelle-desktop application launcher, as a compiled widget"
+description = "The nacelle-desktop search panel, as a compiled widget"
 license = "MIT"
 
 [lib]
@@ -14,11 +14,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
 
-# The launcher's shared half — the XDG scan, the categories, the tile
-# grid, the index and the selection cell — which the categories widget
-# is built out of too. It exports NO attach symbol, so linking it here
-# leaves this library with exactly one entry point, which is what lets
-# both launcher widgets be shipped as files.
+# The launcher's shared half, for the ONE thing this panel shares with
+# the application grid: the XDG scan that says what is installed, and the
+# double fork that hands a chosen application over to init. A second copy
+# of either would be a second launcher — the whole reason that crate
+# exists. Nothing else of it is linked: the tile grid, the categories and
+# the alphabetical index are a GRID's, and this panel draws rows.
 nacelle-launcher-core = { path = "../launcher-core" }
 
 [features]

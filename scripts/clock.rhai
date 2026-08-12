@@ -1,3 +1,9 @@
+// label: CLOCK
+// ref_h: 7.0
+// min_h: 5.5
+// slot: right
+// order: 4
+// weight: 8
 // The separator blinks by ALPHA, not by glyph substitution: each colon
 // keeps its advance and the runs element drives its visibility from
 // motion.value_blink, so the line never re-measures and cannot jitter

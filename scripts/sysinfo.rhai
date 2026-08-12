@@ -1,3 +1,9 @@
+// label: SYSTEM INFO
+// ref_h: 4.5
+// min_h: 4.5
+// slot: left
+// order: 1
+// weight: 5
 // An instrument strip (u2 §2.2): three cells with hairline dividers,
 // labels and values aligned by the theme's columns.align. POWER carries
 // the script's judgement of the battery — a severity from the closed

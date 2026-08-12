@@ -12,6 +12,7 @@ use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_BYTES,
     ACTION_NONE,
 };
+use nacelle::widget::factory::BuiltinWidget;
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -845,6 +846,20 @@ extern "C" fn drag_c(
 ) {
 }
 
+/// Nothing of this widget asks for the hand cursor: it is drawn, not
+/// operated. Declining every point is the honest answer, and the panel
+/// keeps the ordinary pointer.
+extern "C" fn pointer_c(
+    _: *mut c_void,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+) -> u32 {
+    0
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -858,6 +873,19 @@ static API: PluginApi = PluginApi {
     sizing,
     chrome: chrome_c,
     drag: drag_c,
+    pointer: pointer_c,
+};
+
+/// This addon, for a host that LINKS the crate in instead of loading
+/// `keyboard.so` from the addons directory. The name and the metadata
+/// are the addon's own — the same string the file would be called and
+/// the very bytes of `keyboard.meta` beside it — so a host never
+/// describes a widget it merely links: it hands this constant over
+/// whole and learns everything from it.
+pub const WIDGET: BuiltinWidget = BuiltinWidget {
+    name: "keyboard",
+    meta: include_str!("../keyboard.meta"),
+    attach: builtin_attach,
 };
 
 /// # Safety

@@ -1,3 +1,9 @@
+// label: PROCESSES
+// ref_h: 22.0
+// min_h: 8.0
+// slot: right
+// order: 2
+// weight: 26
 fn draw() {
     let body = [];
     for p in host.processes {

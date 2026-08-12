@@ -1,3 +1,9 @@
+// label: UPTIME
+// ref_h: 8.0
+// min_h: 7.0
+// slot: left
+// order: 5
+// weight: 8
 // A widget that exists only as a script — there is no compiled code
 // behind it. It also shows what a script can do that a fixed list of
 // rows cannot: decide what to show.

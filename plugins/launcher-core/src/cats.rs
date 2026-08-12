@@ -16,16 +16,15 @@
 //! which is the whole reason it is a module rather than a corner of the
 //! draw path.
 //!
-//! It lives in the GRID's crate rather than in the categories list's,
-//! and that is not where it started. Both widgets need it now and they
-//! need different halves: the list asks [`group`] what groups exist and
-//! how big each is, the grid asks [`holds`] whether one application
-//! belongs to the group the list pointed it at. Two copies of [`MAIN`]
-//! would be two vocabularies that drift apart on the first category the
-//! specification adds, so this joins [`crate::desktop`] and
-//! [`crate::tile`] as a third thing the family shares rather than
-//! duplicates — and `appcats` already depends on this crate, while the
-//! reverse would be a cycle.
+//! It lives in the launcher's shared crate rather than in either
+//! widget, and that is not where it started. Both widgets need it and
+//! they need different halves: the list asks [`group`] what groups
+//! exist and how big each is, the grid asks [`holds`] whether one
+//! application belongs to the group the list pointed it at. Two copies
+//! of [`MAIN`] would be two vocabularies that drift apart on the first
+//! category the specification adds, so this joins [`crate::desktop`]
+//! and [`crate::tile`] as a third thing the family shares rather than
+//! duplicates.
 
 use crate::desktop::AppEntry;
 

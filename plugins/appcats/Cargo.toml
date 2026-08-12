@@ -9,54 +9,31 @@ license = "MIT"
 [lib]
 # A widget plugin is a C-callable dynamic library: the host loads it with
 # dlopen and talks to it through plain function pointers.
-crate-type = ["rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
 
-# The launcher grid, as a library: this widget groups the SAME
-# applications, found by the SAME XDG scanner (appgrid::desktop), read
-# into groups by the SAME categories module (appgrid::cats), and drawn
-# with the SAME chamfer, ladder and scrollbar (appgrid::tile). Nothing
-# about a desktop entry is parsed twice in this tree.
+# The launcher's shared half: this widget groups the SAME applications,
+# found by the SAME XDG scanner (`desktop`), read into groups by the
+# SAME categories module (`cats`), and drawn with the SAME chamfer,
+# ladder and scrollbar (`tile`). Nothing about a desktop entry is
+# parsed twice in this tree.
 #
 # It is also how the two widgets reach each other: clicking a row here
-# writes appgrid::selection, and the grid reads it. That works because
-# this is a PATH dependency linked into one binary — see the head of
-# appgrid/src/selection.rs for why that is a deliberate stopgap and
-# what replaces it.
-# `default-features = false` drops appgrid's dlopen attach symbol —
-# two plugins exporting `nacelle_plugin_attach` from one process is
-# exactly the collision that feature exists to prevent.
-nacelle-widget-appgrid = { path = "../appgrid", default-features = false }
+# writes `selection`, and the grid reads it — which works only while a
+# host LINKS both widgets into one binary. See the head of
+# launcher-core/src/selection.rs for why that is a deliberate stopgap,
+# what a `.so` build of each loses, and what replaces it.
+#
+# The crate this depends on exports no attach symbol of its own, so
+# this library has exactly one — which is what the widget used to be
+# unable to say while it depended on the grid's crate directly.
+nacelle-launcher-core = { path = "../launcher-core" }
 
 [features]
-# NO dlopen attach symbol, and no .so — deliberately. This crate links
-# the grid's crate to share the scanner, the tile and the selection
-# cell, and a shared object carrying two `nacelle_plugin_attach`
-# symbols is ill-formed: the loader would find the wrong widget. As a
-# built-in that costs nothing, because a linked plugin never exports
-# the symbol anyway. The day someone wants this widget as a standalone
-# file, the shared half moves into a crate of its own, which is the
-# structural answer rather than a flag.
-default = []
-# Kept so the linked-in path and the shipped-.so path read alike; this
-# crate simply never turns it on.
+# The dlopen attach symbol. On for the shipped .so; a host that links
+# this crate statically turns it off, so several plugins' identical
+# attach symbols cannot collide inside one binary.
+default = ["dyn"]
 dyn = []
-
-# ------------------------------------------------------------------------
-# STANDALONE BUILD — delete BOTH tables below the moment `plugins/appcats`
-# is added to nacelle-addons/Cargo.toml's `workspace.members`: the
-# workspace supplies the same patch itself, and two workspace roots in
-# one tree is a hard error. Until then these are what let `cargo build`
-# and `cargo test` run in this directory while the crate is not yet a
-# member of anything.
-#
-# `plugins/appgrid` stays a bare path dependency and is NOT listed as a
-# member here: its own manifest carries the identical standalone pair,
-# and one workspace cannot hold two roots. A path dependency that is its
-# own root is fine — cargo simply builds it — but the patch above is the
-# one that counts for the whole graph, appgrid's being ignored while it
-# is not the root. Adding both crates to nacelle-addons' `members`
-# retires this block and appgrid's together.
-# ------------------------------------------------------------------------

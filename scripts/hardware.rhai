@@ -1,3 +1,9 @@
+// label: HARDWARE
+// ref_h: 6.5
+// min_h: 6.5
+// slot: left
+// order: 2
+// weight: 7
 // nacelle-desktop widget. This file IS the widget: called once a frame, it
 // returns the elements to draw. Any assets it needs live beside it.
 //

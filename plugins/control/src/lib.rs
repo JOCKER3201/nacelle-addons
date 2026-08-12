@@ -20,6 +20,7 @@ use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_EXIT,
     ACTION_NONE, ACTION_OPEN_SETTINGS, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
 };
+use nacelle::widget::factory::BuiltinWidget;
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::time::Instant;
@@ -574,6 +575,33 @@ extern "C" fn drag(
 ) {
 }
 
+/// The two buttons are the only controls this widget has, so the hand
+/// appears over them and nowhere else. The rectangles are the ones the
+/// click uses, from the same tokens: the application asks rather than
+/// working them out a second time and drifting from what was drawn.
+extern "C" fn pointer(
+    instance: *mut c_void,
+    x: f32,
+    y: f32,
+    r: RectC,
+    _win_w: f32,
+    _win_h: f32,
+) -> u32 {
+    let (Some(api), Some(this)) = (host(), state(instance)) else {
+        return 0;
+    };
+    let ctx = std::ptr::null_mut();
+    let t = theme(this, api, ctx);
+    let h = t_px(api, ctx, t.button_h);
+    let gap = t_px(api, ctx, t.button_gap);
+    let w_frac = t_px(api, ctx, t.button_w_frac);
+    let align = t_enum(api, ctx, t.button_align);
+    let over = button_rects(h, gap, w_frac, align, r)
+        .iter()
+        .any(|br| contains(br, x, y));
+    u32::from(over)
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -587,6 +615,19 @@ static API: PluginApi = PluginApi {
     sizing,
     chrome,
     drag,
+    pointer,
+};
+
+/// This addon, for a host that LINKS the crate in instead of loading
+/// `control.so` from the addons directory. The name and the metadata
+/// are the addon's own — the same string the file would be called and
+/// the very bytes of `control.meta` beside it — so a host never
+/// describes a widget it merely links: it hands this constant over
+/// whole and learns everything from it.
+pub const WIDGET: BuiltinWidget = BuiltinWidget {
+    name: "control",
+    meta: include_str!("../control.meta"),
+    attach: builtin_attach,
 };
 
 /// The attach point the host looks for. Taking the host's interface here

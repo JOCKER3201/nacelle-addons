@@ -465,7 +465,16 @@ pub fn launch(app: &AppEntry) -> Result<(), String> {
     })
 }
 
-fn spawn_detached(argv: &[String]) -> Result<(), String> {
+/// Runs an argument vector detached, as [`launch`] describes: a session
+/// of its own, reparented to init, and the intermediate reaped here.
+///
+/// Public because [`launch`] is not the only thing a widget hands over
+/// to init. The SEARCH panel opens a found file with the freedesktop
+/// opener, and it must do it exactly this way or it has invented a
+/// second answer to "how does this desktop start a process" — which is
+/// the whole reason the fork lives in one place. What to run stays the
+/// caller's; how to survive being started stays here.
+pub fn spawn_detached(argv: &[String]) -> Result<(), String> {
     // Everything that allocates happens HERE, before the fork: between
     // fork and exec a process with more than one thread may call only
     // async-signal-safe functions, and the allocator is not one.

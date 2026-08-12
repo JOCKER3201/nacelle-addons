@@ -230,7 +230,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libnacelle"
 version = "0.1.0"
-source = "git+https://github.com/JOCKER3201/libnacelle#5155d2fcf27f73a5af918b2f28e4dca6c4f79a71"
+source = "git+https://github.com/JOCKER3201/libnacelle#28639a57f5582b73a6b5bf92d9f83c342fba0b90"
 dependencies = [
  "chrono",
  "fontdue",
@@ -256,19 +256,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "nacelle-launcher-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libnacelle",
+]
+
+[[package]]
+name = "nacelle-widget-ai"
+version = "0.1.0"
+dependencies = [
+ "libnacelle",
+]
+
+[[package]]
 name = "nacelle-widget-appcats"
 version = "0.1.0"
 dependencies = [
  "libnacelle",
- "nacelle-widget-appgrid",
+ "nacelle-launcher-core",
 ]
 
 [[package]]
 name = "nacelle-widget-appgrid"
 version = "0.1.0"
 dependencies = [
- "libc",
  "libnacelle",
+ "nacelle-launcher-core",
 ]
 
 [[package]]
@@ -290,6 +305,14 @@ name = "nacelle-widget-keyboard"
 version = "0.1.0"
 dependencies = [
  "libnacelle",
+]
+
+[[package]]
+name = "nacelle-widget-search"
+version = "0.1.0"
+dependencies = [
+ "libnacelle",
+ "nacelle-launcher-core",
 ]
 
 [[package]]

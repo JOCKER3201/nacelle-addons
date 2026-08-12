@@ -1,0 +1,34 @@
+# The launcher's category list.
+#
+# The addon's own metadata, installed beside appcats.so and read
+# INSTEAD of it: the host has to know what a widget IS before it
+# decides to load anybody's code. The crate includes these very
+# bytes when it is linked into the program rather than shipped as
+# a file, so the two can never drift.
+#
+#   label      the name the layout editor shows (default: the file
+#              stem in capitals)
+#   ref_h      height in vh at which the widget draws at 100% scale
+#   min_h      height in vh below which its last content row would
+#              leave the screen
+#   category   board (the default), appgrid or search_and_ai — the
+#              kind of board this widget may be placed on
+#   slot       left, center or right — which column of a GENERATED
+#              arrangement this widget asks for (default: whichever
+#              side has room). There is no table of widgets in the
+#              program: where a widget stands is what it says here
+#   order      where in that column, lowest first
+#   weight     how much of a shared column it wants (default: as
+#              much of it as the widget is tall)
+#   anchor     top, bottom or bar — a pinned edge of the arrangement
+#              instead of flowing with the column
+#   essential  true: switching this widget off would leave the user
+#              no way back, so the editor never offers to remove it
+#
+# Everything is optional: an addon that names nothing is still an
+# addon, and what it does not name it does not lose.
+
+label = CATEGORIES
+ref_h = 40.0
+min_h = 12.0
+category = appgrid
