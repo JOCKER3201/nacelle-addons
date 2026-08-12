@@ -56,22 +56,27 @@ fn host() -> Option<&'static HostApi> {
 // contract; ids are per-master-load, so the whole table below is
 // re-resolved whenever `theme_epoch` moves. A token the master does not
 // declare resolves to u32::MAX, and every accessor then answers the
-// engine's raw default for its KIND — mid grey ink, 0.0 for a length —
-// which is the unstyled look, never a value that used to be the design.
+// engine's raw default for its KIND — 0.0 for a length, and on a host
+// that cannot be asked at all, no ink — so the widget draws less rather
+// than drawing a value that used to be the design.
 
-/// The engine's raw ink: what a missing colour answers, and what every
-/// colour becomes on a host too old to carry the theme entries.
-const RAW_INK: ColorC = ColorC { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+/// No ink at all: what every colour becomes on a host too old to carry
+/// the theme entries.
+///
+/// Not a grey and not a black. A colour chosen where the theme cannot be
+/// reached is a design decision taken in the dark, and this program has
+/// none of those — so the strip and the pill draw NOTHING instead, which
+/// is the same clean bail `ai` takes for the same host.
+const NO_INK: ColorC = ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 
-/// The engine's raw rung — `StateStyle::RAW`, mirrored rather than
-/// imported because the host's copy of the engine owns the real one.
-/// No fill, grey ink, one hairline: kind defaults, not a design.
+/// The raw rung for that host: no ink and no width, so every shape
+/// guarded by `edge_width > 0.0 && edge.a > 0.0` stays undrawn.
 const RAW_STATE: StateStyleC = StateStyleC {
-    fill: ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
-    edge: RAW_INK,
-    text: RAW_INK,
-    glyph: RAW_INK,
-    edge_width: 1.0,
+    fill: NO_INK,
+    edge: NO_INK,
+    text: NO_INK,
+    glyph: NO_INK,
+    edge_width: 0.0,
     glow_radius: 0.0,
     glow_alpha: 0.0,
     elevation: 0.0,
@@ -107,11 +112,16 @@ struct Tokens {
     rule_c: u32,    // tab.rule_color — the line under the whole strip
     rule_w: u32,    // tab.rule
     rule_gap: u32,  // tab.rule_gap
-    label_size: u32,  // type.button.size — tab.role is button
-    label_min: u32,   // type.button.min_px
-    label_track: u32, // type.button.tracking, in em
-    label_lead: u32,  // type.button.leading
-    label_case: u32,  // type.button.case
+    // type.<tab.role>.* — the role the master BINDS a tab's label to,
+    // followed as a word rather than spelled out here. The two used to
+    // agree by coincidence (`tab.role = button`); re-roling the strip in
+    // a theme moved nothing, because the binding existed only in the
+    // master.
+    label_size: u32,
+    label_min: u32,
+    label_track: u32, // in em
+    label_lead: u32,
+    label_case: u32,
     center_mode: u32, // rhythm.center_mode
     center_bias: u32, // rhythm.cap_center_bias, a fraction of the px
     // the cell grid's chrome (the cells themselves arrive coloured)
@@ -126,12 +136,17 @@ struct Tokens {
     // the SCROLL +n readout — a status pill in a corner, which is
     // precisely the images' badge (u2 §2.9): severity.info's colours,
     // the badge role's type, the badge component's box
-    ind_inset: u32,    // terminal.indicator.inset
-    badge_size: u32,   // type.badge.size — badge.role is badge
-    badge_min: u32,    // type.badge.min_px
-    badge_track: u32,  // type.badge.tracking, in em
-    badge_lead: u32,   // type.badge.leading
-    badge_case: u32,   // type.badge.case
+    ind_inset: u32, // terminal.indicator.inset
+    // type.<terminal.indicator.role>.* — the readout's own binding, and
+    // NOT `badge.role`: the pill borrows the badge component's box
+    // (height, padding, corner, ring) because it is one, but which type
+    // a scroll readout is set in is the terminal's to say, and the
+    // master says `caption` where this file drew `badge`.
+    ind_size: u32,
+    ind_min: u32,
+    ind_track: u32, // in em
+    ind_lead: u32,
+    ind_case: u32,
     badge_h: u32,      // badge.h
     badge_pad: u32,    // badge.pad_x
     badge_corner: u32, // badge.corner — `pill` bakes negative and squares off
@@ -175,12 +190,30 @@ fn enum_word(api: &HostApi, ctx: *mut c_void, id: u32) -> String {
     String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
 }
 
+/// The name of one token of the role a `*_role` binding names, or `None`
+/// for a master that binds no role — which leaves every id MISSING, and
+/// type of no size draws nothing. Substituting a role here would be this
+/// file deciding how the interface is set.
+fn role_token(role: &str, suffix: &str) -> Option<String> {
+    if role.is_empty() {
+        return None;
+    }
+    Some(format!("type.{role}.{suffix}"))
+}
+
 impl Tokens {
     fn resolve(api: &HostApi, ctx: *mut c_void) -> Tokens {
         let t = |n: &str| (api.theme_token)(n.as_ptr(), n.len() as u32);
         let c = |n: &str| (api.theme_class)(n.as_ptr(), n.len() as u32);
         let style = enum_word(api, ctx, t("severity.info.badge_style"));
         let sel_mode = enum_word(api, ctx, t("term.selection.mode"));
+        // The two type bindings, followed to the roles they name.
+        let tab_role = enum_word(api, ctx, t("tab.role"));
+        let ind_role = enum_word(api, ctx, t("terminal.indicator.role"));
+        let of = |role: &str, suffix: &str| match role_token(role, suffix) {
+            Some(name) => t(&name),
+            None => u32::MAX,
+        };
         Tokens {
             epoch: (api.theme_epoch)(ctx),
             tab_class: c("tab"),
@@ -194,11 +227,11 @@ impl Tokens {
             rule_c: t("tab.rule_color"),
             rule_w: t("tab.rule"),
             rule_gap: t("tab.rule_gap"),
-            label_size: t("type.button.size"),
-            label_min: t("type.button.min_px"),
-            label_track: t("type.button.tracking"),
-            label_lead: t("type.button.leading"),
-            label_case: t("type.button.case"),
+            label_size: of(&tab_role, "size"),
+            label_min: of(&tab_role, "min_px"),
+            label_track: of(&tab_role, "tracking"),
+            label_lead: of(&tab_role, "leading"),
+            label_case: of(&tab_role, "case"),
             center_mode: t("rhythm.center_mode"),
             center_bias: t("rhythm.cap_center_bias"),
             term_pad: t("terminal.pad"),
@@ -209,11 +242,11 @@ impl Tokens {
             blink_period: t("motion.term_cursor_blink.period_ms"),
             blink_duty: t("motion.term_cursor_blink.duty"),
             ind_inset: t("terminal.indicator.inset"),
-            badge_size: t("type.badge.size"),
-            badge_min: t("type.badge.min_px"),
-            badge_track: t("type.badge.tracking"),
-            badge_lead: t("type.badge.leading"),
-            badge_case: t("type.badge.case"),
+            ind_size: of(&ind_role, "size"),
+            ind_min: of(&ind_role, "min_px"),
+            ind_track: of(&ind_role, "tracking"),
+            ind_lead: of(&ind_role, "leading"),
+            ind_case: of(&ind_role, "case"),
             badge_h: t("badge.h"),
             badge_pad: t("badge.pad_x"),
             badge_corner: t("badge.corner"),
@@ -419,16 +452,12 @@ impl Shell {
             Tokens::default()
         };
         let px = |id: u32| if themed { (api.theme_px)(ctx, id) } else { 0.0 };
-        let ink = |id: u32| if themed { (api.theme_color)(ctx, id) } else { RAW_INK };
-        // A colour used as a BED — the pill's interior. Missing, it
-        // answers the engine's raw near-black rather than the mid grey.
-        let bed = |id: u32| {
-            if themed {
-                (api.theme_bed)(ctx, id)
-            } else {
-                ColorC { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
-            }
-        };
+        let ink = |id: u32| if themed { (api.theme_color)(ctx, id) } else { NO_INK };
+        // A colour used as a BED — the pill's interior. A host that
+        // cannot be asked answers no colour at all: a bed of some
+        // chosen black is this file painting over the terminal in a
+        // shade nobody picked, and a pill of no ink is simply not there.
+        let bed = |id: u32| if themed { (api.theme_bed)(ctx, id) } else { NO_INK };
         let flag = |id: u32| themed && (api.theme_flag)(ctx, id) != 0;
         let word = |id: u32| if themed { (api.theme_enum)(ctx, id) } else { 0 };
         let style = |state: u32| {
@@ -755,12 +784,12 @@ impl Shell {
         // file's guess; the indices alone could not tell the styles
         // apart.
         if view.view_offset > 0 {
-            let px_s = px(ids.badge_size).max(px(ids.badge_min));
-            let lead = px(ids.badge_lead).max(1.0);
-            let track = px_s * px(ids.badge_track);
+            let px_s = px(ids.ind_size).max(px(ids.ind_min));
+            let lead = px(ids.ind_lead).max(1.0);
+            let track = px_s * px(ids.ind_track);
             let inset = px(ids.ind_inset);
             let text = recase(
-                word(ids.badge_case),
+                word(ids.ind_case),
                 format!("Scroll +{}", view.view_offset),
             );
             let tw = (api.measure)(ctx, FONT_UI, px_s, text.as_ptr(), text.len() as u32, track);
@@ -1072,6 +1101,52 @@ pub unsafe extern "C" fn nacelle_plugin_attach(api: *const HostApi) -> *const Pl
     }
     HOST = api.as_ref();
     &API
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// The two type BINDINGS this widget follows, and the roles they had
+    /// better name. A binding is a word, the word names a role, and the
+    /// role names a family — so the chain is walked here exactly as
+    /// `Tokens::resolve` walks it, and a master that renamed a role
+    /// fails here instead of drawing a strip of nothing.
+    #[test]
+    fn both_type_bindings_name_roles_the_master_declares() {
+        nacelle::theme::load();
+        for binding in ["tab.role", "terminal.indicator.role"] {
+            let id = nacelle::theme::id(binding).expect(binding);
+            let role = nacelle::theme::enum_word_of(id).expect("the binding names no word");
+            assert!(!role.is_empty(), "{binding} binds to nothing");
+            for suffix in ["size", "min_px", "tracking", "leading", "case"] {
+                let name = role_token(&role, suffix).expect("a bound role names its family");
+                assert!(nacelle::theme::id(&name).is_some(), "the master declares no {name}");
+            }
+        }
+    }
+
+    /// The scroll readout is set in the role the TERMINAL binds, and the
+    /// master binds a different one from the badge's — which is the
+    /// finding: the pill was drawn in `type.badge` while the master said
+    /// `terminal.indicator.role`. If the two ever agree again this test
+    /// stops proving anything, so it says which is which out loud.
+    #[test]
+    fn the_scroll_readout_is_not_set_in_the_badge_role() {
+        nacelle::theme::load();
+        let ind = nacelle::theme::id("terminal.indicator.role").expect("indicator role");
+        let badge = nacelle::theme::id("badge.role").expect("badge role");
+        let ind = nacelle::theme::enum_word_of(ind).expect("no word");
+        let badge = nacelle::theme::enum_word_of(badge).expect("no word");
+        assert_ne!(ind, badge, "the master now binds both to {ind}");
+        let t = nacelle::theme::resolved();
+        let size = |role: &str| {
+            t.px(nacelle::theme::id(&role_token(role, "size").unwrap()).expect("size"))
+        };
+        // And the two roles really are different sizes, so the fix is
+        // visible on the first screen rather than only in the names.
+        assert_ne!(size(&ind), size(&badge));
+    }
 }
 
 #[cfg(test)]

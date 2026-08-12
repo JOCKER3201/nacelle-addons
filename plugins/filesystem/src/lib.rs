@@ -4,7 +4,8 @@
 
 use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_CAPTURE,
-    ACTION_NONE, ACTION_OPEN_DIR, ACTION_OPEN_FILE, DRAG_BEGIN, DRAG_END, DRAG_MOVE, MASK_QUAD_ADD,
+    ACTION_NONE, ACTION_OPEN_DIR, ACTION_OPEN_FILE, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
+    DRAG_BEGIN, DRAG_END, DRAG_MOVE, MASK_QUAD_ADD,
 };
 use nacelle::object::tooltip;
 use nacelle::widget::factory::BuiltinWidget;
@@ -17,8 +18,12 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// The interface font, as the host numbers them.
+/// The font slots, as the host numbers them — the theme's own
+/// `FACE_UI = 0` and `FACE_MONO = 1`. The ABI carries these two and
+/// clamps anything past them, so a slot is chosen by the WORD a role's
+/// `face` names and never by an index into the theme's eight faces.
 const FONT_UI: u32 = 0;
+const FONT_MONO: u32 = 1;
 
 /// Which view a tooltip request comes from. This panel draws one grid,
 /// so it has one; the number goes into the request's id, which only has
@@ -40,9 +45,9 @@ fn meet(a: Rect, b: Rect) -> Rect {
 // ABI 5 hands the theme over as tokens. Names are stable; ids are per
 // master load, so they are resolved once and thrown away whenever
 // theme_epoch moves. Nothing in this file knows what a colour or a length
-// IS any more — a missing token degrades through the raw defaults the ABI
-// itself answers (mid-grey ink, 0.0 lengths), never through a value that
-// used to be the design.
+// IS any more — a token nobody can answer degrades to no ink and no
+// length, which draws nothing, never to a value that used to be the
+// design.
 
 /// The seven interaction states, in the matrix's declaration order. A
 /// tile is a real container now (u2 §2.10): every one rests on the
@@ -64,15 +69,29 @@ const ROW_JUSTIFY_FILL: u32 = 1;
 /// theme has an opinion on it.
 const PARTIAL_ROW: f32 = 0.5;
 
-/// The engine's raw ink — what `theme_color` answers for a missing token.
-/// Kept here only for the path where the host predates ABI 5 and cannot
-/// be asked at all.
-const RAW_INK: ColorC = ColorC { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
-
+/// No colour at all — what this widget draws with on a host that
+/// predates ABI 5 and cannot be asked what anything looks like.
+///
+/// Not a grey: a grey chosen here would be a design decision taken where
+/// the theme cannot be reached. With the zero lengths beside it in
+/// [`Look::raw`] the panel then draws NOTHING, which is the clean bail
+/// `ai` takes for the same host.
 const NO_COLOR: ColorC = ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 
 fn token(api: &HostApi, name: &str) -> u32 {
     (api.theme_token)(name.as_ptr(), name.len() as u32)
+}
+
+/// The cut a corner word names. A word this build has never heard of —
+/// and `chevron` and `hexagon` are two the presets already have —
+/// leaves the shape square, which is what an unstyled rectangle already
+/// is, never a cut of this file's choosing.
+fn corner_style(word: &str) -> u32 {
+    match word {
+        "round" => CORNER_ROUND,
+        "chamfer" => CORNER_CHAMFER,
+        _ => CORNER_SQUARE,
+    }
 }
 
 /// The WORD an enum token currently resolves to — ABI 6's appended
@@ -88,6 +107,35 @@ fn enum_word(api: &HostApi, ctx: *mut c_void, id: u32) -> String {
     let mut buf = [0u8; 64];
     let n = (api.theme_enum_word)(ctx, id, buf.as_mut_ptr(), buf.len() as u32) as usize;
     String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
+}
+
+/// The name of one token of the role a `*_role` binding names, or `None`
+/// for a master that binds no role — every id then stays MISSING, and
+/// type of no size draws nothing. Naming a role here would be this file
+/// choosing how file names are set.
+fn role_token(role: &str, suffix: &str) -> Option<String> {
+    if role.is_empty() {
+        return None;
+    }
+    Some(format!("type.{role}.{suffix}"))
+}
+
+fn role_id(api: &HostApi, role: &str, suffix: &str) -> u32 {
+    match role_token(role, suffix) {
+        Some(name) => token(api, &name),
+        None => u32::MAX,
+    }
+}
+
+/// The font slot a role's `face` names. A face is an OPEN word set, so
+/// it is read as a WORD: the boundary carries two slots and clamps
+/// anything past them, which would turn `display` into monospace.
+fn face_slot(api: &HostApi, ctx: *mut c_void, id: u32) -> u32 {
+    if enum_word(api, ctx, id).starts_with("mono") {
+        FONT_MONO
+    } else {
+        FONT_UI
+    }
 }
 
 /// Token ids this widget draws from, resolved by NAME once per epoch.
@@ -124,7 +172,11 @@ struct ThemeIds {
     banner_case: u32,     // type.alert.banner.case
     badge_h: u32,         // badge.h
     badge_pad: u32,       // badge.pad_x
-    badge_corner: u32,    // badge.corner — `pill` bakes negative and squares off
+    badge_corner: u32,    // badge.corner — a length, or §5.0's `pill`
+    // shape.badge.corners[0] — the CUT. A badge is the one element that
+    // states its shape in two places, and the toolkit's own badge reads
+    // both; this one used to read the radius and spell the cut.
+    badge_corner_style: u32,
     empty_y: u32,        // emptystate.y_frac
     // form
     gap: u32,            // filetile.gap
@@ -133,8 +185,19 @@ struct ThemeIds {
     cell_min: u32,       // filetile.cell_min_px
     cell_pref: u32,      // filetile.cell — preferred tile edge; 0 = size from rows
     corner: u32,           // filetile.corner — the tile container's chamfer cut
-    caption_size: u32,     // type.tooltip.size, via filetile.caption_role
-    caption_tracking: u32, // type.tooltip.tracking
+    // type.<filetile.caption_role>.* — a file name's role, followed as
+    // the WORD the master binds rather than spelled out here. The two
+    // agreed by coincidence (`filetile.caption_role = tooltip`), so
+    // re-roling file names in a theme moved nothing.
+    // No `leading`: one caption is one line, and where it sits under
+    // the glyph is `filetile.caption_gap`'s to say, not a line stack's
+    // pitch.
+    caption_size: u32,
+    caption_min: u32,
+    caption_tracking: u32,
+    caption_case: u32,
+    /// The slot that role's `face` names, resolved WITH the ids.
+    caption_font: u32,
     caption_gap: u32,      // filetile.caption_gap
     icon_inset_x: u32,     // filetile.icon.inset_x
     icon_inset_y: u32,     // filetile.icon.inset_y
@@ -190,6 +253,8 @@ struct ThemeIds {
 impl ThemeIds {
     fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ThemeIds {
         let style_word = enum_word(api, ctx, token(api, "severity.critical.badge_style"));
+        // A file name's role, as the master binds it.
+        let caption_role = enum_word(api, ctx, token(api, "filetile.caption_role"));
         // Without `mask_quad` the glow cannot be drawn at all, so the
         // class is not even asked for — the same degrade as `none`.
         let glow_class = if api.has_mask_quad() {
@@ -236,6 +301,7 @@ impl ThemeIds {
             badge_h: token(api, "badge.h"),
             badge_pad: token(api, "badge.pad_x"),
             badge_corner: token(api, "badge.corner"),
+            badge_corner_style: token(api, "shape.badge.corners[0]"),
             empty_y: token(api, "emptystate.y_frac"),
             gap: token(api, "filetile.gap"),
             rows: token(api, "filetile.rows"),
@@ -243,8 +309,11 @@ impl ThemeIds {
             cell_min: token(api, "filetile.cell_min_px"),
             cell_pref: token(api, "filetile.cell"),
             corner: token(api, "filetile.corner"),
-            caption_size: token(api, "type.tooltip.size"),
-            caption_tracking: token(api, "type.tooltip.tracking"),
+            caption_size: role_id(api, &caption_role, "size"),
+            caption_min: role_id(api, &caption_role, "min_px"),
+            caption_tracking: role_id(api, &caption_role, "tracking"),
+            caption_case: role_id(api, &caption_role, "case"),
+            caption_font: face_slot(api, ctx, role_id(api, &caption_role, "face")),
             caption_gap: token(api, "filetile.caption_gap"),
             icon_inset_x: token(api, "filetile.icon.inset_x"),
             icon_inset_y: token(api, "filetile.icon.inset_y"),
@@ -315,6 +384,10 @@ struct Look {
     badge_h: f32,
     badge_pad: f32,
     badge_corner: f32,
+    /// [`CORNER_SQUARE`], [`CORNER_ROUND`] or [`CORNER_CHAMFER`] — the
+    /// word `shape.badge.corners`' style slot holds, decoded once per
+    /// epoch beside the ids.
+    badge_cut: u32,
     empty_y: f32,
     gap: f32,
     rows: f32,
@@ -324,6 +397,8 @@ struct Look {
     corner: f32,
     caption_px: f32,
     caption_tracking: f32,
+    caption_case: u32,
+    caption_font: u32,
     caption_gap: f32,
     icon_inset_x: f32,
     icon_inset_y: f32,
@@ -346,36 +421,36 @@ struct Look {
 
 impl Look {
     /// The pre-token world: a host that answers no theme calls at all.
-    /// Grey ink, zero lengths — the engine's kind defaults, mirrored, so
-    /// an old host shows the same undesigned raw as an empty theme.
+    /// No ink, zero lengths — nothing is drawn at all, which is the only
+    /// honest answer where the theme cannot be reached.
     fn raw() -> Look {
         let raw_state = StateStyleC {
             fill: NO_COLOR,
-            edge: RAW_INK,
-            text: RAW_INK,
-            glyph: RAW_INK,
-            edge_width: 1.0,
+            edge: NO_COLOR,
+            text: NO_COLOR,
+            glyph: NO_COLOR,
+            edge_width: 0.0,
             glow_radius: 0.0,
             glow_alpha: 0.0,
             elevation: 0.0,
         };
         Look {
-            error: RAW_INK,
-            error_on: RAW_INK,
+            error: NO_COLOR,
+            error_on: NO_COLOR,
             error_fill: NO_COLOR,
-            error_edge: RAW_INK,
+            error_edge: NO_COLOR,
             badge_border: 0.0,
             // The raw pill keeps the pre-word arrangement: solid.
             error_solid: true,
             glow_on: false,
             glow_radius: 0.0,
             glow_alpha: 0.0,
-            glyph_dir: RAW_INK,
-            glyph_file: RAW_INK,
-            glyph_link: RAW_INK,
-            glyph_detail: RAW_INK,
-            caption_dir: RAW_INK,
-            caption_file: RAW_INK,
+            glyph_dir: NO_COLOR,
+            glyph_file: NO_COLOR,
+            glyph_link: NO_COLOR,
+            glyph_detail: NO_COLOR,
+            caption_dir: NO_COLOR,
+            caption_file: NO_COLOR,
             idle: raw_state,
             hover: raw_state,
             thumb: raw_state,
@@ -388,6 +463,9 @@ impl Look {
             badge_h: 0.0,
             badge_pad: 0.0,
             badge_corner: 0.0,
+            // No cut on a host that cannot be asked: a shape chosen
+            // where the theme cannot be reached is this file designing.
+            badge_cut: CORNER_SQUARE,
             empty_y: 0.0,
             gap: 0.0,
             rows: 0.0,
@@ -397,6 +475,8 @@ impl Look {
             corner: 0.0,
             caption_px: 0.0,
             caption_tracking: 0.0,
+            caption_case: 0,
+            caption_font: FONT_UI,
             caption_gap: 0.0,
             icon_inset_x: 0.0,
             icon_inset_y: 0.0,
@@ -491,6 +571,7 @@ impl Look {
             badge_h: px(t.badge_h),
             badge_pad: px(t.badge_pad),
             badge_corner: px(t.badge_corner),
+            badge_cut: corner_style(&enum_word(api, ctx, t.badge_corner_style)),
             empty_y: px(t.empty_y),
             gap: px(t.gap),
             rows: px(t.rows),
@@ -498,8 +579,10 @@ impl Look {
             cell_min: px(t.cell_min),
             cell_pref: px(t.cell_pref),
             corner: px(t.corner),
-            caption_px: px(t.caption_size),
+            caption_px: px(t.caption_size).max(px(t.caption_min)),
             caption_tracking: px(t.caption_tracking),
+            caption_case: (api.theme_enum)(ctx, t.caption_case),
+            caption_font: t.caption_font,
             caption_gap: px(t.caption_gap),
             icon_inset_x: px(t.icon_inset_x),
             icon_inset_y: px(t.icon_inset_y),
@@ -571,14 +654,22 @@ fn host() -> Option<&'static HostApi> {
     unsafe { HOST }
 }
 
-fn measure(api: &HostApi, ctx: *mut c_void, px: f32, text: &str, spacing: f32) -> f32 {
-    (api.measure)(ctx, FONT_UI, px, text.as_ptr(), text.len() as u32, spacing)
+fn measure(
+    api: &HostApi,
+    ctx: *mut c_void,
+    font: u32,
+    px: f32,
+    text: &str,
+    spacing: f32,
+) -> f32 {
+    (api.measure)(ctx, font, px, text.as_ptr(), text.len() as u32, spacing)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     api: &HostApi,
     ctx: *mut c_void,
+    font: u32,
     px: f32,
     x: f32,
     y: f32,
@@ -589,7 +680,7 @@ fn draw_text(
 ) {
     (api.text)(
         ctx,
-        FONT_UI,
+        font,
         px,
         x,
         y,
@@ -873,7 +964,7 @@ impl Filesystem {
             let text = recase(look.banner_case, err.clone());
             let bpx = look.banner_px;
             let track = bpx * look.banner_tracking;
-            let tw = measure(api, ctx, bpx, &text, track);
+            let tw = measure(api, ctx, FONT_UI, bpx, &text, track);
             let w = (tw + 2.0 * look.badge_pad).min(r.w).max(1.0);
             let h = look.badge_h.max(1.0);
             let pill = RectC {
@@ -887,15 +978,35 @@ impl Filesystem {
             } else {
                 (look.error_fill, look.error)
             };
-            let cut = look.badge_corner;
-            if cut > 0.0 {
+            // The shape is the theme's, in both halves: `badge.corner`
+            // for the radius and `shape.badge.corners`' style slot for
+            // the cut, which is what the toolkit's own badge reads.
+            //
+            // The master ships `@corner.pill`, and `pill` is a WORD
+            // ABOUT THIS BOX rather than a length — §5.0 bakes it to a
+            // negative sentinel. This file used to test `cut > 0.0` and
+            // fall to a plain rect, with a note saying the capsule waited
+            // on the ring pair; the ring pair is here (`has_ring`, the
+            // same door the tile grid draws through), so the note was
+            // outliving its reason and the shipped theme's ONE capsule
+            // in this panel was a square. The translation is the
+            // toolkit's, never a copy of the rule.
+            let cut = nacelle::theme::corner_radius(look.badge_corner, pill.w, pill.h);
+            if api.has_ring() {
+                (api.ring_fill)(ctx, pill, look.badge_cut, cut, fill);
+                if !look.error_solid && look.badge_border > 0.0 {
+                    (api.ring)(ctx, pill, look.badge_cut, cut, look.badge_border, look.error_edge);
+                }
+            } else if cut > 0.0 && look.badge_cut != CORNER_SQUARE {
+                // A host too old for the ring pair bevels what it can:
+                // visibly plainer than the arc the theme asked for,
+                // never a different shape from a different rule.
                 let cut = cut.min(h / 2.0);
                 chamfer_fill(api, ctx, pill, cut, fill);
                 if !look.error_solid && look.badge_border > 0.0 {
                     chamfer_frame(api, ctx, pill, cut, look.badge_border, look.error_edge);
                 }
             } else {
-                // `pill` is a negative sentinel until R5 lands: square.
                 (api.rect)(ctx, pill, fill);
                 if !look.error_solid && look.badge_border > 0.0 {
                     (api.rect_outline)(ctx, pill, look.badge_border, look.error_edge);
@@ -904,6 +1015,7 @@ impl Filesystem {
             draw_text(
                 api,
                 ctx,
+                FONT_UI,
                 bpx,
                 pill.x + pill.w / 2.0,
                 pill.y + (pill.h - bpx * look.banner_leading) / 2.0,
@@ -1029,21 +1141,37 @@ impl Filesystem {
             // The tile is a real container (u2 §2.10): every one rests
             // on the filetile ladder's idle rung — a bordered cell with
             // the glyph inset and the caption under it, image 1's
-            // launcher cell — and the pointed-at one takes hover. The
-            // corner honours filetile.corner as far as the renderer can:
-            // a positive cut chamfers, rounding is R5's.
+            // launcher cell — and the pointed-at one takes hover.
+            //
+            // `filetile.corner` is the radius, and the CUT is ROUND
+            // because the master's `[corner]` header states that for
+            // every radius with no `*_corner_style` sibling beside it —
+            // "a rule of this file rather than a default any drawing
+            // code may pick for itself", and `filetile` declares no such
+            // sibling. The bevel this grid wore was the drawing code
+            // picking, kept by a note saying rounding waited on the ring
+            // pair; the ring pair is here, and the launcher's grid — the
+            // SAME token, drawn by `tile::tile_face` — has been reading
+            // the header's rule since. One token drawn as two shapes in
+            // two panels was the thing to end. A host too old for the
+            // pair still bevels, which is plainer, never a third shape.
             let rung = if trect.contains(mx, my) { &look.hover } else { &look.idle };
             let cell = RectC { x, y, w: tile, h: tile };
-            let cut = look.corner.min(tile / 2.0);
+            let cut = nacelle::theme::corner_radius(look.corner, tile, tile);
+            let round = api.has_ring();
             if rung.fill.a > 0.0 {
-                if cut > 0.0 {
+                if round {
+                    (api.ring_fill)(ctx, cell, CORNER_ROUND, cut, rung.fill);
+                } else if cut > 0.0 {
                     chamfer_fill(api, ctx, cell, cut, rung.fill);
                 } else {
                     (api.rect)(ctx, cell, rung.fill);
                 }
             }
             if rung.edge_width > 0.0 && rung.edge.a > 0.0 {
-                if cut > 0.0 {
+                if round {
+                    (api.ring)(ctx, cell, CORNER_ROUND, cut, rung.edge_width, rung.edge);
+                } else if cut > 0.0 {
                     chamfer_frame(api, ctx, cell, cut, rung.edge_width, rung.edge);
                 } else {
                     (api.rect_outline)(ctx, cell, rung.edge_width, rung.edge);
@@ -1105,10 +1233,13 @@ impl Filesystem {
             }
 
             // Name under the icon, trimmed by measured width.
-            let name = fit_name(api, ctx, name_px, &entry.name, tile, name_sp);
+            let name = recase(look.caption_case, entry.name.clone());
+            let name =
+                fit_name(api, ctx, look.caption_font, name_px, &name, tile, name_sp);
             draw_text(
                 api,
                 ctx,
+                look.caption_font,
                 name_px,
                 trect.cx(),
                 y + tile * look.caption_gap,
@@ -1240,19 +1371,20 @@ fn row_span(
 fn fit_name(
     api: &HostApi,
     ctx: *mut c_void,
+    font: u32,
     px: f32,
     text: &str,
     max_w: f32,
     spacing: f32,
 ) -> String {
-    if measure(api, ctx, px, text, spacing) <= max_w {
+    if measure(api, ctx, font, px, text, spacing) <= max_w {
         return text.to_string();
     }
     let chars: Vec<char> = text.chars().collect();
     let mut n = chars.len().saturating_sub(1);
     while n > 1 {
         let cand: String = chars[..n].iter().collect::<String>() + "\u{2026}";
-        if measure(api, ctx, px, &cand, spacing) <= max_w {
+        if measure(api, ctx, font, px, &cand, spacing) <= max_w {
             return cand;
         }
         n -= 1;
@@ -1894,5 +2026,193 @@ mod abi_tests {
             (API.button)(std::ptr::null_mut(), phase, 1.0, 1.0, r, 100.0, 100.0, &mut a);
         }
         assert_eq!(a.kind, u32::MAX, "an entry that does nothing writes nothing");
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    /// A file name is set in the role `filetile.caption_role` names,
+    /// and the binding is followed to a family that really exists — the
+    /// chain `ThemeIds::resolve` walks. Spelled into the code as
+    /// `type.tooltip.*`, the binding moved nothing when a theme
+    /// re-roled it; a renamed role now fails here instead.
+    #[test]
+    fn the_file_caption_role_names_a_family_the_master_declares() {
+        nacelle::theme::load();
+        let id = nacelle::theme::id("filetile.caption_role").expect("filetile.caption_role");
+        let role = nacelle::theme::enum_word_of(id).expect("the binding names no word");
+        assert!(!role.is_empty());
+        for suffix in ["size", "min_px", "tracking", "case", "face"] {
+            let name = role_token(&role, suffix).expect("a bound role names its family");
+            assert!(nacelle::theme::id(&name).is_some(), "the master declares no {name}");
+        }
+        // And the role really carries a size: a caption of no size is a
+        // grid of unnamed tiles.
+        let t = nacelle::theme::resolved();
+        let px = t.px(nacelle::theme::id(&role_token(&role, "size").unwrap()).unwrap());
+        assert!(px > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod badge_shape_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// (corner code, radius) for every ring the error pill drew, and
+        /// how many plain rectangles it fell back to.
+        static RINGS: RefCell<Vec<(u32, f32)>> = const { RefCell::new(Vec::new()) };
+        static RECTS: RefCell<Vec<RectC>> = const { RefCell::new(Vec::new()) };
+    }
+
+    extern "C" fn rec_ring_fill(_: *mut c_void, _: RectC, style: u32, radius: f32, _: ColorC) {
+        RINGS.with(|v| v.borrow_mut().push((style, radius)));
+    }
+
+    extern "C" fn rec_ring(_: *mut c_void, _: RectC, style: u32, radius: f32, _: f32, _: ColorC) {
+        RINGS.with(|v| v.borrow_mut().push((style, radius)));
+    }
+
+    extern "C" fn rec_rect(_: *mut c_void, r: RectC, _: ColorC) {
+        RECTS.with(|v| v.borrow_mut().push(r));
+    }
+
+    /// The panel drawn over a directory that cannot be read — the one
+    /// frame the error pill appears in — through a host table whose ring
+    /// and rect entries write down what they were asked for.
+    fn error_frame() -> (Vec<(u32, f32)>, Vec<RectC>) {
+        nacelle::theme::load();
+        let api = HostApi {
+            ring_fill: rec_ring_fill,
+            ring: rec_ring,
+            rect: rec_rect,
+            ..*nacelle::plugin::host_api()
+        };
+        let mut fs = Filesystem::new(PathBuf::from("/nonexistent/nacelle-badge-test"));
+        assert!(fs.error.is_some(), "the panel found no error to badge");
+        RINGS.with(|v| v.borrow_mut().clear());
+        RECTS.with(|v| v.borrow_mut().clear());
+        // A null drawing context: every entry this frame reaches either
+        // is ours or is a theme entry, and no theme entry reads it.
+        fs.draw(&api, std::ptr::null_mut(), Rect::new(0.0, 0.0, 400.0, 300.0));
+        (RINGS.with(|v| v.borrow().clone()), RECTS.with(|v| v.borrow().clone()))
+    }
+
+    /// The master ships `badge.corner = @corner.pill`, and a capsule is
+    /// half the shorter side of the box it is a word about. This file
+    /// used to test the baked number for `> 0.0`, find §5.0's negative
+    /// sentinel, and draw a plain rectangle with a note saying the
+    /// capsule was waiting on the ring pair — which had already arrived.
+    /// So the one badge this panel draws was a square the theme never
+    /// asked for. A return to that reading fails here.
+    #[test]
+    fn the_error_pill_is_the_capsule_the_master_states() {
+        let t = nacelle::theme::resolved();
+        let stated = t.px(nacelle::theme::id("badge.corner").expect("badge.corner"));
+        let pill = nacelle::theme::expr::sentinel("pill").expect("§5.0 declares pill");
+        assert_eq!(stated, pill, "the master no longer states a capsule here");
+
+        let (rings, rects) = error_frame();
+        assert!(!rings.is_empty(), "the pill drew no ring at all");
+        // Nothing was squared off: a plain rect from this frame would be
+        // the retired fallback, and there is no other rect in it.
+        assert!(rects.is_empty(), "the pill fell back to a rectangle");
+        // The pill is `badge.h` tall and its text plus `badge.pad_x`
+        // wide, so its capsule radius is half whichever is shorter.
+        let h = t.px(nacelle::theme::id("badge.h").expect("badge.h"));
+        let w = 2.0 * t.px(nacelle::theme::id("badge.pad_x").expect("badge.pad_x"));
+        let want = h.min(w) / 2.0;
+        for (_, radius) in &rings {
+            assert_eq!(*radius, want, "a radius of {radius} where the capsule is {want}");
+        }
+    }
+
+    /// And the CUT is the word the master holds, not one spelled in
+    /// here: `shape.badge.corners`' style slot, the same key the
+    /// toolkit's own badge reads.
+    ///
+    /// Said plainly about its reach: the shipped word is `round`, so
+    /// this catches a cut spelled in as square or chamfer and a master
+    /// that moves the slot, but not a `Round` spelled in that happens to
+    /// agree with today's theme. What pins the READING is the key being
+    /// declared and answered at all, which is the half asserted first.
+    #[test]
+    fn the_error_pills_cut_is_the_shape_presets_own_word() {
+        nacelle::theme::load();
+        let id = nacelle::theme::id("shape.badge.corners[0]").expect("shape.badge.corners[0]");
+        let word = nacelle::theme::enum_word_of(id).expect("the slot names no word");
+        assert!(matches!(word.as_str(), "square" | "round" | "chamfer"), "{word}");
+        let (rings, _) = error_frame();
+        assert!(!rings.is_empty());
+        for (style, _) in &rings {
+            assert_eq!(*style, corner_style(&word), "the preset's word was not followed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tile_shape_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SHAPES: RefCell<Vec<(u32, f32)>> = const { RefCell::new(Vec::new()) };
+        static QUADS: RefCell<usize> = const { RefCell::new(0) };
+    }
+
+    extern "C" fn rec_ring_fill(_: *mut c_void, _: RectC, style: u32, radius: f32, _: ColorC) {
+        SHAPES.with(|v| v.borrow_mut().push((style, radius)));
+    }
+
+    extern "C" fn rec_ring(_: *mut c_void, _: RectC, style: u32, radius: f32, _: f32, _: ColorC) {
+        SHAPES.with(|v| v.borrow_mut().push((style, radius)));
+    }
+
+    extern "C" fn rec_quad(_: *mut c_void, _: *const f32, _: ColorC) {
+        QUADS.with(|n| *n.borrow_mut() += 1);
+    }
+
+    /// A frame over a directory that really has entries — this crate's
+    /// own, so the test reads nothing it did not ship — with the ring and
+    /// quad entries writing down what the tiles asked for.
+    fn tile_frame() -> (Vec<(u32, f32)>, usize) {
+        nacelle::theme::load();
+        let api = HostApi {
+            ring_fill: rec_ring_fill,
+            ring: rec_ring,
+            quad: rec_quad,
+            ..*nacelle::plugin::host_api()
+        };
+        let mut fs = Filesystem::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        assert!(fs.error.is_none(), "the panel could not read its own crate");
+        assert!(!fs.entries.is_empty(), "no tile to draw");
+        SHAPES.with(|v| v.borrow_mut().clear());
+        QUADS.with(|n| *n.borrow_mut() = 0);
+        fs.draw(&api, std::ptr::null_mut(), Rect::new(0.0, 0.0, 400.0, 300.0));
+        (SHAPES.with(|v| v.borrow().clone()), QUADS.with(|n| *n.borrow()))
+    }
+
+    /// A file tile wears the ROUND cut the master's `[corner]` header
+    /// states for a radius with no `*_corner_style` sibling — which is
+    /// what `filetile.corner` is, and what the launcher's grid draws the
+    /// same token as. The bevel this panel used to spell in was the
+    /// drawing code choosing a shape, and it made ONE token two shapes
+    /// in two panels; a return to it fails here, because a chamfer is
+    /// quads and never reaches the ring pair.
+    #[test]
+    fn a_file_tile_wears_the_headers_round_cut_at_the_masters_radius() {
+        let stated = nacelle::theme::resolved()
+            .px(nacelle::theme::id("filetile.corner").expect("filetile.corner"));
+        assert!(stated > 0.0, "the master states no tile radius to draw");
+        let (shapes, quads) = tile_frame();
+        assert!(!shapes.is_empty(), "no tile reached the ring pair");
+        assert_eq!(quads, 0, "a tile was bevelled out of quads");
+        for (style, radius) in &shapes {
+            assert_eq!(*style, CORNER_ROUND, "a tile was cut some other way");
+            assert_eq!(*radius, stated, "a radius of {radius} where the master states {stated}");
+        }
     }
 }

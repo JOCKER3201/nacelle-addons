@@ -11,11 +11,14 @@
 //!
 //! Nothing here holds state and nothing here decides anything: every
 //! colour, length and word arrives from the theme through ABI 5/6
-//! tokens, and a missing token degrades through the raw answers the ABI
-//! itself gives (grey ink, zero lengths), never through a number that
-//! used to be the design.
+//! tokens, and a token nobody can answer degrades to no ink and no
+//! length — nothing drawn — never to a number that used to be the
+//! design.
 
-use nacelle::runtime::{ColorC, HostApi, RectC, StateStyleC, MASK_QUAD_ADD};
+use nacelle::runtime::{
+    ColorC, HostApi, RectC, StateStyleC, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
+    MASK_QUAD_ADD,
+};
 use std::ffi::c_void;
 
 /// The font slots, as the host numbers them — the theme's own
@@ -46,11 +49,60 @@ pub const STATE_SELECTED_HOVER: u32 = 4;
 /// word's index in that list.
 pub const ROW_JUSTIFY_FILL: u32 = 1;
 
-/// The engine's raw ink — what `theme_color` answers for a missing
-/// token. Kept only for the path where the host predates ABI 5 and
-/// cannot be asked at all.
-pub const RAW_INK: ColorC = ColorC { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+/// No colour at all — what this family draws with on a host that
+/// predates ABI 5 and cannot be asked what anything looks like.
+///
+/// Not a grey: a grey chosen here is a design decision taken where the
+/// theme cannot be reached. Paired with the zero widths and zero lengths
+/// of [`TileLook::raw`], it makes that host draw NOTHING, which is the
+/// clean bail `ai` takes for the same case.
 pub const NO_COLOR: ColorC = ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+
+/// How a container's corners are CUT, and how far. A radius alone is a
+/// length and not a shape — the master's `[corner]` section says so —
+/// so the two travel together and neither is decided here.
+#[derive(Clone, Copy)]
+pub struct Corner {
+    /// [`CORNER_SQUARE`], [`CORNER_ROUND`] or [`CORNER_CHAMFER`].
+    pub style: u32,
+    pub radius: f32,
+}
+
+/// The cut a `*_corner_style` word names. A word this build has never
+/// heard of leaves the shape square, which is what an unstyled rectangle
+/// already is — never a cut of this file's choosing.
+pub fn corner_style(word: &str) -> u32 {
+    match word {
+        "round" => CORNER_ROUND,
+        "chamfer" => CORNER_CHAMFER,
+        _ => CORNER_SQUARE,
+    }
+}
+
+/// Whether a scrolling area's bar is drawn at all, and whether it costs
+/// layout — `scrollbar.mode`'s three words, decoded from the WORD.
+///
+/// Read as a word and not as an index: the index-only reading could not
+/// tell `inset` from `none`, so a theme that asked for a bar beside the
+/// content got no bar at all.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BarMode {
+    Overlay,
+    Inset,
+    None,
+}
+
+pub fn bar_mode(word: &str) -> BarMode {
+    match word {
+        "none" => BarMode::None,
+        // Honoured as far as this grid can: the bar is drawn, but the
+        // tiles are laid out before there is a bar to make room for, so
+        // it costs no width yet. Said out loud rather than silently
+        // drawing nothing, which is what the index reading did.
+        "inset" => BarMode::Inset,
+        _ => BarMode::Overlay,
+    }
+}
 
 /// A rectangle in a widget's own arithmetic; `RectC` is what crosses.
 #[derive(Clone, Copy)]
@@ -89,6 +141,40 @@ pub fn token(api: &HostApi, name: &str) -> u32 {
     (api.theme_token)(name.as_ptr(), name.len() as u32)
 }
 
+/// The WORD an enum token currently resolves to — ABI 6's appended
+/// `theme_enum_word`. Init-time work, like [`token`]: it copies a
+/// string, so it belongs beside the id resolution and behind the epoch,
+/// never inside a frame. An empty answer — a host whose table ends
+/// before the entry, a missing token, a token with no word — is what a
+/// caller degrades on.
+pub fn enum_word(api: &HostApi, ctx: *mut c_void, id: u32) -> String {
+    if !api.has_theme_enum_word() || id == u32::MAX {
+        return String::new();
+    }
+    let mut buf = [0u8; 64];
+    let n = (api.theme_enum_word)(ctx, id, buf.as_mut_ptr(), buf.len() as u32) as usize;
+    String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
+}
+
+/// The name of one token of the role a `*_role` binding names, or `None`
+/// for a master that binds no role at all — which leaves every id
+/// MISSING and every accessor on zero, and type of no size draws
+/// nothing. Naming a role here would be this file choosing the type.
+pub fn role_token(role: &str, suffix: &str) -> Option<String> {
+    if role.is_empty() {
+        return None;
+    }
+    Some(format!("type.{role}.{suffix}"))
+}
+
+/// The id of one token of the role a binding names.
+pub fn role_id(api: &HostApi, role: &str, suffix: &str) -> u32 {
+    match role_token(role, suffix) {
+        Some(name) => token(api, &name),
+        None => u32::MAX,
+    }
+}
+
 /// Token ids the tile grid draws from, resolved by NAME once per epoch.
 ///
 /// No header tokens: a panel's title band is the HOST's, through
@@ -121,12 +207,18 @@ pub struct TileTheme {
     pub row_justify: u32, // filetile.row_justify
     // the stand-in for the icon nobody can draw yet
     pub glyph_px: u32, // icon.size.launcher — "the launcher grid's app glyphs"
-    // type — the launcher tile caption role
-    pub caption_size: u32,     // type.caption.size
-    pub caption_min: u32,      // type.caption.min_px
-    pub caption_tracking: u32, // type.caption.tracking
-    pub caption_leading: u32,  // type.caption.leading
-    pub caption_case: u32,     // type.caption.case
+    // type.<tile.caption_role>.* — the role the master BINDS a launcher
+    // tile's caption to. Read as a word: `tile.caption_role` and
+    // `filetile.caption_role` are two different words for two grids, and
+    // a file that spells `type.caption.*` out reads neither.
+    pub caption_size: u32,
+    pub caption_min: u32,
+    pub caption_tracking: u32,
+    pub caption_leading: u32,
+    pub caption_case: u32,
+    /// The slot that role's `face` names, resolved WITH the ids because
+    /// a face is a word and reading words is init-time work.
+    pub caption_font: u32,
     // where an empty grid says so
     pub empty_y: u32, // emptystate.y_frac
     // the press flash's life, and the one global that scales it
@@ -134,7 +226,8 @@ pub struct TileTheme {
     pub motion_scale: u32, // motion.scale
     pub glow_scale: u32,   // glow.alpha_scale
     // the scrollbar
-    pub sb_mode: u32,      // scrollbar.mode — `overlay | inset | none`; overlay = 0
+    /// `scrollbar.mode`, decoded from its WORD beside the ids.
+    pub sb_mode: BarMode,
     pub sb_w: u32,         // scrollbar.w
     pub sb_margin: u32,    // scrollbar.margin
     pub sb_thumb_min: u32, // scrollbar.thumb_min
@@ -146,8 +239,13 @@ pub struct TileTheme {
 }
 
 impl TileTheme {
-    pub fn resolve(api: &HostApi, epoch: u32) -> TileTheme {
+    pub fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> TileTheme {
         let class = |name: &str| (api.theme_class)(name.as_ptr(), name.len() as u32);
+        // The caption's binding, followed to the role it names. An
+        // unbound one leaves every id below MISSING, which is a caption
+        // of no size: a grid whose type the master says nothing about
+        // shows its tiles and no names.
+        let caption = enum_word(api, ctx, token(api, "tile.caption_role"));
         TileTheme {
             epoch,
             gap: token(api, "filetile.gap"),
@@ -164,16 +262,17 @@ impl TileTheme {
             wheel: token(api, "filetile.wheel_px"),
             row_justify: token(api, "filetile.row_justify"),
             glyph_px: token(api, "icon.size.launcher"),
-            caption_size: token(api, "type.caption.size"),
-            caption_min: token(api, "type.caption.min_px"),
-            caption_tracking: token(api, "type.caption.tracking"),
-            caption_leading: token(api, "type.caption.leading"),
-            caption_case: token(api, "type.caption.case"),
+            caption_size: role_id(api, &caption, "size"),
+            caption_min: role_id(api, &caption, "min_px"),
+            caption_tracking: role_id(api, &caption, "tracking"),
+            caption_leading: role_id(api, &caption, "leading"),
+            caption_case: role_id(api, &caption, "case"),
+            caption_font: face_slot(api, ctx, role_id(api, &caption, "face")),
             empty_y: token(api, "emptystate.y_frac"),
             press_ms: token(api, "motion.press.duration_ms"),
             motion_scale: token(api, "motion.scale"),
             glow_scale: token(api, "glow.alpha_scale"),
-            sb_mode: token(api, "scrollbar.mode"),
+            sb_mode: bar_mode(&enum_word(api, ctx, token(api, "scrollbar.mode"))),
             sb_w: token(api, "scrollbar.w"),
             sb_margin: token(api, "scrollbar.margin"),
             sb_thumb_min: token(api, "scrollbar.thumb_min"),
@@ -213,13 +312,14 @@ pub struct TileLook {
     pub caption_tracking: f32,
     pub caption_leading: f32,
     pub caption_case: u32,
+    pub caption_font: u32,
     pub empty_y: f32,
     /// `motion.press.duration_ms` already scaled by `motion.scale` and
     /// turned into seconds — a reduced-motion theme sets the scale to 0
     /// and the flash simply never shows.
     pub press_s: f32,
     pub glow_scale: f32,
-    pub sb_mode: u32,
+    pub sb_mode: BarMode,
     pub sb_w: f32,
     pub sb_margin: f32,
     pub sb_thumb_min: f32,
@@ -233,10 +333,10 @@ impl TileLook {
     pub fn raw() -> TileLook {
         let raw_state = StateStyleC {
             fill: NO_COLOR,
-            edge: RAW_INK,
-            text: RAW_INK,
-            glyph: RAW_INK,
-            edge_width: 1.0,
+            edge: NO_COLOR,
+            text: NO_COLOR,
+            glyph: NO_COLOR,
+            edge_width: 0.0,
             glow_radius: 0.0,
             glow_alpha: 0.0,
             elevation: 0.0,
@@ -264,10 +364,11 @@ impl TileLook {
             caption_tracking: 0.0,
             caption_leading: 1.0,
             caption_case: 0,
+            caption_font: FONT_UI,
             empty_y: 0.0,
             press_s: 0.0,
             glow_scale: 0.0,
-            sb_mode: 0,
+            sb_mode: BarMode::None,
             sb_w: 0.0,
             sb_margin: 0.0,
             sb_thumb_min: 0.0,
@@ -300,10 +401,11 @@ impl TileLook {
             caption_tracking: px(t.caption_tracking),
             caption_leading: px(t.caption_leading).max(1.0),
             caption_case: (api.theme_enum)(ctx, t.caption_case),
+            caption_font: t.caption_font,
             empty_y: px(t.empty_y),
             press_s: px(t.press_ms) * px(t.motion_scale) / 1000.0,
             glow_scale: px(t.glow_scale),
-            sb_mode: (api.theme_enum)(ctx, t.sb_mode),
+            sb_mode: t.sb_mode,
             sb_w: px(t.sb_w),
             sb_margin: px(t.sb_margin),
             sb_thumb_min: px(t.sb_thumb_min),
@@ -454,27 +556,52 @@ pub fn recase(word: u32, s: String) -> String {
 // ----------------------------------------------------------------- shapes
 
 /// One container's whole surface on one rung of the ladder: the fill,
-/// the ring, and the ring's glow — in that order, chamfered by `cut`.
-/// This is what makes a tile look like a tile; a caller that wants the
-/// same look on a different shape passes a different rectangle, never a
-/// different colour.
+/// the ring, and the ring's glow — in that order, on the corners
+/// `corner` states. This is what makes a tile look like a tile; a caller
+/// that wants the same look on a different shape passes a different
+/// [`Corner`], never a different colour.
+///
+/// The round cut goes through the host's own ring pair, which
+/// tessellates the arc by its quarter-pixel rule, so no caller has to
+/// know how many segments a radius needs. A host too old for that pair
+/// draws the chamfer it always did.
 pub fn frame(
     api: &HostApi,
     ctx: *mut c_void,
     cell: RectC,
-    cut: f32,
+    corner: Corner,
     rung: &StateStyleC,
     glow_scale: f32,
 ) {
+    // `pill` is a WORD ABOUT THIS BOX, not a length: §5.0 bakes it to a
+    // negative sentinel, so clamping the radius at zero — which is what
+    // this line did — answered a master writing `@corner.pill` with the
+    // very square it wrote to avoid, and said nothing about it. Both
+    // doors below this one already read the sentinel (`AbiSurface::
+    // ring_fill` on the way out, the host's own `corners_in` on the way
+    // in), which left this clamp as the last thing standing between the
+    // theme's capsule and a silent rectangle — and the only one on the
+    // chamfer path, which never reaches the ring pair at all.
+    //
+    // The translation is the toolkit's, never repeated here: a capsule
+    // written twice is a capsule that stops being one somewhere. It is
+    // idempotent, so a caller that resolved its own sentinel first hands
+    // in a plain length and gets it back.
+    let cut = nacelle::theme::corner_radius(corner.radius, cell.w, cell.h);
+    let round = corner.style == CORNER_ROUND && api.has_ring();
     if rung.fill.a > 0.0 {
-        if cut > 0.0 {
+        if round {
+            (api.ring_fill)(ctx, cell, CORNER_ROUND, cut, rung.fill);
+        } else if cut > 0.0 && corner.style != CORNER_SQUARE {
             chamfer_fill(api, ctx, cell, cut, rung.fill);
         } else {
             (api.rect)(ctx, cell, rung.fill);
         }
     }
     if rung.edge_width > 0.0 && rung.edge.a > 0.0 {
-        if cut > 0.0 {
+        if round {
+            (api.ring)(ctx, cell, CORNER_ROUND, cut, rung.edge_width, rung.edge);
+        } else if cut > 0.0 && corner.style != CORNER_SQUARE {
             chamfer_frame(api, ctx, cell, cut, rung.edge_width, rung.edge);
         } else {
             (api.rect_outline)(ctx, cell, rung.edge_width, rung.edge);
@@ -484,6 +611,11 @@ pub fn frame(
         // the edge's resolved colour and scaled by the one global knob.
         // Every shipped idle rung is dark; hover and press are where the
         // ladder lights up.
+        //
+        // The halo is extruded from the octagon whatever the cut is: it
+        // is a soft light around the shape, and at a corner radius the
+        // difference between an arc's halo and a bevel's is under the
+        // sprite's own falloff.
         let alpha = (rung.glow_alpha * glow_scale).clamp(0.0, 1.0);
         if api.has_mask_quad() && rung.glow_radius > 0.0 && alpha > 0.0 {
             let c = ColorC { a: alpha, ..rung.edge };
@@ -699,8 +831,18 @@ pub fn tile_face(
     mark: &str,
     label: &str,
 ) {
-    let cut = look.corner.min(t.w / 2.0);
-    frame(api, ctx, t.c(), cut, rung, look.glow_scale);
+    // `filetile.corner` is the radius, and the cut is ROUND because the
+    // `[corner]` header states that for every radius with no
+    // `*_corner_style` sibling beside it — "a rule of this file rather
+    // than a default any drawing code may pick for itself". The header's
+    // list of such radii omits this one, but the list is the rule's
+    // examples and the condition is "declares no such sibling", which
+    // `filetile` does not; the keyboard cap reads the same sentence the
+    // same way. The bevel this grid used to wear was the drawing code
+    // picking, and the sibling key that would let a theme ask for it
+    // back is reported, not invented here.
+    let corner = Corner { style: CORNER_ROUND, radius: look.corner.min(t.w / 2.0) };
+    frame(api, ctx, t.c(), corner, rung, look.glow_scale);
 
     let icon = Rect::new(
         t.x + t.w * look.icon_inset_x,
@@ -716,8 +858,19 @@ pub fn tile_face(
     let px = look.caption_px;
     let sp = px * look.caption_tracking;
     let name = recase(look.caption_case, label.to_string());
-    let name = fit_name(api, ctx, FONT_UI, px, &name, t.w, sp);
-    draw_text(api, ctx, px, t.cx(), t.y + t.w * look.caption_gap, &name, rung.text, sp);
+    let name = fit_name(api, ctx, look.caption_font, px, &name, t.w, sp);
+    text(
+        api,
+        ctx,
+        look.caption_font,
+        px,
+        t.cx(),
+        t.y + t.w * look.caption_gap,
+        &name,
+        rung.text,
+        sp,
+        1,
+    );
 }
 
 /// Where a scrolling column of rows currently is: how many there are,
@@ -745,12 +898,18 @@ impl Layout {
     }
 }
 
-/// The bar that says where in a long list the eye is. Overlay only —
-/// the word an enum index can decode across the ABI; any other (inset,
-/// none) draws nothing until the ABI can tell them apart.
+/// The bar that says where in a long list the eye is.
+///
+/// `scrollbar.mode` decides whether there is one: `none` draws nothing,
+/// and `overlay` and `inset` both draw — the difference between them is
+/// whether the bar costs the content width, which this grid cannot yet
+/// give it (the tiles are laid out before there is a bar). Until the
+/// index reading was replaced by the WORD, `inset` and `none` were the
+/// same answer here, so a theme asking for a bar beside the tiles got
+/// no bar at all.
 pub fn scrollbar(api: &HostApi, ctx: *mut c_void, look: &TileLook, area: Rect, s: Scroll) {
     let (total_rows, nvis, row_off, max_off) = (s.total, s.nvis, s.off, s.max_off);
-    if !(total_rows > nvis && look.sb_mode == 0 && look.sb_w > 0.0) {
+    if !(total_rows > nvis && look.sb_mode != BarMode::None && look.sb_w > 0.0) {
         return;
     }
     let bw = look.sb_w;
@@ -768,5 +927,186 @@ pub fn scrollbar(api: &HostApi, ctx: *mut c_void, look: &TileLook, area: Rect, s
     }
     if look.thumb.edge_width > 0.0 && look.thumb.edge.a > 0.0 {
         (api.rect_outline)(ctx, thumb, look.thumb.edge_width, look.thumb.edge);
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// The tile grid's caption is set in the role the master BINDS, and
+    /// the binding is followed to a family that really exists — the
+    /// chain `TileTheme::resolve` walks. A renamed role fails here
+    /// instead of leaving every tile nameless.
+    #[test]
+    fn the_tile_caption_role_names_a_family_the_master_declares() {
+        nacelle::theme::load();
+        let id = nacelle::theme::id("tile.caption_role").expect("tile.caption_role");
+        let role = nacelle::theme::enum_word_of(id).expect("the binding names no word");
+        assert!(!role.is_empty());
+        for suffix in ["size", "min_px", "tracking", "leading", "case", "face"] {
+            let name = role_token(&role, suffix).expect("a bound role names its family");
+            assert!(nacelle::theme::id(&name).is_some(), "the master declares no {name}");
+        }
+    }
+
+    /// The launcher's caption role and the file browser's are two
+    /// different words for two grids — which is why neither could be
+    /// spelled into the code. If a master ever binds both to one role
+    /// this test says so rather than letting the distinction rot.
+    #[test]
+    fn the_two_tile_grids_are_bound_to_two_different_roles() {
+        nacelle::theme::load();
+        let word = |n: &str| {
+            nacelle::theme::enum_word_of(nacelle::theme::id(n).expect(n)).expect("no word")
+        };
+        assert_ne!(word("tile.caption_role"), word("filetile.caption_role"));
+    }
+
+    /// THE scrollbar finding: `inset` and `none` are different answers.
+    /// Read as an index they were both "not overlay", so a theme asking
+    /// for a bar beside the content got no bar at all.
+    #[test]
+    fn inset_asks_for_a_bar_and_none_asks_for_no_bar() {
+        assert!(bar_mode("inset") != BarMode::None);
+        assert!(bar_mode("overlay") != BarMode::None);
+        assert!(bar_mode("none") == BarMode::None);
+        // A word this build predates is a bar, not silence: an unknown
+        // arrangement is still an arrangement.
+        assert!(bar_mode("") != BarMode::None);
+        // And the master's own word is one of the three.
+        nacelle::theme::load();
+        let id = nacelle::theme::id("scrollbar.mode").expect("scrollbar.mode");
+        let word = nacelle::theme::enum_word_of(id).expect("no word");
+        assert!(matches!(word.as_str(), "overlay" | "inset" | "none"), "{word}");
+    }
+
+    /// A radius is not a shape: the same length is three different
+    /// containers depending on the word beside it, and a word this file
+    /// has never heard of leaves the shape unstyled rather than cut.
+    #[test]
+    fn each_corner_word_is_a_different_cut() {
+        assert_eq!(corner_style("round"), CORNER_ROUND);
+        assert_eq!(corner_style("chamfer"), CORNER_CHAMFER);
+        assert_eq!(corner_style("square"), CORNER_SQUARE);
+        assert_eq!(corner_style("hexagon"), CORNER_SQUARE);
+    }
+}
+
+#[cfg(test)]
+mod sentinel_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static RADII: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    extern "C" fn rec_ring_fill(_: *mut c_void, _: RectC, _: u32, radius: f32, _: ColorC) {
+        RADII.with(|r| r.borrow_mut().push(radius));
+    }
+
+    extern "C" fn rec_ring(_: *mut c_void, _: RectC, _: u32, radius: f32, _: f32, _: ColorC) {
+        RADII.with(|r| r.borrow_mut().push(radius));
+    }
+
+    thread_local! {
+        static QUADS: RefCell<Vec<[f32; 8]>> = const { RefCell::new(Vec::new()) };
+    }
+
+    extern "C" fn rec_quad(_: *mut c_void, pts: *const f32, _: ColorC) {
+        let mut q = [0.0f32; 8];
+        // The ABI's quad is eight floats at `pts`; the entry is only
+        // ever reached from this file's own `chamfer_fill`.
+        q.copy_from_slice(unsafe { std::slice::from_raw_parts(pts, 8) });
+        QUADS.with(|v| v.borrow_mut().push(q));
+    }
+
+    /// A rung that draws both halves of the frame — a fill to carry the
+    /// `ring_fill` radius and a stroke to carry the `ring` one — and no
+    /// glow, so the mask sprite stays out of the count.
+    const LIT: StateStyleC = StateStyleC {
+        fill: ColorC { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+        edge: ColorC { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+        text: NO_COLOR,
+        glyph: NO_COLOR,
+        edge_width: 1.0,
+        glow_radius: 0.0,
+        glow_alpha: 0.0,
+        elevation: 0.0,
+    };
+
+    /// Every radius `frame` hands the ring pair for `cell`, taken through
+    /// the real function: a host table whose two ring entries write the
+    /// radius down and whose `api_size` is the live one, so `has_ring`
+    /// answers as it does in the running program.
+    fn draw(corner: Corner, cell: RectC) -> (Vec<f32>, Vec<[f32; 8]>) {
+        let api = HostApi {
+            ring_fill: rec_ring_fill,
+            ring: rec_ring,
+            quad: rec_quad,
+            ..*nacelle::plugin::host_api()
+        };
+        RADII.with(|r| r.borrow_mut().clear());
+        QUADS.with(|v| v.borrow_mut().clear());
+        // A null drawing context: every entry reached here is ours and
+        // none of them looks at it.
+        frame(&api, std::ptr::null_mut(), cell, corner, &LIT, 0.0);
+        (RADII.with(|r| r.borrow().clone()), QUADS.with(|v| v.borrow().clone()))
+    }
+
+    fn radii(corner: Corner, cell: RectC) -> Vec<f32> {
+        draw(corner, cell).0
+    }
+
+    /// `@corner.pill` on a tile's radius token is a CAPSULE, and the
+    /// capsule is half the shorter side of the box it is a word about.
+    /// The clamp this line used to carry (`radius.max(0.0)`) made it a
+    /// square, which is the shape the master wrote `pill` to avoid —
+    /// and a return to that clamp fails here rather than passing.
+    #[test]
+    fn a_pill_radius_reaches_the_ring_pair_as_half_the_short_side() {
+        let pill = nacelle::theme::expr::sentinel("pill").expect("§5.0 declares pill");
+        let cell = RectC { x: 0.0, y: 0.0, w: 200.0, h: 40.0 };
+        let got = radii(Corner { style: CORNER_ROUND, radius: pill }, cell);
+        assert_eq!(got, vec![20.0, 20.0], "the fill's radius and the ring's");
+        // The short side is whichever it is: a tall tile capsules across
+        // its width, and a clamp that happened to equal h/2 cannot pass
+        // both of these.
+        let tall = RectC { x: 0.0, y: 0.0, w: 40.0, h: 200.0 };
+        assert_eq!(radii(Corner { style: CORNER_ROUND, radius: pill }, tall), vec![20.0, 20.0]);
+    }
+
+    /// The chamfer path never reaches the ring pair — it is built here,
+    /// out of quads — so it is the one cut no door below this file could
+    /// have rescued. A capsule chamfer is the widest bevel the box holds.
+    #[test]
+    fn a_pill_radius_cuts_the_chamfer_by_the_same_half_side() {
+        let pill = nacelle::theme::expr::sentinel("pill").expect("§5.0 declares pill");
+        let cell = RectC { x: 0.0, y: 0.0, w: 200.0, h: 40.0 };
+        let (radii, quads) = draw(Corner { style: CORNER_CHAMFER, radius: pill }, cell);
+        assert!(radii.is_empty(), "a chamfer is quads, not a ring");
+        // `chamfer_fill`'s top trapezoid: its first vertex sits one cut
+        // in from the left edge. A cut of zero — which is what the
+        // retired clamp made of the sentinel — would put it ON the edge,
+        // and the else-arm would draw a plain rect with no quad at all.
+        let top = quads.first().expect("the sentinel was read as no cut at all");
+        assert_eq!(top[0], cell.x + 20.0, "the top-left cut starts where the capsule says");
+    }
+
+    /// A length is still a length: the sentinel reading must not move
+    /// the radius a master actually states, and the other sentinels —
+    /// `auto`, `same_as_parent` — are the ABSENCE of a length and draw
+    /// no corner rather than one this file invents.
+    #[test]
+    fn a_stated_length_is_untouched_and_the_other_sentinels_cut_nothing() {
+        let cell = RectC { x: 0.0, y: 0.0, w: 200.0, h: 40.0 };
+        let got = radii(Corner { style: CORNER_ROUND, radius: 6.0 }, cell);
+        assert_eq!(got, vec![6.0, 6.0]);
+        for word in ["auto", "same_as_parent"] {
+            let s = nacelle::theme::expr::sentinel(word).expect(word);
+            let got = radii(Corner { style: CORNER_ROUND, radius: s }, cell);
+            assert_eq!(got, vec![0.0, 0.0], "{word} is not a radius");
+        }
     }
 }

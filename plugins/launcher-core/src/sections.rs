@@ -163,8 +163,9 @@ pub struct HeadLook {
 
 impl HeadLook {
     /// The pre-token world: a host that answers no theme calls at all.
-    /// Grey ink, zero lengths — a rule of no width draws nothing, which
-    /// is the same undesigned raw an empty theme gives.
+    /// No ink and zero lengths — type of no size and a rule of no width
+    /// draw nothing, which is the honest answer where the theme cannot
+    /// be reached at all.
     pub fn raw() -> HeadLook {
         HeadLook {
             px: 0.0,
@@ -172,7 +173,7 @@ impl HeadLook {
             leading: 1.0,
             case: 0,
             font: tile::FONT_UI,
-            ink: tile::RAW_INK,
+            ink: tile::NO_COLOR,
             gap: 0.0,
             rule_w: 0.0,
             rule: tile::NO_COLOR,

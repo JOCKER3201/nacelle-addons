@@ -38,12 +38,13 @@
 //! instance's own.
 //!
 //! Every colour, length, duration and word comes from the theme through
-//! ABI 5/6 tokens. Nothing here knows what a colour is: a missing token
-//! degrades through the raw answers the ABI itself gives (grey ink,
-//! zero lengths), never through a number that used to be the design.
+//! ABI 5/6 tokens. Nothing here knows what a colour is: a token nobody
+//! can answer degrades to no ink and no length — nothing drawn — never
+//! to a number that used to be the design.
 
 use nacelle::runtime::{
     ActionC, ChromeC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_NONE,
+    CORNER_SQUARE,
 };
 use nacelle::widget::factory::BuiltinWidget;
 use nacelle_launcher_core::cats::{self, Category};
@@ -90,18 +91,37 @@ struct ListTheme {
     chip_gap: u32,   // list.glyph_gap
     status_gap: u32, // list.status_gap — the gap before a row's trailing status
     wheel: u32,      // list.wheel_px — a row list scrolls by its own notch, not a tile grid's
-    // type — the count is a number in a column, which is `data`'s role
-    count_size: u32,    // type.data.size
-    count_min: u32,     // type.data.min_px
-    count_tracking: u32, // type.data.tracking
-    count_leading: u32, // type.data.leading
-    count_case: u32,    // type.data.case
-    /// The font slots `type.data.face` and `type.caption.face` name,
-    /// resolved WITH the ids because a face is a word and reading words
-    /// is init-time work. `data` asks for the monospace face and means
-    /// it: a column of counts lines up because the figures are tabular,
-    /// which is a property of the face and not of this file.
-    count_font: u32,
+    /// The plate behind a row: `list.corner` is its radius and
+    /// `list.corner_style` the cut. A row used to borrow the file
+    /// browser's `filetile.corner` for want of one of its own, which is
+    /// exactly what the master's `list.corner` comment says it was for.
+    corner: u32,
+    /// The cut itself, decoded from `list.corner_style`'s WORD beside
+    /// the ids: a word crossing the boundary is a string copy, and a
+    /// string copy per frame per row is not a thing to do in a draw.
+    corner_cut: u32,
+    // type.<list.status_role>.* — the trailing count. The master binds
+    // it to `caption`; this file used to spell `type.data.*` out, which
+    // is a second binding nobody can edit.
+    status_size: u32,
+    status_min: u32,
+    status_tracking: u32,
+    status_leading: u32,
+    status_case: u32,
+    // type.<list.label_role>.* — the row's name. Bound to `body`, a
+    // step ABOVE the caption size this file drew it at, so the list is
+    // the size the master says and not one grade smaller.
+    label_size: u32,
+    label_min: u32,
+    label_tracking: u32,
+    label_leading: u32,
+    label_case: u32,
+    /// The font slots those two roles' `face` names, resolved WITH the
+    /// ids because a face is a word and reading words is init-time
+    /// work. A role asking for the monospace face means it: a column of
+    /// counts lines up because the figures are tabular, which is a
+    /// property of the face and not of this file.
+    status_font: u32,
     label_font: u32,
     /// Where an empty panel says so. `emptystate.y_frac` — the master's
     /// `[emptystate]` header landed, so the name this widget always asked
@@ -114,6 +134,9 @@ struct ListTheme {
 impl ListTheme {
     fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ListTheme {
         let empty_y = tile::token(api, "emptystate.y_frac");
+        // The row's two type bindings, followed to the roles they name.
+        let label = tile::enum_word(api, ctx, tile::token(api, "list.label_role"));
+        let status = tile::enum_word(api, ctx, tile::token(api, "list.status_role"));
         ListTheme {
             epoch,
             row_h: tile::token(api, "list.row_h"),
@@ -123,13 +146,22 @@ impl ListTheme {
             chip_gap: tile::token(api, "list.glyph_gap"),
             status_gap: tile::token(api, "list.status_gap"),
             wheel: tile::token(api, "list.wheel_px"),
-            count_size: tile::token(api, "type.data.size"),
-            count_min: tile::token(api, "type.data.min_px"),
-            count_tracking: tile::token(api, "type.data.tracking"),
-            count_leading: tile::token(api, "type.data.leading"),
-            count_case: tile::token(api, "type.data.case"),
-            count_font: tile::face_slot(api, ctx, tile::token(api, "type.data.face")),
-            label_font: tile::face_slot(api, ctx, tile::token(api, "type.caption.face")),
+            corner: tile::token(api, "list.corner"),
+            corner_cut: tile::corner_style(
+                &tile::enum_word(api, ctx, tile::token(api, "list.corner_style")),
+            ),
+            status_size: tile::role_id(api, &status, "size"),
+            status_min: tile::role_id(api, &status, "min_px"),
+            status_tracking: tile::role_id(api, &status, "tracking"),
+            status_leading: tile::role_id(api, &status, "leading"),
+            status_case: tile::role_id(api, &status, "case"),
+            label_size: tile::role_id(api, &label, "size"),
+            label_min: tile::role_id(api, &label, "min_px"),
+            label_tracking: tile::role_id(api, &label, "tracking"),
+            label_leading: tile::role_id(api, &label, "leading"),
+            label_case: tile::role_id(api, &label, "case"),
+            status_font: tile::face_slot(api, ctx, tile::role_id(api, &status, "face")),
+            label_font: tile::face_slot(api, ctx, tile::role_id(api, &label, "face")),
             empty_y,
             item_class: (api.theme_class)("list.item".as_ptr(), "list.item".len() as u32),
         }
@@ -152,11 +184,16 @@ struct ListLook {
     chip_gap: f32,
     status_gap: f32,
     wheel_px: f32,
-    count_px: f32,
-    count_tracking: f32,
-    count_leading: f32,
-    count_case: u32,
-    count_font: u32,
+    corner: tile::Corner,
+    status_px: f32,
+    status_tracking: f32,
+    status_leading: f32,
+    status_case: u32,
+    label_px: f32,
+    label_tracking: f32,
+    label_leading: f32,
+    label_case: u32,
+    status_font: u32,
     label_font: u32,
     empty_y: f32,
 }
@@ -168,10 +205,10 @@ impl ListLook {
     fn raw() -> ListLook {
         let raw_state = StateStyleC {
             fill: tile::NO_COLOR,
-            edge: tile::RAW_INK,
-            text: tile::RAW_INK,
-            glyph: tile::RAW_INK,
-            edge_width: 1.0,
+            edge: tile::NO_COLOR,
+            text: tile::NO_COLOR,
+            glyph: tile::NO_COLOR,
+            edge_width: 0.0,
             glow_radius: 0.0,
             glow_alpha: 0.0,
             elevation: 0.0,
@@ -189,11 +226,16 @@ impl ListLook {
             chip_gap: 0.0,
             status_gap: 0.0,
             wheel_px: 0.0,
-            count_px: 0.0,
-            count_tracking: 0.0,
-            count_leading: 1.0,
-            count_case: 0,
-            count_font: tile::FONT_UI,
+            corner: tile::Corner { style: CORNER_SQUARE, radius: 0.0 },
+            status_px: 0.0,
+            status_tracking: 0.0,
+            status_leading: 1.0,
+            status_case: 0,
+            label_px: 0.0,
+            label_tracking: 0.0,
+            label_leading: 1.0,
+            label_case: 0,
+            status_font: tile::FONT_UI,
             label_font: tile::FONT_UI,
             empty_y: 0.0,
         }
@@ -214,11 +256,16 @@ impl ListLook {
             chip_gap: px(t.chip_gap),
             status_gap: px(t.status_gap),
             wheel_px: px(t.wheel),
-            count_px: px(t.count_size).max(px(t.count_min)),
-            count_tracking: px(t.count_tracking),
-            count_leading: px(t.count_leading).max(1.0),
-            count_case: (api.theme_enum)(ctx, t.count_case),
-            count_font: t.count_font,
+            corner: tile::Corner { style: t.corner_cut, radius: px(t.corner) },
+            status_px: px(t.status_size).max(px(t.status_min)),
+            status_tracking: px(t.status_tracking),
+            status_leading: px(t.status_leading).max(1.0),
+            status_case: (api.theme_enum)(ctx, t.status_case),
+            label_px: px(t.label_size).max(px(t.label_min)),
+            label_tracking: px(t.label_tracking),
+            label_leading: px(t.label_leading).max(1.0),
+            label_case: (api.theme_enum)(ctx, t.label_case),
+            status_font: t.status_font,
             label_font: t.label_font,
             empty_y: px(t.empty_y),
         }
@@ -401,7 +448,7 @@ impl Appcats {
         let epoch = (api.theme_epoch)(ctx);
         if self.theme.as_ref().map(|(t, _)| t.epoch) != Some(epoch) {
             self.theme =
-                Some((TileTheme::resolve(api, epoch), ListTheme::resolve(api, ctx, epoch)));
+                Some((TileTheme::resolve(api, ctx, epoch), ListTheme::resolve(api, ctx, epoch)));
         }
         match &self.theme {
             Some((t, l)) => {
@@ -571,11 +618,15 @@ fn row(
     label: &str,
     right: &str,
 ) {
-    // `list.*` declares no corner of its own; a row is a container in
-    // the same family as a tile, so it takes the tile's chamfer rather
-    // than a number this file made up.
-    let cut = look.tile.corner.min(rect.h / 2.0);
-    tile::frame(api, ctx, rect.c(), cut, rung, look.tile.glow_scale);
+    // The plate behind the row, on the row family's OWN shape:
+    // `list.corner` for the radius and `list.corner_style` for the cut.
+    // It borrowed the file browser's tile corner until the two keys
+    // existed, which is what `list.corner`'s own comment records.
+    let corner = tile::Corner {
+        radius: look.list.corner.radius.min(rect.h / 2.0),
+        ..look.list.corner
+    };
+    tile::frame(api, ctx, rect.c(), corner, rung, look.tile.glow_scale);
 
     // The chip, and the mark centred in it. Never taller than the row.
     let chip_w = look.list.chip.min(rect.h);
@@ -590,38 +641,41 @@ fn row(
         tile::draw_text(api, ctx, gpx, chip.cx(), chip.cy() - gpx / 2.0, mark, rung.glyph, 0.0);
     }
 
-    // The count, right-aligned on the row's inner edge. A number in a
-    // column is `type.data`'s role, which the theme draws in the
-    // monospace face with tabular figures — so a column of counts lines
-    // up without this file arranging anything.
-    let cpx = look.list.count_px;
-    let csp = cpx * look.list.count_tracking;
-    let count = tile::recase(look.list.count_case, right.to_string());
+    // The count, right-aligned on the row's inner edge, in the role
+    // `list.status_role` names — an aside beside the name, and the
+    // theme's word for which type an aside is set in. Whether its
+    // figures line up in a column is the role's face, not this file's
+    // arrangement.
+    let cpx = look.list.status_px;
+    let csp = cpx * look.list.status_tracking;
+    let count = tile::recase(look.list.status_case, right.to_string());
     let cx = rect.right() - look.list.pad_x;
     tile::text(
         api,
         ctx,
-        look.list.count_font,
+        look.list.status_font,
         cpx,
         cx,
-        rect.cy() - cpx * look.list.count_leading / 2.0,
+        rect.cy() - cpx * look.list.status_leading / 2.0,
         &count,
         rung.text,
         csp,
         2,
     );
 
-    // The name, in the caption role the launcher's tiles already use,
-    // between the chip and whatever the count left.
-    let px = look.tile.caption_px;
-    let sp = px * look.tile.caption_tracking;
+    // The name, in the role `list.label_role` names, between the chip
+    // and whatever the count left. It was drawn at the launcher tile's
+    // caption size — one grade under what the master asks a row of
+    // prose to be.
+    let px = look.list.label_px;
+    let sp = px * look.list.label_tracking;
     let lx = chip.right() + look.list.chip_gap;
     let font = look.list.label_font;
     let room = cx
-        - tile::measure(api, ctx, look.list.count_font, cpx, &count, csp)
+        - tile::measure(api, ctx, look.list.status_font, cpx, &count, csp)
         - look.list.status_gap
         - lx;
-    let name = tile::recase(look.tile.caption_case, label.to_string());
+    let name = tile::recase(look.list.label_case, label.to_string());
     let name = tile::fit_name(api, ctx, font, px, &name, room.max(0.0), sp);
     tile::text(
         api,
@@ -629,7 +683,7 @@ fn row(
         font,
         px,
         lx,
-        rect.cy() - px * look.tile.caption_leading / 2.0,
+        rect.cy() - px * look.list.label_leading / 2.0,
         &name,
         rung.text,
         sp,
@@ -641,21 +695,25 @@ fn row(
 /// a machine can honestly have no menu — so it says so in the caption
 /// role rather than in a critical pill.
 fn empty(api: &HostApi, ctx: *mut c_void, r: Rect, look: &Look, what: &str) {
-    let px = look.tile.caption_px;
-    let sp = px * look.tile.caption_tracking;
-    let text = tile::recase(look.tile.caption_case, what.to_string());
+    // The line a list has instead of rows is a ROW, so it is set in the
+    // role the rows are: `list.label_role`, not the tile grid's caption.
+    let px = look.list.label_px;
+    let sp = px * look.list.label_tracking;
+    let text = tile::recase(look.list.label_case, what.to_string());
     // The empty-state fraction says where in the box the line sits; the
     // role's own leading is what centres the line box on it rather than
     // hanging it below.
-    tile::draw_text(
+    tile::text(
         api,
         ctx,
+        look.list.label_font,
         px,
         r.cx(),
-        r.y + r.h * look.list.empty_y - px * look.tile.caption_leading / 2.0,
+        r.y + r.h * look.list.empty_y - px * look.list.label_leading / 2.0,
         &text,
         look.tile.idle.text,
         sp,
+        1,
     );
 }
 
@@ -1108,5 +1166,83 @@ mod abi_tests {
             (API.button)(std::ptr::null_mut(), phase, 1.0, 1.0, r, 100.0, 100.0, &mut a);
         }
         assert_eq!(a.kind, u32::MAX, "an entry that does nothing writes nothing");
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// Every token this widget names for itself, spelled as the code
+    /// spells it. A name the master does not declare answers u32::MAX
+    /// and then zero, and a row of no size looks exactly like a list
+    /// nobody wrote — so a typo fails here or nowhere.
+    const TOKENS: &[&str] = &[
+        "list.row_h",
+        "list.gap",
+        "list.pad_x",
+        "list.glyph",
+        "list.glyph_gap",
+        "list.status_gap",
+        "list.wheel_px",
+        "list.corner",
+        "list.corner_style",
+        "list.label_role",
+        "list.status_role",
+        "emptystate.y_frac",
+    ];
+
+    #[test]
+    fn every_token_this_widget_names_is_one_the_master_declares() {
+        nacelle::theme::load();
+        let missing: Vec<&str> =
+            TOKENS.iter().copied().filter(|n| nacelle::theme::id(n).is_none()).collect();
+        assert!(missing.is_empty(), "the master declares no {missing:?}");
+    }
+
+    /// The row's two bindings are followed to families that exist, and
+    /// the label's role is NOT the tile grid's caption — which is the
+    /// finding: a category row was drawn one grade under what the
+    /// master asks a row of prose to be.
+    #[test]
+    fn a_row_is_set_in_the_roles_the_list_binds_not_the_tiles() {
+        nacelle::theme::load();
+        let word = |n: &str| {
+            nacelle::theme::enum_word_of(nacelle::theme::id(n).expect(n)).expect("no word")
+        };
+        let label = word("list.label_role");
+        let status = word("list.status_role");
+        for role in [&label, &status] {
+            for suffix in ["size", "min_px", "tracking", "leading", "case", "face"] {
+                let name = tile::role_token(role, suffix).expect("a role names its family");
+                assert!(nacelle::theme::id(&name).is_some(), "the master declares no {name}");
+            }
+        }
+        let t = nacelle::theme::resolved();
+        let size = |role: &str| {
+            t.px(nacelle::theme::id(&tile::role_token(role, "size").unwrap()).expect("size"))
+        };
+        // The three sizes this row used to draw with, and the two it
+        // draws with now: the label really moves off the tile caption.
+        assert_ne!(size(&label), size(&word("tile.caption_role")));
+        assert_ne!(size(&label), size(&status));
+    }
+
+    /// The plate behind a row has a radius of its own, so it no longer
+    /// borrows the file browser's tile corner — and its cut is a word
+    /// the master states, not a shape this file picked.
+    #[test]
+    fn the_row_plate_carries_the_lists_own_radius_and_cut() {
+        nacelle::theme::load();
+        let t = nacelle::theme::resolved();
+        let radius = t.px(nacelle::theme::id("list.corner").expect("list.corner"));
+        assert!(radius > 0.0, "a row plate with no radius is a rectangle");
+        let id = nacelle::theme::id("list.corner_style").expect("list.corner_style");
+        let word = nacelle::theme::enum_word_of(id).expect("no word");
+        assert_ne!(
+            tile::corner_style(&word),
+            CORNER_SQUARE,
+            "list.corner_style resolves to {word}, which this file cannot cut"
+        );
     }
 }

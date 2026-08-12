@@ -65,18 +65,19 @@ fn abi5(api: &HostApi) -> bool {
     api.abi_version >= 5
 }
 
-// The engine's raw answers, kept for a host too old to be asked. These
-// mirror the defaults the ABI itself gives for a missing token — mid
-// grey ink, no fill, one hairline — so the degrade is the same in both
-// directions: undesigned, legible, and nobody's palette.
-const RAW_INK: ColorC = ColorC { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
-const RAW_NONE: ColorC = ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+// What a host too old to be asked draws with: nothing at all.
+//
+// Not a grey. A colour chosen where the theme cannot be reached is a
+// design decision made in the dark, and this program has none of those —
+// so the panel degrades to no ink and no width, and the buttons simply
+// do not appear. The same clean bail `ai` takes for the same host.
+const NO_INK: ColorC = ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 const RAW_STATE: StateStyleC = StateStyleC {
-    fill: RAW_NONE,
-    edge: RAW_INK,
-    text: RAW_INK,
-    glyph: RAW_INK,
-    edge_width: 1.0,
+    fill: NO_INK,
+    edge: NO_INK,
+    text: NO_INK,
+    glyph: NO_INK,
+    edge_width: 0.0,
     glow_radius: 0.0,
     glow_alpha: 0.0,
     elevation: 0.0,
@@ -123,7 +124,7 @@ fn t_col(api: &HostApi, ctx: *mut c_void, id: u32) -> ColorC {
     if abi5(api) {
         (api.theme_color)(ctx, id)
     } else {
-        RAW_INK
+        NO_INK
     }
 }
 
@@ -161,6 +162,10 @@ struct ThemeIds {
     skew: u32,
     corner: u32,
     corner_style: u32,
+    // type.<button.role>.* — the role the master BINDS a button's
+    // caption to. It named `button` and this file spelled `button` out,
+    // which is the binding written twice: only one of the two moves
+    // when a theme re-roles its controls.
     type_size: u32,
     type_min_px: u32,
     type_leading: u32,
@@ -185,12 +190,23 @@ struct ThemeIds {
     class_button: u32,
 }
 
-fn resolve_ids(api: &HostApi, epoch: u32) -> ThemeIds {
+fn resolve_ids(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ThemeIds {
     let tok = |name: &str| {
         if abi5(api) {
             (api.theme_token)(name.as_ptr(), name.len() as u32)
         } else {
             u32::MAX
+        }
+    };
+    // The caption's binding, followed to the role it names. A master
+    // that binds no role leaves every id below MISSING — a caption of
+    // no size, drawn as nothing, rather than one this file sized.
+    let role = t_word(api, ctx, tok("button.role"));
+    let of = |suffix: &str| {
+        if role.is_empty() {
+            u32::MAX
+        } else {
+            tok(&format!("type.{role}.{suffix}"))
         }
     };
     ThemeIds {
@@ -204,11 +220,11 @@ fn resolve_ids(api: &HostApi, epoch: u32) -> ThemeIds {
         skew: tok("button.skew"),
         corner: tok("button.corner"),
         corner_style: tok("button.corner_style"),
-        type_size: tok("type.button.size"),
-        type_min_px: tok("type.button.min_px"),
-        type_leading: tok("type.button.leading"),
-        type_tracking: tok("type.button.tracking"),
-        type_case: tok("type.button.case"),
+        type_size: of("size"),
+        type_min_px: of("min_px"),
+        type_leading: of("leading"),
+        type_tracking: of("tracking"),
+        type_case: of("case"),
         press_ms: tok("motion.press.duration_ms"),
         icon_size: tok("button.icon_size"),
         icon_gap: tok("button.icon_gap"),
@@ -240,7 +256,7 @@ fn theme(this: &mut Control, api: &HostApi, ctx: *mut c_void) -> ThemeIds {
     match this.theme {
         Some(t) if t.epoch == epoch => t,
         _ => {
-            let t = resolve_ids(api, epoch);
+            let t = resolve_ids(api, ctx, epoch);
             this.theme = Some(t);
             t
         }
@@ -398,7 +414,17 @@ extern "C" fn draw(
         let s = t_px(api, ctx, t.icon_size);
         if s > 0.0 {
             let gap_i = t_px(api, ctx, t.icon_gap);
-            let stroke = t_px(api, ctx, t.icon_stroke).max(1.0);
+            // `icon.stroke` is declared in em, and an em token bakes to
+            // the BARE multiplier — `length_px` passes `Unit::Em`
+            // through untouched, because the size it multiplies is not
+            // known where the theme is baked. So `theme_px` answers
+            // 0.10 here, and 0.10 is not a width: what states the em is
+            // the size this slot draws its glyph at, which is the very
+            // token read one line up. Handing the multiplier straight
+            // to `polyline` drew a tenth-of-a-pixel hair; clamping it to
+            // one device px, as this file did before, drew the widget's
+            // number instead of the theme's. Neither read the master.
+            let stroke = t_px(api, ctx, t.icon_stroke) * s;
             let tw = (api.measure)(
                 ctx,
                 0, // the interface font
@@ -745,5 +771,128 @@ mod abi_tests {
             (API.button)(std::ptr::null_mut(), phase, 1.0, 1.0, r, 100.0, 100.0, &mut a);
         }
         assert_eq!(a.kind, u32::MAX, "an entry that does nothing writes nothing");
+    }
+}
+
+#[cfg(test)]
+mod stroke_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static STROKES: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    extern "C" fn rec_polyline(
+        _: *mut c_void,
+        _: *const f32,
+        _: u32,
+        t: f32,
+        _: ColorC,
+        _: bool,
+    ) {
+        STROKES.with(|s| s.borrow_mut().push(t));
+    }
+
+    extern "C" fn rec_line(_: *mut c_void, _: f32, _: f32, _: f32, _: f32, t: f32, _: ColorC) {
+        STROKES.with(|s| s.borrow_mut().push(t));
+    }
+
+    /// Off every button, so no rung but idle is reached and the frame is
+    /// the resting one.
+    extern "C" fn no_mouse(_: *mut c_void, x: *mut f32, y: *mut f32) {
+        unsafe {
+            *x = f32::NAN;
+            *y = f32::NAN;
+        }
+    }
+
+    fn px(name: &str) -> f32 {
+        nacelle::theme::resolved().px(nacelle::theme::id(name).expect(name))
+    }
+
+    /// Every stroke width the two glyphs leave, taken through the real
+    /// entry: a host table whose stroking entries write the widths down
+    /// and whose theme half is the loaded master's own.
+    fn widths() -> Vec<f32> {
+        nacelle::theme::load();
+        let api: &'static HostApi = Box::leak(Box::new(HostApi {
+            polyline: rec_polyline,
+            line: rec_line,
+            mouse: no_mouse,
+            ..*nacelle::plugin::host_api()
+        }));
+        builtin_attach(api);
+        let instance = create();
+        STROKES.with(|s| s.borrow_mut().clear());
+        // A null drawing context: every theme entry ignores it and the
+        // stroking entries here are ours, so the widths are real and the
+        // rasterising is not attempted.
+        draw(instance, std::ptr::null_mut(), std::ptr::null(), RectC {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 300.0,
+        });
+        destroy(instance);
+        STROKES.with(|s| s.borrow().clone())
+    }
+
+    /// `icon.stroke` is an em, and an em BAKES TO THE BARE MULTIPLIER —
+    /// `length_px` has nothing to multiply it by where the theme is
+    /// baked, so the number the ABI answers with (0.10) is a ratio and
+    /// not a width. This pins the size that states it: the glyph's own,
+    /// `button.icon_size`, the token `draw` reads one line above the
+    /// stroke. Both mistakes this file has made are failures here — the
+    /// multiplier handed over raw (0.10 px, an invisible hair) and the
+    /// old `.max(1.0)` (the widget's number in place of the theme's).
+    #[test]
+    fn the_glyph_stroke_is_the_masters_em_of_the_size_the_glyph_draws_at() {
+        // `button.icon_size` arrives already floored by its
+        // `_min_px` companion — bake bounds X by X_min_px as a rule —
+        // so this is the same one number `draw` sizes the glyph with.
+        let want = px("icon.stroke") * px("button.icon_size");
+        let widths = widths();
+        assert!(!widths.is_empty(), "neither glyph was stroked");
+        for w in &widths {
+            assert_eq!(*w, want, "a glyph stroke of {w} where the master states {want}");
+        }
+        // The two numbers this file used to draw instead, named so a
+        // return to either fails rather than passes quietly.
+        assert!(want > px("icon.stroke"), "the em multiplier is being drawn as a width");
+        assert!(want != 1.0, "the retired floor is back");
+    }
+
+    /// The floor is the master's to state, and it does not state one:
+    /// the X / X_min_px convention (button.icon_size_min_px is one) has
+    /// no entry for this stroke, so nothing here rounds it up. When the
+    /// key appears, it is read here — and this is what says so.
+    #[test]
+    fn there_is_still_no_companion_floor_for_this_stroke_to_read() {
+        nacelle::theme::load();
+        assert!(
+            nacelle::theme::id("icon.stroke_min_px").is_none(),
+            "icon.stroke_min_px exists now — read it in `draw` instead of nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    /// The caption's role is the one `button.role` names, and the
+    /// binding is followed to a family that exists — the chain
+    /// `resolve_ids` walks. Spelled into the code as `type.button.*`,
+    /// the binding was a second copy nobody could edit; a master that
+    /// re-roles its controls now moves these two buttons with the rest.
+    #[test]
+    fn the_caption_role_names_a_family_the_master_declares() {
+        nacelle::theme::load();
+        let id = nacelle::theme::id("button.role").expect("button.role");
+        let role = nacelle::theme::enum_word_of(id).expect("the binding names no word");
+        assert!(!role.is_empty());
+        for suffix in ["size", "min_px", "leading", "tracking", "case"] {
+            let name = format!("type.{role}.{suffix}");
+            assert!(nacelle::theme::id(&name).is_some(), "the master declares no {name}");
+        }
     }
 }

@@ -10,14 +10,19 @@
 
 use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_BYTES,
-    ACTION_NONE,
+    ACTION_NONE, CORNER_ROUND,
 };
 use nacelle::widget::factory::BuiltinWidget;
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::time::Instant;
 
-/// The interface font, as the host numbers them.
+/// The font slots, as the host numbers them — the theme's own
+/// `FACE_UI = 0` and `FACE_MONO = 1`. The ABI carries these two and
+/// clamps anything past them, so a slot is chosen by the WORD a role's
+/// `face` names and never by an index into the theme's eight faces.
 const FONT_UI: u32 = 0;
+const FONT_MONO: u32 = 1;
 
 /// A rectangle in the widget's own arithmetic. The host's `RectC` is
 /// what crosses the boundary; this is what the layout is worked out in.
@@ -44,17 +49,21 @@ impl Rect {
     }
 }
 
-/// The engine's raw kind defaults, answered when this copy is attached to
-/// a host without the token entries (abi_version < 5). They mirror
-/// `StateStyle::RAW` and `ResolvedTheme::RAW_INK`: grey ink, no fill, one
-/// hairline — visibly unstyled, never the retired hardcoded design.
-const RAW_INK: ColorC = ColorC { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+/// No ink at all, for a host without the token entries (abi_version < 5)
+/// — one that cannot be asked what anything looks like.
+///
+/// Not a grey: a chosen grey is a design decision taken where the theme
+/// cannot be reached, and a keyboard drawn in it is an interface nobody
+/// designed. Paired with zero widths below and with the zero lengths
+/// every accessor then answers, so the whole widget draws NOTHING — the
+/// clean bail `ai` takes for the same host.
+const NO_INK: ColorC = ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 const RAW_STYLE: StateStyleC = StateStyleC {
-    fill: ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
-    edge: RAW_INK,
-    text: RAW_INK,
-    glyph: RAW_INK,
-    edge_width: 1.0,
+    fill: NO_INK,
+    edge: NO_INK,
+    text: NO_INK,
+    glyph: NO_INK,
+    edge_width: 0.0,
     glow_radius: 0.0,
     glow_alpha: 0.0,
     elevation: 0.0,
@@ -72,6 +81,128 @@ fn token(api: &HostApi, name: &str) -> u32 {
     (api.theme_token)(name.as_ptr(), name.len() as u32)
 }
 
+/// The WORD an enum token resolves to — ABI 6's `theme_enum_word`. Read
+/// with the ids and never in a draw loop: it copies a string. An empty
+/// answer (a host whose table ends before the entry, a missing token, a
+/// token with no word) is what a caller degrades on.
+fn enum_word(api: &HostApi, ctx: *mut c_void, id: u32) -> String {
+    if !api.has_theme_enum_word() || id == u32::MAX {
+        return String::new();
+    }
+    let mut buf = [0u8; 64];
+    let n = (api.theme_enum_word)(ctx, id, buf.as_mut_ptr(), buf.len() as u32) as usize;
+    String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned()
+}
+
+/// The name of one token of the role a `*_role` binding names.
+///
+/// `None` for a master that binds no role, which leaves every id MISSING
+/// and every accessor on zero — type of no size draws nothing. Naming a
+/// role here instead would be this file choosing how a legend is set.
+fn role_token(role: &str, suffix: &str) -> Option<String> {
+    if role.is_empty() {
+        return None;
+    }
+    Some(format!("type.{role}.{suffix}"))
+}
+
+/// The font slot a role's `face` names. A face is an OPEN word set, so
+/// it is read as a WORD: the boundary carries two slots and clamps
+/// anything past them, which would turn `display` into monospace.
+fn face_slot(api: &HostApi, ctx: *mut c_void, id: u32) -> u32 {
+    if enum_word(api, ctx, id).starts_with("mono") {
+        FONT_MONO
+    } else {
+        FONT_UI
+    }
+}
+
+/// A role's case transform, applied here because the text entry draws
+/// bytes as given. The indices are the schema's declared order — every
+/// `*.case` declares `enum: none | upper | lower | smallcaps`, and
+/// `theme_enum` indexes that list. Smallcaps needs per-glyph sizes only
+/// the host's font system has; through a single text call the nearest
+/// honest reading is capitals.
+fn recase(word: u32, s: &str) -> Cow<'_, str> {
+    match word {
+        1 | 3 => Cow::Owned(s.to_uppercase()), // upper | smallcaps
+        2 => Cow::Owned(s.to_lowercase()),     // lower
+        _ => Cow::Borrowed(s),                 // none, or a word this build predates
+    }
+}
+
+/// Which corner of a cap its shifted legend sits in — the four words
+/// `keyboard.sub_corner` declares, decoded once beside the ids.
+///
+/// A word this build has never heard of, or no word at all, is NOT
+/// substituted with one of these: it means the master and this file
+/// disagree about where the mark goes, and the legend is left undrawn
+/// rather than parked in a corner nobody asked for.
+#[derive(Clone, Copy, PartialEq)]
+enum SubCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+fn sub_corner(word: &str) -> Option<SubCorner> {
+    Some(match word {
+        "top_left" => SubCorner::TopLeft,
+        "top_right" => SubCorner::TopRight,
+        "bottom_left" => SubCorner::BottomLeft,
+        "bottom_right" => SubCorner::BottomRight,
+        _ => return None,
+    })
+}
+
+/// Where the shifted legend's run starts, and which way it grows:
+/// `keyboard.sub_inset_x` off the named vertical edge,
+/// `keyboard.sub_inset_y` off the named horizontal one, and the run
+/// anchored so that the inset is a gap on BOTH edges the corner names.
+/// `line_h` is the sub-role's own line box, which is what keeps a
+/// bottom-corner legend inside the cap instead of hanging under it.
+/// Returns the host's alignment: 0 left, 2 right.
+fn sub_place(c: SubCorner, k: &Rect, dx: f32, dy: f32, line_h: f32) -> (f32, f32, u32) {
+    let (x, align) = match c {
+        SubCorner::TopLeft | SubCorner::BottomLeft => (k.x + dx, 0),
+        SubCorner::TopRight | SubCorner::BottomRight => (k.right() - dx, 2),
+    };
+    let y = match c {
+        SubCorner::TopLeft | SubCorner::TopRight => k.y + dy,
+        SubCorner::BottomLeft | SubCorner::BottomRight => k.y + k.h - dy - line_h,
+    };
+    (x, y, align)
+}
+
+/// A `same_as_parent` sentinel — every sentinel bakes negative — falls
+/// back to the value the master names as its parent; anything the theme
+/// really stated is clamped to a length. The toolkit's own reading of
+/// the same sentinel (`object::panel::or_parent`), because a plugin that
+/// read it differently would put the same word two widths apart.
+fn or_parent(v: f32, parent: f32) -> f32 {
+    if v < 0.0 {
+        parent
+    } else {
+        v
+    }
+}
+
+/// The key field inside the panel's content box.
+///
+/// `keyboard.pad` is padding around the WHOLE field — all four sides —
+/// and `keyboard.gap` is the space between two caps. Until this read
+/// the horizontal padding was zero and the vertical one borrowed the
+/// gap, so the field touched both side edges however the theme was set.
+fn field(r: Rect, pad: f32) -> Rect {
+    Rect::new(
+        r.x + pad,
+        r.y + pad,
+        (r.w - 2.0 * pad).max(0.0),
+        (r.h - 2.0 * pad).max(0.0),
+    )
+}
+
 /// Every token this widget reads, resolved by NAME once per theme epoch.
 /// Ids are stable per master load, not forever, which is why the epoch
 /// rides along: when `theme_epoch` moves, the whole set is looked up
@@ -83,23 +214,40 @@ struct ThemeIds {
     /// glyph) is one rung of its ladder per frame.
     class_key: u32,
     gap: u32,
-    // The type roles the master binds to this widget (label_role = body,
-    // sub_role = caption). The role indirection itself is an enum whose
-    // word list never crosses the C ABI, so the roles the master names
-    // are read directly.
+    /// Padding around the whole key field, and the cap's own shape:
+    /// `keyboard.key_corner` states the radius, `keyboard.key_border`
+    /// the ring's width.
+    pad: u32,
+    key_corner: u32,
+    key_border: u32,
+    // The type roles the master BINDS to this widget — keyboard.label_role
+    // and keyboard.sub_role name a role, and the role's own family is
+    // resolved from the word (ABI 6's theme_enum_word). Naming
+    // `type.body.*` here instead, as this file did, is the binding
+    // spelled twice: the master's and this file's, and only one of them
+    // moves when a theme re-roles the legends.
     label_size: u32,
     label_min_px: u32,
     label_max_px: u32,
     label_tracking: u32,
     label_leading: u32,
+    label_case: u32,
+    label_font: u32,
     sub_size: u32,
     sub_min_px: u32,
     sub_max_px: u32,
     sub_tracking: u32,
+    sub_leading: u32,
+    sub_case: u32,
+    sub_font: u32,
     sub_fg: u32,
     sub_alpha: u32,
     sub_inset_x: u32,
     sub_inset_y: u32,
+    /// Which corner of the cap the shifted legend sits in, as the word
+    /// `keyboard.sub_corner` names — decoded here because words are
+    /// init-time work.
+    sub_corner: Option<SubCorner>,
     snap_px: u32,
     center_mode: u32,
     center_bias: u32,
@@ -119,19 +267,28 @@ impl ThemeIds {
         epoch: 0,
         class_key: u32::MAX,
         gap: u32::MAX,
+        pad: u32::MAX,
+        key_corner: u32::MAX,
+        key_border: u32::MAX,
         label_size: u32::MAX,
         label_min_px: u32::MAX,
         label_max_px: u32::MAX,
         label_tracking: u32::MAX,
         label_leading: u32::MAX,
+        label_case: u32::MAX,
+        label_font: FONT_UI,
         sub_size: u32::MAX,
         sub_min_px: u32::MAX,
         sub_max_px: u32::MAX,
         sub_tracking: u32::MAX,
+        sub_leading: u32::MAX,
+        sub_case: u32::MAX,
+        sub_font: FONT_UI,
         sub_fg: u32::MAX,
         sub_alpha: u32::MAX,
         sub_inset_x: u32::MAX,
         sub_inset_y: u32::MAX,
+        sub_corner: None,
         snap_px: u32::MAX,
         center_mode: u32::MAX,
         center_bias: u32::MAX,
@@ -144,24 +301,42 @@ impl ThemeIds {
         motion_scale: u32::MAX,
     };
 
-    fn resolve(api: &HostApi, epoch: u32) -> ThemeIds {
+    fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ThemeIds {
+        // The two bindings, followed to the roles they name. An unbound
+        // one gives every id below u32::MAX, which is zero size and no
+        // ink: a legend the master says nothing about is not drawn.
+        let label = enum_word(api, ctx, token(api, "keyboard.label_role"));
+        let sub = enum_word(api, ctx, token(api, "keyboard.sub_role"));
+        let of = |role: &str, suffix: &str| match role_token(role, suffix) {
+            Some(name) => token(api, &name),
+            None => u32::MAX,
+        };
         ThemeIds {
             epoch,
             class_key: (api.theme_class)(b"key".as_ptr(), 3),
             gap: token(api, "keyboard.gap"),
-            label_size: token(api, "type.body.size"),
-            label_min_px: token(api, "type.body.min_px"),
-            label_max_px: token(api, "type.body.max_px"),
-            label_tracking: token(api, "type.body.tracking"),
-            label_leading: token(api, "type.body.leading"),
-            sub_size: token(api, "type.caption.size"),
-            sub_min_px: token(api, "type.caption.min_px"),
-            sub_max_px: token(api, "type.caption.max_px"),
-            sub_tracking: token(api, "type.caption.tracking"),
-            sub_fg: token(api, "type.caption.fg"),
-            sub_alpha: token(api, "type.caption.alpha"),
+            pad: token(api, "keyboard.pad"),
+            key_corner: token(api, "keyboard.key_corner"),
+            key_border: token(api, "keyboard.key_border"),
+            label_size: of(&label, "size"),
+            label_min_px: of(&label, "min_px"),
+            label_max_px: of(&label, "max_px"),
+            label_tracking: of(&label, "tracking"),
+            label_leading: of(&label, "leading"),
+            label_case: of(&label, "case"),
+            label_font: face_slot(api, ctx, of(&label, "face")),
+            sub_size: of(&sub, "size"),
+            sub_min_px: of(&sub, "min_px"),
+            sub_max_px: of(&sub, "max_px"),
+            sub_tracking: of(&sub, "tracking"),
+            sub_leading: of(&sub, "leading"),
+            sub_case: of(&sub, "case"),
+            sub_font: face_slot(api, ctx, of(&sub, "face")),
+            sub_fg: of(&sub, "fg"),
+            sub_alpha: of(&sub, "alpha"),
             sub_inset_x: token(api, "keyboard.sub_inset_x"),
             sub_inset_y: token(api, "keyboard.sub_inset_y"),
+            sub_corner: sub_corner(&enum_word(api, ctx, token(api, "keyboard.sub_corner"))),
             snap_px: token(api, "type.snap_px"),
             center_mode: token(api, "rhythm.center_mode"),
             center_bias: token(api, "rhythm.cap_center_bias"),
@@ -183,9 +358,11 @@ fn host() -> Option<&'static HostApi> {
     unsafe { HOST }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
     api: &HostApi,
     ctx: *mut c_void,
+    font: u32,
     px: f32,
     x: f32,
     y: f32,
@@ -196,7 +373,7 @@ fn draw_text(
 ) {
     (api.text)(
         ctx,
-        FONT_UI,
+        font,
         px,
         x,
         y,
@@ -362,7 +539,7 @@ impl Keyboard {
         match self.theme {
             Some(t) if t.epoch == epoch => t,
             _ => {
-                let t = ThemeIds::resolve(api, epoch);
+                let t = ThemeIds::resolve(api, ctx, epoch);
                 self.theme = Some(t);
                 t
             }
@@ -488,7 +665,7 @@ impl Keyboard {
         let abi5 = api.abi_version >= 5;
         let ids = if abi5 { self.ids(api, ctx) } else { ThemeIds::MISSING };
         let px_of = |id: u32| if abi5 { (api.theme_px)(ctx, id) } else { 0.0 };
-        let ink = |id: u32| if abi5 { (api.theme_color)(ctx, id) } else { RAW_INK };
+        let ink = |id: u32| if abi5 { (api.theme_color)(ctx, id) } else { NO_INK };
         let rung = |s: u32| {
             if !abi5 {
                 return RAW_STYLE;
@@ -531,6 +708,9 @@ impl Keyboard {
         let label_spacing = px_of(ids.label_tracking) * label_px;
         let sub_spacing = px_of(ids.sub_tracking) * sub_px;
         let leading = px_of(ids.label_leading);
+        let sub_leading = px_of(ids.sub_leading);
+        let label_case = if abi5 { (api.theme_enum)(ctx, ids.label_case) } else { 0 };
+        let sub_case = if abi5 { (api.theme_enum)(ctx, ids.sub_case) } else { 0 };
         // Optical centring nudges the run by a fraction of its px.
         // `rhythm.center_mode` declares `enum: optical | geometric`, and
         // `theme_enum` indexes that declared list: optical = 0.
@@ -557,8 +737,20 @@ impl Keyboard {
         let flash_s = px_of(ids.press_ms) * px_of(ids.motion_scale) / 1000.0;
 
         let gap = px_of(ids.gap);
+        // The cap's shape, stated by the two keys the master gives it:
+        // `key_corner` is the radius, `key_border` the ring. The radius
+        // is CUT round — `[corner]` states that as a rule of the theme
+        // file for every radius with no `*_corner_style` sibling beside
+        // it, so it is not this file picking a shape.
+        let corner = px_of(ids.key_corner);
+        let border = px_of(ids.key_border);
+        // `keyboard.pad = same_as_parent` names `keyboard.gap` as that
+        // parent, so the field's margin and the space between two caps
+        // are one decision until a theme separates them.
+        let pad = or_parent(px_of(ids.pad), gap).max(0.0);
+        let f = field(r, pad);
         let n_rows = self.rows.len();
-        let key_h = (r.h - gap * (n_rows as f32 + 1.0)) / n_rows as f32;
+        let key_h = (f.h - gap * (n_rows as f32 - 1.0)) / n_rows as f32;
         let now = Instant::now();
 
         // Where the pointer is, for the hover rung. When the host has no
@@ -568,9 +760,9 @@ impl Keyboard {
 
         for (ri, row) in self.rows.iter().enumerate() {
             let total_units: f32 = row.iter().map(|k| k.w).sum::<f32>();
-            let unit = (r.w - gap * (row.len() as f32 - 1.0)) / total_units;
-            let mut x = r.x;
-            let y = r.y + gap + (key_h + gap) * ri as f32;
+            let unit = (f.w - gap * (row.len() as f32 - 1.0)) / total_units;
+            let mut x = f.x;
+            let y = f.y + (key_h + gap) * ri as f32;
             for (ki, key) in row.iter().enumerate() {
                 let kw = unit * key.w;
                 let krect = Rect::new(x, y, kw, key_h);
@@ -603,9 +795,45 @@ impl Keyboard {
                     &idle
                 };
 
+                // The cap, on the shape the master gives it. The rung
+                // says what colour the cap and its ring are; the WIDTH of
+                // that ring is `keyboard.key_border`, the cap's own key,
+                // the way the search field's ring is `field.border` while
+                // its wash comes off the ladder.
+                //
+                // The master states the cap's ring twice — that key and
+                // `state.<rung>.edge_width`, which the `key` class
+                // inherits — and one of the two has to win. The object's
+                // own key does, because `[state]` calls itself "the
+                // default EVERY class inherits" and a key written for
+                // this object is the specific declaration beside it;
+                // that is also how `checkbox.border`, `panel.border`,
+                // `menu.border` and `field.border` are read across the
+                // toolkit. The cost is stated rather than hidden: the
+                // ladder's "selection thickens the ring one step" does
+                // not reach a cap, so a latched modifier is marked by
+                // `selected.fill`, `selected.edge` and its dot alone —
+                // and the ladder's own evidence for that step is image
+                // 8, a taskbar icon, not a keyboard. Reading it the
+                // other way would leave `keyboard.key_border` with no
+                // consumer at all: a key a theme can edit to no effect,
+                // which is the defect this pass exists to remove.
+                //
+                // A host too old for the ring pair draws the flat quad
+                // it always did — visibly plainer, never a different
+                // design.
                 let cell = RectC { x: krect.x, y: krect.y, w: krect.w, h: krect.h };
-                (api.rect)(ctx, cell, style.fill);
-                (api.rect_outline)(ctx, cell, style.edge_width, style.edge);
+                if api.has_ring() {
+                    (api.ring_fill)(ctx, cell, CORNER_ROUND, corner, style.fill);
+                    if border > 0.0 && style.edge.a > 0.0 {
+                        (api.ring)(ctx, cell, CORNER_ROUND, corner, border, style.edge);
+                    }
+                } else {
+                    (api.rect)(ctx, cell, style.fill);
+                    if border > 0.0 && style.edge.a > 0.0 {
+                        (api.rect_outline)(ctx, cell, border, style.edge);
+                    }
+                }
 
                 // Main label in the center. The four cursor caps are the
                 // icon registry's arrow_left / arrow_up / arrow_right /
@@ -644,38 +872,50 @@ impl Keyboard {
                     draw_text(
                         api,
                         ctx,
+                        ids.label_font,
                         label_px,
                         krect.cx(),
                         y + (key_h - label_px * leading) / 2.0 + bias,
-                        label,
+                        &recase(label_case, label),
                         style.text,
                         label_spacing,
                         1,
                     );
                 }
-                // SHIFT variant in the top-right corner — the only corner
-                // the master names; `keyboard.sub_corner`'s other words
-                // cannot be told apart across the ABI.
-                if !key.shift_label.is_empty() {
+                // The shifted legend, in the corner `keyboard.sub_corner`
+                // names. A cap whose corner word this build cannot read
+                // draws no legend at all rather than one wherever this
+                // file would have put it.
+                if let (false, Some(c)) = (key.shift_label.is_empty(), ids.sub_corner) {
+                    let (sx, sy, align) =
+                        sub_place(c, &krect, sub_dx, sub_dy, sub_px * sub_leading);
                     draw_text(
                         api,
                         ctx,
+                        ids.sub_font,
                         sub_px,
-                        krect.right() - sub_dx,
-                        y + sub_dy,
-                        key.shift_label,
+                        sx,
+                        sy,
+                        &recase(sub_case, key.shift_label),
                         sub_fg,
                         sub_spacing,
-                        2,
+                        align,
                     );
                 }
-                // The latched-modifier dot, finally drawn: bottom-centre
-                // of the cap, spaced off the edge by its own size — the
-                // marker the theme declared and no widget read until now.
+                // The latched-modifier dot: bottom-centre of the cap,
+                // standing off the floor by `keyboard.sub_inset_y`.
+                // That key names the OTHER mark inside a cap — the
+                // shifted legend — because the master declares no
+                // `keyboard.mod_dot_inset_y` for this one, and the whole
+                // section states only one vertical inset for a mark on a
+                // key. Borrowed and reported, which is what this tree
+                // does where a token does not exist at all; the number
+                // that used to stand here (twice the dot's own size) was
+                // an inset no theme could reach.
                 if sticky && dot_px > 0.0 {
                     let dot = RectC {
                         x: krect.cx() - dot_px / 2.0,
-                        y: y + key_h - 2.0 * dot_px,
+                        y: y + key_h - sub_dy - dot_px,
                         w: dot_px,
                         h: dot_px,
                     };
@@ -951,6 +1191,323 @@ pub unsafe extern "C" fn nacelle_plugin_attach(api: *const HostApi) -> *const Pl
     }
     HOST = api.as_ref();
     &API
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// Every token name this widget asks for by a name of its own,
+    /// spelled exactly as the code spells it. A name the master does not
+    /// declare answers `u32::MAX`, `theme_px` answers zero, and the cap
+    /// silently loses its shape — so a typo fails here or nowhere.
+    const TOKENS: &[&str] = &[
+        "keyboard.gap",
+        "keyboard.pad",
+        "keyboard.key_corner",
+        "keyboard.key_border",
+        "keyboard.label_role",
+        "keyboard.sub_role",
+        "keyboard.sub_corner",
+        "keyboard.sub_inset_x",
+        "keyboard.sub_inset_y",
+        "keyboard.mod_dot",
+        "keyboard.mod_dot_min_px",
+        "keyboard.mod_dot_color",
+        "keyboard.arrow_size",
+        "keyboard.arrow_size_min_px",
+        "rhythm.center_mode",
+        "rhythm.cap_center_bias",
+        "type.snap_px",
+        "motion.press.duration_ms",
+        "motion.scale",
+    ];
+
+    #[test]
+    fn every_token_this_widget_names_is_one_the_master_declares() {
+        nacelle::theme::load();
+        let missing: Vec<&str> =
+            TOKENS.iter().copied().filter(|n| nacelle::theme::id(n).is_none()).collect();
+        assert!(missing.is_empty(), "the master declares no {missing:?}");
+    }
+
+    /// The two role bindings are followed to the end, exactly as
+    /// `ThemeIds::resolve` follows them: a role the master does not
+    /// declare is a legend with no size and no ink, drawn as nothing.
+    #[test]
+    fn both_legend_roles_are_roles_the_master_declares() {
+        nacelle::theme::load();
+        for binding in ["keyboard.label_role", "keyboard.sub_role"] {
+            let id = nacelle::theme::id(binding).expect(binding);
+            let role = nacelle::theme::enum_word_of(id).expect("the binding names no word");
+            assert!(!role.is_empty(), "{binding} binds to nothing");
+            for suffix in
+                ["size", "min_px", "max_px", "tracking", "leading", "case", "face", "fg", "alpha"]
+            {
+                let name = role_token(&role, suffix).expect("a bound role names its family");
+                assert!(nacelle::theme::id(&name).is_some(), "the master declares no {name}");
+            }
+        }
+    }
+
+    /// `keyboard.sub_corner`'s live word is one this file can place. The
+    /// decode has no default, so a master naming a fifth word would put
+    /// the legend nowhere — and this is where that shows up.
+    #[test]
+    fn the_sub_legend_corner_word_is_one_this_file_can_place() {
+        nacelle::theme::load();
+        let id = nacelle::theme::id("keyboard.sub_corner").expect("keyboard.sub_corner");
+        let word = nacelle::theme::enum_word_of(id).expect("no word");
+        assert!(sub_corner(&word).is_some(), "unplaceable corner word {word:?}");
+    }
+
+    /// The cap's radius and ring are lengths the master really answers
+    /// with, and the radius is not zero — the value this file used to
+    /// draw with when it drew a plain rectangle.
+    #[test]
+    fn the_cap_carries_a_radius_and_a_ring_the_theme_states() {
+        nacelle::theme::load();
+        let t = nacelle::theme::resolved();
+        let radius = t.px(nacelle::theme::id("keyboard.key_corner").expect("key_corner"));
+        let border = t.px(nacelle::theme::id("keyboard.key_border").expect("key_border"));
+        assert!(radius > 0.0, "a cap drawn by api.rect had radius 0; the token says {radius}");
+        assert!(border > 0.0, "a ring of no width is a cap with no ring");
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// `keyboard.pad` is padding on all four sides, and the field is
+    /// what the rows are laid out in. Feeding a different pad moves and
+    /// resizes the field — which is the whole of the token's job.
+    #[test]
+    fn the_key_field_is_inset_by_keyboard_pad_on_every_side() {
+        let r = Rect::new(10.0, 20.0, 300.0, 200.0);
+        let tight = field(r, 0.0);
+        assert_eq!((tight.x, tight.y, tight.w, tight.h), (10.0, 20.0, 300.0, 200.0));
+        let padded = field(r, 5.0);
+        assert_eq!((padded.x, padded.y, padded.w, padded.h), (15.0, 25.0, 290.0, 190.0));
+        // A pad wider than the box leaves no field rather than a
+        // negative one, which would draw caps outside the panel.
+        let over = field(r, 400.0);
+        assert!(over.w == 0.0 && over.h == 0.0);
+    }
+
+    /// Rows fill the field exactly: five caps and the four gaps between
+    /// them, with the padding — and nothing else — on the outside.
+    #[test]
+    fn five_rows_and_four_gaps_fill_the_padded_field() {
+        let r = Rect::new(0.0, 0.0, 400.0, 300.0);
+        let (pad, gap, rows) = (7.0, 3.0, 5.0);
+        let f = field(r, pad);
+        let key_h = (f.h - gap * (rows - 1.0)) / rows;
+        let bottom = f.y + (key_h + gap) * (rows - 1.0) + key_h;
+        assert!((bottom - (r.y + r.h - pad)).abs() < 0.001);
+    }
+
+    /// The four words of `keyboard.sub_corner` put the legend in four
+    /// different places, and each one keeps both insets as gaps from the
+    /// edges its word names.
+    #[test]
+    fn each_corner_word_puts_the_shifted_legend_somewhere_else() {
+        let k = Rect::new(100.0, 50.0, 40.0, 30.0);
+        let (dx, dy, line) = (4.0, 3.0, 10.0);
+        let tl = sub_place(SubCorner::TopLeft, &k, dx, dy, line);
+        let tr = sub_place(SubCorner::TopRight, &k, dx, dy, line);
+        let bl = sub_place(SubCorner::BottomLeft, &k, dx, dy, line);
+        let br = sub_place(SubCorner::BottomRight, &k, dx, dy, line);
+        assert_eq!(tl, (104.0, 53.0, 0));
+        assert_eq!(tr, (136.0, 53.0, 2));
+        assert_eq!(bl, (104.0, 67.0, 0));
+        assert_eq!(br, (136.0, 67.0, 2));
+        // A bottom corner keeps the whole line box inside the cap.
+        assert!(bl.1 + line <= k.y + k.h);
+        // And the insets are really read: a larger one moves every
+        // corner inward.
+        let far = sub_place(SubCorner::TopLeft, &k, 12.0, 9.0, line);
+        assert!(far.0 > tl.0 && far.1 > tl.1);
+    }
+}
+
+/// What the widget actually put on the screen, recorded through a host
+/// table whose DRAWING entries are these and whose theme entries are the
+/// engine's own.
+///
+/// This is the only way a plugin's picture can be examined from a test:
+/// everything it draws leaves through the function table, so a table
+/// that writes the calls down instead of rasterising them IS the frame.
+/// The theme half is not stubbed — `nacelle::plugin::host_api()` answers
+/// from the loaded master — so what these tests compare a shape against
+/// is the live value of the token that shaped it.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Cmd {
+        RingFill { r: [f32; 4], style: u32, radius: f32 },
+        Ring { r: [f32; 4], style: u32, radius: f32, w: f32 },
+        Rect { r: [f32; 4] },
+    }
+
+    thread_local! {
+        static FRAME: RefCell<Vec<Cmd>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn push(c: Cmd) {
+        FRAME.with(|f| f.borrow_mut().push(c));
+    }
+
+    extern "C" fn rec_ring_fill(_: *mut c_void, r: RectC, style: u32, radius: f32, _: ColorC) {
+        push(Cmd::RingFill { r: [r.x, r.y, r.w, r.h], style, radius });
+    }
+
+    extern "C" fn rec_ring(
+        _: *mut c_void,
+        r: RectC,
+        style: u32,
+        radius: f32,
+        w: f32,
+        _: ColorC,
+    ) {
+        push(Cmd::Ring { r: [r.x, r.y, r.w, r.h], style, radius, w });
+    }
+
+    extern "C" fn rec_rect(_: *mut c_void, r: RectC, _: ColorC) {
+        push(Cmd::Rect { r: [r.x, r.y, r.w, r.h] });
+    }
+
+    /// One frame of the keyboard, drawn into the recorder.
+    fn frame(r: Rect) -> Vec<Cmd> {
+        frame_of(Keyboard::new(), r)
+    }
+
+    /// The same frame from a keyboard already in some state — a latched
+    /// modifier is a state, and its mark only exists in one.
+    fn frame_of(mut k: Keyboard, r: Rect) -> Vec<Cmd> {
+        nacelle::theme::load();
+        let api = HostApi {
+            ring_fill: rec_ring_fill,
+            ring: rec_ring,
+            rect: rec_rect,
+            ..*nacelle::plugin::host_api()
+        };
+        FRAME.with(|f| f.borrow_mut().clear());
+        // A null context is what input-time calls already pass: every
+        // theme entry ignores it, and the drawing entries here are ours.
+        k.draw(&api, std::ptr::null_mut(), r);
+        FRAME.with(|f| f.borrow().clone())
+    }
+
+    fn px(name: &str) -> f32 {
+        nacelle::theme::resolved().px(nacelle::theme::id(name).expect(name))
+    }
+
+    /// THE proof for the heavy finding: every cap is drawn as a rounded
+    /// ring whose radius is `keyboard.key_corner` and whose stroke is
+    /// `keyboard.key_border`, both as the loaded master answers them
+    /// right now. Before this change the same frame was `api.rect` plus
+    /// `api.rect_outline` — a radius of zero no theme could move.
+    #[test]
+    fn every_cap_wears_the_radius_and_the_ring_the_theme_states() {
+        let cmds = frame(Rect::new(0.0, 0.0, 1200.0, 400.0));
+        let (radius, border) = (px("keyboard.key_corner"), px("keyboard.key_border"));
+        let fills: Vec<&Cmd> = cmds
+            .iter()
+            .filter(|c| matches!(c, Cmd::RingFill { .. }))
+            .collect();
+        // 61 caps in the five rows this widget declares.
+        assert_eq!(fills.len(), layout().iter().map(|r| r.len()).sum::<usize>());
+        for c in cmds.iter() {
+            match c {
+                Cmd::RingFill { style, radius: got, .. } => {
+                    assert_eq!(*style, CORNER_ROUND);
+                    assert_eq!(*got, radius, "the cap's radius is not keyboard.key_corner");
+                }
+                Cmd::Ring { style, radius: got, w, .. } => {
+                    assert_eq!(*style, CORNER_ROUND);
+                    assert_eq!(*got, radius);
+                    assert_eq!(*w, border, "the cap's ring is not keyboard.key_border");
+                }
+                // The only plain rectangles left are the latched
+                // modifiers' dots, and no modifier is latched here.
+                Cmd::Rect { .. } => panic!("a cap drawn as a plain rectangle"),
+            }
+        }
+        assert!(radius > 0.0 && border > 0.0);
+    }
+
+    /// The field really is inset by `keyboard.pad`: the leftmost cap
+    /// starts a pad in from the box's edge and the rightmost ends a pad
+    /// short of it, where both used to sit exactly on it.
+    #[test]
+    fn the_caps_stop_a_keyboard_pad_short_of_every_edge() {
+        let r = Rect::new(30.0, 10.0, 1200.0, 400.0);
+        let cmds = frame(r);
+        // The master writes this pad as `same_as_parent`, which bakes to
+        // a negative sentinel and reads as `keyboard.gap`.
+        let pad = or_parent(px("keyboard.pad"), px("keyboard.gap"));
+        assert!(pad > 0.0, "neither the pad nor its parent is a length");
+        let boxes: Vec<[f32; 4]> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::RingFill { r, .. } => Some(*r),
+                _ => None,
+            })
+            .collect();
+        let left = boxes.iter().map(|b| b[0]).fold(f32::INFINITY, f32::min);
+        let right = boxes.iter().map(|b| b[0] + b[2]).fold(f32::NEG_INFINITY, f32::max);
+        let top = boxes.iter().map(|b| b[1]).fold(f32::INFINITY, f32::min);
+        let bottom = boxes.iter().map(|b| b[1] + b[3]).fold(f32::NEG_INFINITY, f32::max);
+        assert!((left - (r.x + pad)).abs() < 0.01, "left edge at {left}");
+        assert!((right - (r.x + r.w - pad)).abs() < 0.01, "right edge at {right}");
+        assert!((top - (r.y + pad)).abs() < 0.01, "top edge at {top}");
+        assert!((bottom - (r.y + r.h - pad)).abs() < 0.01, "bottom edge at {bottom}");
+    }
+
+    /// The latched modifier's dot stands off the cap's floor by a length
+    /// the theme states — `keyboard.sub_inset_y`, borrowed from the only
+    /// other mark the master places inside a cap, because it declares no
+    /// `keyboard.mod_dot_inset_y`. What stood here before was twice the
+    /// dot's own size: a distance no theme could reach, and this is what
+    /// fails if it comes back.
+    #[test]
+    fn the_latched_dot_stands_off_the_floor_by_a_length_the_theme_states() {
+        let mut k = Keyboard::new();
+        k.shift = true;
+        let cmds = frame_of(k, Rect::new(0.0, 0.0, 1200.0, 400.0));
+        let dots: Vec<[f32; 4]> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                // The caps go through the ring pair, so the only plain
+                // rectangles in a latched frame are the dots.
+                Cmd::Rect { r } => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert!(!dots.is_empty(), "a latched modifier drew no dot");
+        let caps: Vec<[f32; 4]> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::RingFill { r, .. } => Some(*r),
+                _ => None,
+            })
+            .collect();
+        let inset = px("keyboard.sub_inset_y");
+        let size = px("keyboard.mod_dot").max(px("keyboard.mod_dot_min_px"));
+        assert!(inset > 0.0 && size > 0.0);
+        for d in &dots {
+            assert!((d[3] - size).abs() < 0.01, "a dot {} px tall", d[3]);
+            let floor = d[1] + d[3] + inset;
+            assert!(
+                caps.iter().any(|c| ((c[1] + c[3]) - floor).abs() < 0.01),
+                "no cap whose floor is a keyboard.sub_inset_y under this dot"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
