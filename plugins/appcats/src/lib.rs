@@ -50,7 +50,7 @@ use nacelle::widget::factory::BuiltinWidget;
 use nacelle_launcher_core::cats::{self, Category};
 use nacelle_launcher_core::desktop::{self, AppEntry};
 use nacelle_launcher_core::selection::{Selection, Watch};
-use nacelle_launcher_core::tile::{self, Rect, TileLook, TileTheme};
+use nacelle_launcher_core::tile::{self, EmptyLook, EmptyTheme, Rect, TileLook, TileTheme};
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -123,17 +123,12 @@ struct ListTheme {
     /// property of the face and not of this file.
     status_font: u32,
     label_font: u32,
-    /// Where an empty panel says so. `emptystate.y_frac` — the master's
-    /// `[emptystate]` header landed, so the name this widget always asked
-    /// for is the name that answers.
-    empty_y: u32,
     /// A row's row in the class x state matrix.
     item_class: u32,
 }
 
 impl ListTheme {
     fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ListTheme {
-        let empty_y = tile::token(api, "emptystate.y_frac");
         // The row's two type bindings, followed to the roles they name.
         let label = tile::enum_word(api, ctx, tile::token(api, "list.label_role"));
         let status = tile::enum_word(api, ctx, tile::token(api, "list.status_role"));
@@ -162,7 +157,6 @@ impl ListTheme {
             label_case: tile::role_id(api, &label, "case"),
             status_font: tile::face_slot(api, ctx, tile::role_id(api, &status, "face")),
             label_font: tile::face_slot(api, ctx, tile::role_id(api, &label, "face")),
-            empty_y,
             item_class: (api.theme_class)("list.item".as_ptr(), "list.item".len() as u32),
         }
     }
@@ -195,7 +189,6 @@ struct ListLook {
     label_case: u32,
     status_font: u32,
     label_font: u32,
-    empty_y: f32,
 }
 
 impl ListLook {
@@ -237,7 +230,6 @@ impl ListLook {
             label_case: 0,
             status_font: tile::FONT_UI,
             label_font: tile::FONT_UI,
-            empty_y: 0.0,
         }
     }
 
@@ -267,7 +259,6 @@ impl ListLook {
             label_case: (api.theme_enum)(ctx, t.label_case),
             status_font: t.status_font,
             label_font: t.label_font,
-            empty_y: px(t.empty_y),
         }
     }
 }
@@ -276,6 +267,10 @@ impl ListLook {
 struct Look {
     tile: TileLook,
     list: ListLook,
+    /// The line this list draws INSTEAD of its rows. Its own look,
+    /// because "the panel has nothing to show" is its own kind of
+    /// element and the master answers it once, in `emptystate.role`.
+    empty: EmptyLook,
 }
 
 // ----------------------------------------------------------- the widget
@@ -317,7 +312,7 @@ pub struct Appcats {
     last_look: Instant,
     stamp: u64,
     /// Resolved token ids, re-resolved whenever the theme epoch moves.
-    theme: Option<(TileTheme, ListTheme)>,
+    theme: Option<(TileTheme, ListTheme, EmptyTheme)>,
     /// `list.wheel_px`, cached at draw because a wheel event arrives
     /// with no drawing context to ask the theme through.
     wheel_px: f32,
@@ -443,19 +438,35 @@ impl Appcats {
         // day the check moves — an old table simply ends before these
         // entries do.
         if api.abi_version < 5 {
-            return Look { tile: TileLook::raw(), list: ListLook::raw() };
+            return Look {
+                tile: TileLook::raw(),
+                list: ListLook::raw(),
+                empty: EmptyLook::raw(),
+            };
         }
         let epoch = (api.theme_epoch)(ctx);
-        if self.theme.as_ref().map(|(t, _)| t.epoch) != Some(epoch) {
-            self.theme =
-                Some((TileTheme::resolve(api, ctx, epoch), ListTheme::resolve(api, ctx, epoch)));
+        if self.theme.as_ref().map(|(t, _, _)| t.epoch) != Some(epoch) {
+            self.theme = Some((
+                TileTheme::resolve(api, ctx, epoch),
+                ListTheme::resolve(api, ctx, epoch),
+                EmptyTheme::resolve(api, ctx, epoch),
+            ));
         }
         match &self.theme {
-            Some((t, l)) => {
+            Some((t, l, e)) => {
                 debug_assert_eq!(t.epoch, l.epoch);
-                Look { tile: TileLook::read(api, ctx, t), list: ListLook::read(api, ctx, l) }
+                debug_assert_eq!(t.epoch, e.epoch);
+                Look {
+                    tile: TileLook::read(api, ctx, t),
+                    list: ListLook::read(api, ctx, l),
+                    empty: EmptyLook::read(api, ctx, e),
+                }
             }
-            None => Look { tile: TileLook::raw(), list: ListLook::raw() },
+            None => Look {
+                tile: TileLook::raw(),
+                list: ListLook::raw(),
+                empty: EmptyLook::raw(),
+            },
         }
     }
 
@@ -692,28 +703,27 @@ fn row(
 }
 
 /// What a box with nothing in it says. Nothing found is not an error —
-/// a machine can honestly have no menu — so it says so in the caption
-/// role rather than in a critical pill.
+/// a machine can honestly have no menu — so it says so in a line rather
+/// than in a critical pill.
 fn empty(api: &HostApi, ctx: *mut c_void, r: Rect, look: &Look, what: &str) {
-    // The line a list has instead of rows is a ROW, so it is set in the
-    // role the rows are: `list.label_role`, not the tile grid's caption.
-    let px = look.list.label_px;
-    let sp = px * look.list.label_tracking;
-    let text = tile::recase(look.list.label_case, what.to_string());
-    // The empty-state fraction says where in the box the line sits; the
-    // role's own leading is what centres the line box on it rather than
-    // hanging it below.
-    tile::text(
+    // In `emptystate.role`, which is the master's answer for every panel
+    // that has nothing to show — not in this list's ROW role.
+    //
+    // The row argument stood here and was not wrong about this panel: a
+    // list's empty line does sit where a row would. It was answering a
+    // question the theme had already answered, and the cost was visible
+    // on one board — this sentence at 13.3 px beside the launcher grid
+    // saying the same words at 9.6 px, while the search panel next to
+    // both said it at 17.6 px.
+    tile::empty_line(
         api,
         ctx,
-        look.list.label_font,
-        px,
-        r.cx(),
-        r.y + r.h * look.list.empty_y - px * look.list.label_leading / 2.0,
-        &text,
-        look.tile.idle.text,
-        sp,
-        1,
+        &look.empty,
+        r,
+        what,
+        // The list's own resting ink, so the line reads as part of the
+        // surface the rows would have covered.
+        Some(look.tile.idle.text),
     );
 }
 

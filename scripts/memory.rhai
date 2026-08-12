@@ -10,10 +10,15 @@ fn draw() {
         title("MEMORY"),
         // The nameless row becomes the header line above the matrix
         // (u2 §2.6): its label STAYS empty — u2 §6.3's default — and its
-        // value is the same used / total string as always, set small so
-        // it reads as the matrix's caption.
-        rows([["", bytes(host.mem_used) + " / " + bytes(host.mem_total)]],
-             #{ value_role: "caption" }),
+        // value is the same used / total string as always.
+        //
+        // It used to name the `caption` role to read as the matrix's
+        // caption, which set this panel's headline figure at 1.77u under
+        // its own swap readout at 3.25u: the less important number was
+        // twice the size of the more important one. Both are values of a
+        // rows line now, so both are one size, and which size that is is
+        // script.rows_value_role's to say.
+        rows([["", bytes(host.mem_used) + " / " + bytes(host.mem_total)]]),
         dots(host.mem_fraction),
     ];
     // No swap configured means no swap meter, rather than an empty bar.
