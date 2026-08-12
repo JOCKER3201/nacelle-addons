@@ -860,6 +860,46 @@ extern "C" fn pointer_c(
     0
 }
 
+/// Filled, and consumes nothing on purpose — emphatically so, because
+/// this is the one widget that would be wrong to give a key to.
+///
+/// An on-screen keyboard's whole job is to SHOW the key somebody else is
+/// typing, and that arrives on `key_feedback`, the broadcast every
+/// instance hears. This entry is its opposite: it is delivered to the
+/// widget that owns the keyboard, and a keyboard that owned the keyboard
+/// would be lighting up its own reflection while the field the user is
+/// typing into got nothing. Answering 0 keeps every key going where it
+/// was going.
+extern "C" fn key_c(
+    _: *mut c_void,
+    _: u32,
+    _: *const u8,
+    _: u32,
+    _: u32,
+    _: *mut ActionC,
+) -> u32 {
+    0
+}
+
+/// Filled, and does nothing on purpose. A key here lights up for
+/// `motion.press.duration_ms` from the moment it is struck — by the
+/// pointer or by the physical keyboard, through the broadcast — which is
+/// a decay this widget draws from its own clock. A press taken here as
+/// well would be a second source of one state, and the two would
+/// disagree the first time a key was released somewhere else.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn button_c(
+    _: *mut c_void,
+    _: u32,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+    _: *mut ActionC,
+) {
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -874,6 +914,8 @@ static API: PluginApi = PluginApi {
     chrome: chrome_c,
     drag: drag_c,
     pointer: pointer_c,
+    key: key_c,
+    button: button_c,
 };
 
 /// This addon, for a host that LINKS the crate in instead of loading
@@ -909,4 +951,57 @@ pub unsafe extern "C" fn nacelle_plugin_attach(api: *const HostApi) -> *const Pl
     }
     HOST = api.as_ref();
     &API
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use nacelle::runtime::{
+        BUTTON_PRESS, BUTTON_RELEASE, MODS_CTRL, PLUGIN_API_HAS_BUTTON,
+    };
+
+    /// A value no entry of this widget could ever write, so "left alone"
+    /// is something a test can see.
+    fn untouched() -> ActionC {
+        ActionC { kind: u32::MAX, index: 0, lines: 0, data: std::ptr::null(), data_len: 0 }
+    }
+
+    /// The entries appended in this version are filled AND declared.
+    ///
+    /// Two different things, and the host checks the second: it reads
+    /// `api_size` before it calls either, so a table that carried the
+    /// pointers without reaching them would be a widget the host never
+    /// asks. `size_of` says it here because the table is one literal.
+    ///
+    /// That they do NOTHING is pinned too. It is a decision, written out
+    /// above `key_c` and `button_c`, and a later change that gave
+    /// this widget a keyboard or a press rung has to come past those
+    /// reasons — and past this test — rather than round them.
+    #[test]
+    fn the_appended_entries_are_declared_and_take_nothing() {
+        assert_eq!(API.api_size as usize, std::mem::size_of::<PluginApi>());
+        assert!(API.api_size as usize >= PLUGIN_API_HAS_BUTTON);
+
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut a = untouched();
+        // A character, a named key and a chord: nothing here is the
+        // widget's, so the host keeps all three.
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 'a' as u32, std::ptr::null(), 0, 0, &mut a),
+            0
+        );
+        let word = nacelle::runtime::keys::DOWN;
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 0, word.as_ptr(), word.len() as u32, 0, &mut a),
+            0
+        );
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 'c' as u32, std::ptr::null(), 0, MODS_CTRL, &mut a),
+            0
+        );
+        for phase in [BUTTON_PRESS, BUTTON_RELEASE] {
+            (API.button)(std::ptr::null_mut(), phase, 1.0, 1.0, r, 100.0, 100.0, &mut a);
+        }
+        assert_eq!(a.kind, u32::MAX, "an entry that does nothing writes nothing");
+    }
 }

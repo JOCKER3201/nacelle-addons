@@ -230,7 +230,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libnacelle"
 version = "0.1.0"
-source = "git+https://github.com/JOCKER3201/libnacelle#28639a57f5582b73a6b5bf92d9f83c342fba0b90"
+source = "git+https://github.com/JOCKER3201/libnacelle#6693fb6aa4d6ffc2a19332660943be4661205bd2"
 dependencies = [
  "chrono",
  "fontdue",

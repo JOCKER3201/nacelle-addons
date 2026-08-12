@@ -8,10 +8,11 @@
 //! with it.
 //!
 //! WHICH applications it shows is not its own decision. The categories
-//! list next door points it at one group or at the whole menu, through
-//! [`selection`] — read that module before this one, because the way
-//! the two widgets reach each other is the one thing in this tree that
-//! is a stopgap rather than a design.
+//! list next door points it at one group or at the whole menu, and it
+//! says so through the HOST — `nacelle::channel`, under
+//! `selection::TOPIC`. This file is the READING end; read the head of
+//! [`nacelle_launcher_core::selection`] before this one, because it says
+//! why the choice cannot live in the crate the two widgets share.
 //!
 //! Pointed at the whole menu it draws the ALPHABETICAL INDEX: the tiles
 //! broken into letter groups, each under its letter and a rule (see
@@ -31,7 +32,7 @@
 //! zero lengths), never through a number that used to be the design.
 //!
 //! Almost none of the above is written here. The XDG scan, the
-//! categories, the tile grid, the index and the selection cell are
+//! categories, the tile grid, the index and the selection are
 //! `nacelle-launcher-core`, the launcher's shared half, because the
 //! categories widget is built out of the same five and two copies of
 //! any of them would be two launchers. What this file holds is the one
@@ -44,9 +45,9 @@ use nacelle::runtime::{
 use nacelle::widget::factory::BuiltinWidget;
 use nacelle_launcher_core::desktop::AppEntry;
 use nacelle_launcher_core::sections::{HeadLook, HeadTheme, Section};
-use nacelle_launcher_core::selection::Selection;
+use nacelle_launcher_core::selection::{Selection, Watch};
 use nacelle_launcher_core::tile::{Rect, TileLook, TileTheme};
-use nacelle_launcher_core::{cats, desktop, sections, selection, tile};
+use nacelle_launcher_core::{cats, desktop, sections, tile};
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -74,10 +75,10 @@ pub struct Appgrid {
     /// The installed applications, sorted by display name.
     entries: Vec<AppEntry>,
     /// What the categories list has pointed this grid at, as of the
-    /// last rebuild. Kept so that a change can be NOTICED: the cell in
-    /// [`selection`] is written by another widget and nothing tells
-    /// this one when.
-    sel: Selection,
+    /// last rebuild. A [`Watch`] so that a change can be NOTICED: the
+    /// value on the host's board is written by another widget — in
+    /// another `.so` — and nothing tells this one when.
+    sel: Watch,
     /// Which of [`Appgrid::entries`] the selection admits, by index and
     /// in the scanner's order. Rebuilt when the selection or the menu
     /// moves, and not once per frame: the filter walks every entry's
@@ -117,11 +118,12 @@ impl Appgrid {
         eprintln!("appgrid: {} applications found", entries.len());
         let mut this = Appgrid {
             entries,
-            // Deliberately NOT the cell's current value: an empty view
-            // against a selection nothing matches is what makes the
-            // first `refresh` build one. The default the user sees is
-            // the cell's own, in `selection`, and not a copy of it here.
-            sel: Selection::Named(String::new()),
+            // A view that has not looked yet; the poll below reads
+            // whatever is standing — ALL on a launcher nobody has
+            // clicked, and the choice already made on one opened next to
+            // a categories list that has been. The default lives in
+            // `selection`, never in a copy here.
+            sel: Watch::new(),
             view: Vec::new(),
             secs: Vec::new(),
             scroll: 0.0,
@@ -133,7 +135,14 @@ impl Appgrid {
             wheel_px: 0.0,
             chrome_right: Vec::new(),
         };
-        this.refresh();
+        // Built at once for the choice already standing. NOT through
+        // `refresh`: that one acts on a choice that MOVED, and reading
+        // the standing one for the first time is not a move — a grid
+        // that waited for one would have no page at all until somebody
+        // clicked the list next door.
+        this.sel.poll();
+        let sel = this.sel.get().clone();
+        this.rebuild(&sel);
         this
     }
 
@@ -162,14 +171,14 @@ impl Appgrid {
     /// and where the letters break.
     ///
     /// Called at the top of every frame and cheap on almost all of
-    /// them: it compares the selection cell with the one this view was
-    /// built for and does nothing when they agree.
+    /// them: the board is asked for a SEQUENCE NUMBER, and the page is
+    /// only rebuilt in the frames where that number moved.
     fn refresh(&mut self) {
-        let sel = selection::get();
-        if sel == self.sel {
+        if !self.sel.poll() {
             return;
         }
-        self.rebuild(sel);
+        let sel = self.sel.get().clone();
+        self.rebuild(&sel);
         // A different selection is a different page, and a page starts
         // at its top. The scroll of the group looked at before it means
         // nothing here.
@@ -180,12 +189,12 @@ impl Appgrid {
     /// rescan needs, and what must NOT move the scroll: the reader did
     /// not ask for a new page, an application was merely installed.
     fn rescan_view(&mut self) {
-        let sel = self.sel.clone();
-        self.rebuild(sel);
+        let sel = self.sel.get().clone();
+        self.rebuild(&sel);
     }
 
-    fn rebuild(&mut self, sel: Selection) {
-        self.view = view_of(&self.entries, &sel);
+    fn rebuild(&mut self, sel: &Selection) {
+        self.view = view_of(&self.entries, sel);
         // An index only when the whole menu is on show. A category's
         // own page is flat, and computing sections nobody draws would
         // be work done to be thrown away.
@@ -194,7 +203,6 @@ impl Appgrid {
         } else {
             Vec::new()
         };
-        self.sel = sel;
     }
 
     pub fn wheel(&mut self, delta: f32) {
@@ -555,6 +563,41 @@ extern "C" fn pointer_c(
     0
 }
 
+/// Filled, and consumes nothing on purpose: this grid is walked with the
+/// pointer and has no keyboard cursor to move. Answering 0 leaves every
+/// key with the host, which is where the focus chain and the shortcuts
+/// are — a grid that swallowed Tab would trap the keyboard in a panel
+/// that cannot use it.
+extern "C" fn key_c(
+    _: *mut c_void,
+    _: u32,
+    _: *const u8,
+    _: u32,
+    _: u32,
+    _: *mut ActionC,
+) -> u32 {
+    0
+}
+
+/// Filled, and does nothing on purpose. The press rung this entry
+/// carries is one this panel already draws from its own clock — a tile
+/// marks itself for `motion.press.duration_ms` from the click — so
+/// taking the press here as well would be a second source of one state,
+/// and the two would disagree the first time a press was released
+/// somewhere else.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn button_c(
+    _: *mut c_void,
+    _: u32,
+    _: f32,
+    _: f32,
+    _: RectC,
+    _: f32,
+    _: f32,
+    _: *mut ActionC,
+) {
+}
+
 static API: PluginApi = PluginApi {
     abi_version: ABI_VERSION,
     api_size: std::mem::size_of::<PluginApi>() as u32,
@@ -569,6 +612,8 @@ static API: PluginApi = PluginApi {
     chrome: chrome_c,
     drag: drag_c,
     pointer: pointer_c,
+    key: key_c,
+    button: button_c,
 };
 
 /// This addon, for a host that LINKS the crate in instead of loading
@@ -797,5 +842,135 @@ mod view_tests {
         // selection rather than by counting sections.
         assert!(!Selection::Named("Game".to_string()).is_all());
         assert!(Selection::All.is_all());
+    }
+
+    /// A grid over a menu of this file's own, without the XDG scan
+    /// `Appgrid::new` does: a test whose page depended on what happens
+    /// to be installed would be a different test on every machine.
+    fn grid_over(entries: Vec<AppEntry>) -> Appgrid {
+        let mut g = Appgrid {
+            entries,
+            sel: Watch::new(),
+            view: Vec::new(),
+            secs: Vec::new(),
+            scroll: 0.0,
+            hits: Vec::new(),
+            pressed: None,
+            last_look: Instant::now(),
+            stamp: 0,
+            theme: None,
+            wheel_px: 0.0,
+            chrome_right: Vec::new(),
+        };
+        g.sel.poll();
+        let sel = g.sel.get().clone();
+        g.rebuild(&sel);
+        g
+    }
+
+    /// ONE test that touches the board, not four: it is process-wide
+    /// state and two tests writing it would race each other under the
+    /// default harness — `launcher-core`'s own channel test says the
+    /// same and for the same reason.
+    ///
+    /// What this one proves is the half `launcher-core` cannot: that the
+    /// GRID's page, index and scroll all follow a choice this crate
+    /// never sees made. Nothing but the host's board passes between the
+    /// two ends.
+    #[test]
+    fn the_page_follows_the_choice_the_categories_panel_published() {
+        let m = menu();
+        let mut grid = grid_over(menu());
+        // Nobody has chosen yet: the whole menu, under its letter index.
+        assert_eq!(grid.view.len(), m.len());
+        assert!(!grid.secs.is_empty(), "the whole menu is drawn with its index");
+
+        // The categories panel is another widget in another `.so` with
+        // its own copy of this crate; a `Watch` of its own is the
+        // closest a single test binary can stand to one.
+        let mut cats_panel = Watch::new();
+        cats_panel.set(Selection::Named("Game".to_string()));
+        grid.scroll = 120.0;
+        grid.refresh();
+        let names: Vec<&str> = grid.view.iter().map(|&i| m[i].name.as_str()).collect();
+        assert_eq!(names, ["0 A.D.", "Łoś", "Żaba"]);
+        assert!(grid.secs.is_empty(), "a category's own page is flat");
+        assert_eq!(grid.scroll, 0.0, "a different page starts at its top");
+
+        // And a frame in which nothing was published rebuilds nothing —
+        // the sequence number is what makes that cheap, and the scroll
+        // standing still is what makes it visible.
+        grid.scroll = 40.0;
+        grid.refresh();
+        assert_eq!(grid.scroll, 40.0);
+
+        // The top row takes it back, index and all.
+        cats_panel.set(Selection::All);
+        grid.refresh();
+        assert_eq!(grid.view.len(), m.len());
+        assert!(!grid.secs.is_empty());
+
+        // A grid created after the click reads the choice standing,
+        // which is what makes load order stop mattering.
+        cats_panel.set(Selection::Named("Utility".to_string()));
+        let late = grid_over(menu());
+        let names: Vec<&str> = late.view.iter().map(|&i| m[i].name.as_str()).collect();
+        assert_eq!(names, ["7-Zip", "Ark", "Ósemka"]);
+
+        // Put the board back, so the order tests run in cannot matter.
+        cats_panel.set(Selection::All);
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use nacelle::runtime::{
+        BUTTON_PRESS, BUTTON_RELEASE, MODS_CTRL, PLUGIN_API_HAS_BUTTON,
+    };
+
+    /// A value no entry of this widget could ever write, so "left alone"
+    /// is something a test can see.
+    fn untouched() -> ActionC {
+        ActionC { kind: u32::MAX, index: 0, lines: 0, data: std::ptr::null(), data_len: 0 }
+    }
+
+    /// The entries appended in this version are filled AND declared.
+    ///
+    /// Two different things, and the host checks the second: it reads
+    /// `api_size` before it calls either, so a table that carried the
+    /// pointers without reaching them would be a widget the host never
+    /// asks. `size_of` says it here because the table is one literal.
+    ///
+    /// That they do NOTHING is pinned too. It is a decision, written out
+    /// above `key_c` and `button_c`, and a later change that gave
+    /// this widget a keyboard or a press rung has to come past those
+    /// reasons — and past this test — rather than round them.
+    #[test]
+    fn the_appended_entries_are_declared_and_take_nothing() {
+        assert_eq!(API.api_size as usize, std::mem::size_of::<PluginApi>());
+        assert!(API.api_size as usize >= PLUGIN_API_HAS_BUTTON);
+
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut a = untouched();
+        // A character, a named key and a chord: nothing here is the
+        // widget's, so the host keeps all three.
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 'a' as u32, std::ptr::null(), 0, 0, &mut a),
+            0
+        );
+        let word = nacelle::runtime::keys::DOWN;
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 0, word.as_ptr(), word.len() as u32, 0, &mut a),
+            0
+        );
+        assert_eq!(
+            (API.key)(std::ptr::null_mut(), 'c' as u32, std::ptr::null(), 0, MODS_CTRL, &mut a),
+            0
+        );
+        for phase in [BUTTON_PRESS, BUTTON_RELEASE] {
+            (API.button)(std::ptr::null_mut(), phase, 1.0, 1.0, r, 100.0, 100.0, &mut a);
+        }
+        assert_eq!(a.kind, u32::MAX, "an entry that does nothing writes nothing");
     }
 }
