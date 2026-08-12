@@ -82,7 +82,6 @@ const MESSAGE: &str =
 /// clamps anything past them, so a slot is chosen by the WORD a role's
 /// `face` names and never by an index into the theme's eight faces.
 const FONT_UI: u32 = 0;
-const FONT_MONO: u32 = 1;
 
 /// No ink at all, for the host that predates ABI 5 and cannot be asked
 /// for a colour.
@@ -124,18 +123,13 @@ fn enum_word(api: &HostApi, ctx: *mut c_void, id: u32) -> String {
 
 /// The font slot a type role's `face` token names.
 ///
-/// A face is an OPEN word set — `ui`, `mono`, `ui_medium`, `display` are
-/// all faces the theme declares — so it is read as a WORD rather than as
-/// an index: the boundary numbers two slots and clamps anything past
-/// them, which would turn `display` into monospace. A mono face answers
-/// the mono slot; every other face answers the interface slot, which is
-/// where the boundary puts them all anyway.
+/// A face is a CLOSED word set of eight, read as a WORD and turned into
+/// a slot by `nacelle::font::face_slot` — the one place that holds the
+/// master's own numbering. A copy of that rule here could only ever
+/// answer "mono or not", which is how `ui_medium` and `display` came to
+/// be the same family at the same weight on this side of the boundary.
 fn face_slot(api: &HostApi, ctx: *mut c_void, id: u32) -> u32 {
-    if enum_word(api, ctx, id).starts_with("mono") {
-        FONT_MONO
-    } else {
-        FONT_UI
-    }
+    nacelle::font::face_slot(&enum_word(api, ctx, id)) as u32
 }
 
 /// A type role's case transform, applied here because the text entry

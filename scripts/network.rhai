@@ -22,11 +22,18 @@ fn draw() {
         // of the reference images, on the label's own line, carrying
         // exactly the string the old rows line showed.
         badge(state, #{ label: "STATE", severity: state_sev }),
-        // The addresses are instrument data: monospace, tabular, right
-        // where the images put their numerals.
+        // Two rows with a label and a reading, and that is the whole of
+        // what this widget says about them. It used to add
+        // #{ value_role: "data" } to hold the address still — the `data`
+        // role was the only one carrying tabular figures a script could
+        // reach — and paid for it in size: 1.87u where every other panel
+        // sets a value at 3.25u, so the same reading was 42% shorter
+        // here and the value role is 74% taller than what this widget
+        // took. type.value.tabular does that job now, so the address
+        // stands still AND reads at the one value size.
         rows([
             ["IPV4", ipv4, ipv4_sev],
             ["PING", ping, ping_sev],
-        ], #{ value_role: "data" }),
+        ]),
     ]
 }

@@ -94,14 +94,15 @@ pub fn of<'a, I: IntoIterator<Item = &'a str>>(names: I) -> Vec<Section> {
 /// Token ids one heading draws from, resolved by NAME once per epoch.
 ///
 /// The three of them are ONE pattern the theme already has, rather than
-/// three separate picks: `[table]` declares `head_role = label.section`
-/// and `rule = @stroke.hair`, and `component.table.rule` colours it —
-/// a `label.section` heading with a hairline under it is exactly the
-/// shape of an alphabetical break, and taking the trio together is what
-/// keeps a theme able to retune "a heading and its rule" in one place.
-/// `type.label.section` is described in the master as "an instrument
-/// label above a group", which is what a letter over its applications
-/// is, word for word.
+/// three separate picks: `[table]` declares `head_role`, `rule` and — in
+/// `component.table.rule` — the rule's ink, and a heading with a
+/// hairline under it is exactly the shape of an alphabetical break. The
+/// master ships `head_role = label.section`, "an instrument label above
+/// a group", which is what a letter over its applications is, word for
+/// word — but that is the THEME's sentence and this file reads it rather
+/// than repeating it. It used to repeat it, which meant the trio was
+/// really a pair plus a copy: two of the three moved with the theme and
+/// the type did not.
 ///
 /// The gap between the letter and its rule is `space.2` — `1u`, the
 /// step of the ladder nearest the five device pixels the panel wants at
@@ -113,14 +114,18 @@ pub fn of<'a, I: IntoIterator<Item = &'a str>>(names: I) -> Vec<Section> {
 /// `component.launcher.tile`, and adding it is host-side work.
 pub struct HeadTheme {
     pub epoch: u32,
-    size: u32,     // type.label.section.size
-    min: u32,      // type.label.section.min_px
-    tracking: u32, // type.label.section.tracking
-    leading: u32,  // type.label.section.leading
-    case: u32,     // type.label.section.case
-    fg: u32,       // type.label.section.fg
-    /// The slot `type.label.section.face` names, read WITH the ids
-    /// because a face is a word and reading words is init-time work.
+    // type.<table.head_role>.* — the role the master BINDS a heading
+    // to. Read as a word: which role a heading is set in is the theme's
+    // decision, and a file that spells `type.label.section.*` out has
+    // taken that decision back off it.
+    size: u32,
+    min: u32,
+    tracking: u32,
+    leading: u32,
+    case: u32,
+    fg: u32,
+    /// The slot that role's `face` names, read WITH the ids because a
+    /// face is a word and reading words is init-time work.
     font: u32,
     gap: u32,        // space.2 — letter to rule
     rule: u32,       // table.rule — the hairline's width
@@ -129,15 +134,23 @@ pub struct HeadTheme {
 
 impl HeadTheme {
     pub fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> HeadTheme {
+        // The BINDING, followed to the role it names — not the role
+        // spelled out. `table.head_role` is the third member of the trio
+        // the two lines below already take (`table.rule` and
+        // `component.table.rule`), and taking two of three was the whole
+        // defect: a theme moving its headings off `label.section` moved
+        // every table in the program and left this index behind, at the
+        // size of a role it never named.
+        let head = tile::enum_word(api, ctx, tile::token(api, "table.head_role"));
         HeadTheme {
             epoch,
-            size: tile::token(api, "type.label.section.size"),
-            min: tile::token(api, "type.label.section.min_px"),
-            tracking: tile::token(api, "type.label.section.tracking"),
-            leading: tile::token(api, "type.label.section.leading"),
-            case: tile::token(api, "type.label.section.case"),
-            fg: tile::token(api, "type.label.section.fg"),
-            font: tile::face_slot(api, ctx, tile::token(api, "type.label.section.face")),
+            size: tile::role_id(api, &head, "size"),
+            min: tile::role_id(api, &head, "min_px"),
+            tracking: tile::role_id(api, &head, "tracking"),
+            leading: tile::role_id(api, &head, "leading"),
+            case: tile::role_id(api, &head, "case"),
+            fg: tile::role_id(api, &head, "fg"),
+            font: tile::face_slot(api, ctx, tile::role_id(api, &head, "face")),
             gap: tile::token(api, "space.2"),
             rule: tile::token(api, "table.rule"),
             rule_color: tile::token(api, "component.table.rule"),

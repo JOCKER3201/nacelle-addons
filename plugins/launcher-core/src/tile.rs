@@ -175,6 +175,144 @@ pub fn role_id(api: &HostApi, role: &str, suffix: &str) -> u32 {
     }
 }
 
+// ------------------------------------------------------- the empty state
+//
+// The line a panel draws INSTEAD of its content. `[emptystate]` is two
+// keys — `y_frac`, where in the box it sits, and `role`, which type it is
+// set in — and the second is the whole reason this pair lives here rather
+// than in each widget: "no applications" said by the grid and the same
+// sentence said by the list beside it are ONE kind of element, and the
+// master gives that kind one answer.
+//
+// It was three answers. The grid drew its line in the tile CAPTION's role
+// (`type.caption`, 9.6 px at 1080 lines), the categories list drew it in
+// its ROW's role (`type.body`, 13.3 px) with a comment arguing that a
+// list's empty line is a row, and the search panel and the settings
+// window read `emptystate.role` (`type.value`, 17.6 px) — a spread of
+// 84 % between two widgets standing side by side on the same board.
+// Neither local argument was wrong about its own panel; both were
+// answering a question the theme had already answered.
+
+/// Token ids the empty state draws from, resolved by NAME once per epoch.
+pub struct EmptyTheme {
+    pub epoch: u32,
+    /// `emptystate.y_frac` — where in the content box the line sits.
+    y_frac: u32,
+    // type.<emptystate.role>.* — the role the group above names.
+    size: u32,
+    min: u32,
+    tracking: u32,
+    leading: u32,
+    case: u32,
+    fg: u32,
+    /// The slot that role's `face` names, resolved WITH the ids because
+    /// a face is a word and reading words is init-time work.
+    font: u32,
+}
+
+impl EmptyTheme {
+    pub fn resolve(api: &HostApi, ctx: *mut c_void, epoch: u32) -> EmptyTheme {
+        // The binding, followed to the role it names. A master that binds
+        // no role leaves every id below MISSING, which is a line of no
+        // size: naming a role here would be this file choosing the type.
+        let role = enum_word(api, ctx, token(api, "emptystate.role"));
+        EmptyTheme {
+            epoch,
+            y_frac: token(api, "emptystate.y_frac"),
+            size: role_id(api, &role, "size"),
+            min: role_id(api, &role, "min_px"),
+            tracking: role_id(api, &role, "tracking"),
+            leading: role_id(api, &role, "leading"),
+            case: role_id(api, &role, "case"),
+            fg: role_id(api, &role, "fg"),
+            font: face_slot(api, ctx, role_id(api, &role, "face")),
+        }
+    }
+}
+
+/// The empty state's values for one frame, read fresh from the ids.
+#[derive(Clone, Copy)]
+pub struct EmptyLook {
+    pub y_frac: f32,
+    pub px: f32,
+    pub tracking: f32,
+    pub leading: f32,
+    pub case: u32,
+    pub font: u32,
+    pub ink: ColorC,
+}
+
+impl EmptyLook {
+    /// The pre-token world: a host that answers no theme calls at all.
+    /// No ink, zero lengths — type of no size draws nothing, which is
+    /// the same undesigned raw an empty theme gives.
+    pub fn raw() -> EmptyLook {
+        EmptyLook {
+            y_frac: 0.0,
+            px: 0.0,
+            tracking: 0.0,
+            leading: 1.0,
+            case: 0,
+            font: FONT_UI,
+            ink: NO_COLOR,
+        }
+    }
+
+    pub fn read(api: &HostApi, ctx: *mut c_void, t: &EmptyTheme) -> EmptyLook {
+        let px = |id| (api.theme_px)(ctx, id);
+        EmptyLook {
+            y_frac: px(t.y_frac),
+            px: px(t.size).max(px(t.min)),
+            tracking: px(t.tracking),
+            // A leading below one line would stack the lines on top of
+            // each other; the role declares 1.0 .. 2.0 and the floor is
+            // what a nonsense value degrades to, not a chosen pitch.
+            leading: px(t.leading).max(1.0),
+            case: (api.theme_enum)(ctx, t.case),
+            font: t.font,
+            ink: (api.theme_color)(ctx, t.fg),
+        }
+    }
+}
+
+/// The one line a panel with nothing to show draws, centred on `r` at
+/// `emptystate.y_frac` — the whole element, so that the two launcher
+/// widgets cannot draw it two ways again.
+///
+/// `ink` overrides the role's own `fg` when a caller has a better answer
+/// (a row list tints its line with the row class's text ink so the line
+/// sits in the same colour the rows would have); `None` takes the role's.
+pub fn empty_line(
+    api: &HostApi,
+    ctx: *mut c_void,
+    look: &EmptyLook,
+    r: Rect,
+    what: &str,
+    ink: Option<ColorC>,
+) {
+    if look.px <= 0.0 {
+        return;
+    }
+    let sp = look.px * look.tracking;
+    let text = recase(look.case, what.to_string());
+    // The fraction says where in the box the line sits; the role's own
+    // leading is what centres the LINE BOX on it rather than hanging the
+    // glyphs below it.
+    let y = r.y + r.h * look.y_frac - look.px * look.leading / 2.0;
+    self::text(
+        api,
+        ctx,
+        look.font,
+        look.px,
+        r.cx(),
+        y,
+        &text,
+        ink.unwrap_or(look.ink),
+        sp,
+        1,
+    );
+}
+
 /// Token ids the tile grid draws from, resolved by NAME once per epoch.
 ///
 /// No header tokens: a panel's title band is the HOST's, through
@@ -219,8 +357,6 @@ pub struct TileTheme {
     /// The slot that role's `face` names, resolved WITH the ids because
     /// a face is a word and reading words is init-time work.
     pub caption_font: u32,
-    // where an empty grid says so
-    pub empty_y: u32, // emptystate.y_frac
     // the press flash's life, and the one global that scales it
     pub press_ms: u32,     // motion.press.duration_ms
     pub motion_scale: u32, // motion.scale
@@ -268,7 +404,6 @@ impl TileTheme {
             caption_leading: role_id(api, &caption, "leading"),
             caption_case: role_id(api, &caption, "case"),
             caption_font: face_slot(api, ctx, role_id(api, &caption, "face")),
-            empty_y: token(api, "emptystate.y_frac"),
             press_ms: token(api, "motion.press.duration_ms"),
             motion_scale: token(api, "motion.scale"),
             glow_scale: token(api, "glow.alpha_scale"),
@@ -313,7 +448,6 @@ pub struct TileLook {
     pub caption_leading: f32,
     pub caption_case: u32,
     pub caption_font: u32,
-    pub empty_y: f32,
     /// `motion.press.duration_ms` already scaled by `motion.scale` and
     /// turned into seconds — a reduced-motion theme sets the scale to 0
     /// and the flash simply never shows.
@@ -365,7 +499,6 @@ impl TileLook {
             caption_leading: 1.0,
             caption_case: 0,
             caption_font: FONT_UI,
-            empty_y: 0.0,
             press_s: 0.0,
             glow_scale: 0.0,
             sb_mode: BarMode::None,
@@ -402,7 +535,6 @@ impl TileLook {
             caption_leading: px(t.caption_leading).max(1.0),
             caption_case: (api.theme_enum)(ctx, t.caption_case),
             caption_font: t.caption_font,
-            empty_y: px(t.empty_y),
             press_s: px(t.press_ms) * px(t.motion_scale) / 1000.0,
             glow_scale: px(t.glow_scale),
             sb_mode: t.sb_mode,
@@ -479,12 +611,16 @@ pub fn draw_text(
 
 /// The font slot a type role's `face` token names.
 ///
-/// A face is an OPEN word set — `ui`, `mono`, `ui_bold`, `display` and
-/// `icon` are all faces the theme declares — so it is read as a WORD
-/// rather than as an index: the boundary numbers two slots and clamps
-/// anything past them, which would turn `display` into monospace. A
-/// mono face answers the mono slot; every other face answers the
-/// interface slot, which is where the boundary puts them all anyway.
+/// A face is a CLOSED word set of eight — the master declares eight
+/// `[face.*]` blocks and numbers them itself — and it is read as a WORD
+/// rather than as an index, because an index is meaningful only against
+/// that numbering and a theme is free to reorder its own file.
+///
+/// The word→slot rule is the TOOLKIT's: `nacelle::font::face_slot`, the
+/// one place that holds the master's list. This used to be a copy of it
+/// that could only answer "mono or not", which meant a widget drawing
+/// `ui_medium` and the toolkit drawing `ui_medium` reached the same two
+/// slots by two different rules — and neither reached the third.
 ///
 /// Init-time work, like [`token`]: this copies a string, so it belongs
 /// beside the id resolution and behind the epoch, never in a frame.
@@ -495,11 +631,7 @@ pub fn face_slot(api: &HostApi, ctx: *mut c_void, id: u32) -> u32 {
     let mut buf = [0u8; 32];
     let n = (api.theme_enum_word)(ctx, id, buf.as_mut_ptr(), buf.len() as u32) as usize;
     let word = std::str::from_utf8(&buf[..n.min(buf.len())]).unwrap_or("");
-    if word.starts_with("mono") {
-        FONT_MONO
-    } else {
-        FONT_UI
-    }
+    nacelle::font::face_slot(word) as u32
 }
 
 /// The one character that stands in for an application's icon: the
@@ -1108,5 +1240,64 @@ mod sentinel_tests {
             let got = radii(Corner { style: CORNER_ROUND, radius: s }, cell);
             assert_eq!(got, vec![0.0, 0.0], "{word} is not a radius");
         }
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    /// A binding, followed to its role and to that role's family — the
+    /// chain every `*Theme::resolve` above walks, checked against the
+    /// master rather than against a name written into the code.
+    fn family_of(binding: &str) -> String {
+        nacelle::theme::load();
+        let id = nacelle::theme::id(binding)
+            .unwrap_or_else(|| panic!("the master declares no {binding}"));
+        let role = nacelle::theme::enum_word_of(id)
+            .unwrap_or_else(|| panic!("{binding} names no word"));
+        assert!(!role.is_empty(), "{binding} names no role");
+        for suffix in ["size", "min_px", "tracking", "leading", "case", "fg", "face"] {
+            let name = role_token(&role, suffix).expect("a bound role names its family");
+            assert!(nacelle::theme::id(&name).is_some(), "the master declares no {name}");
+        }
+        let t = nacelle::theme::resolved();
+        let px = t.px(nacelle::theme::id(&role_token(&role, "size").unwrap()).unwrap());
+        assert!(px > 0.0, "{binding} lands on a role of no size");
+        role
+    }
+
+    /// The line a panel draws instead of its content is ONE kind of
+    /// element, so it has one binding — and that binding is not the tile
+    /// caption's and not a list row's.
+    ///
+    /// It was both, and neither: the launcher grid drew the sentence in
+    /// `tile.caption_role`, the categories list beside it drew the same
+    /// sentence in `list.label_role`, and `emptystate.role` — the key the
+    /// master declares for exactly this — was read only by the search
+    /// panel and the settings window. Three answers to one question, a
+    /// spread of 84 % between the two widgets that share a board.
+    #[test]
+    fn an_empty_panel_and_a_tile_caption_are_two_different_bindings() {
+        let empty = family_of("emptystate.role");
+        let caption = family_of("tile.caption_role");
+        let row = family_of("list.label_role");
+        assert_ne!(
+            empty, caption,
+            "the master binds an empty state and a tile caption to one role, so \
+             this test cannot tell a grid that reads `emptystate.role` from one \
+             that reads its caption's"
+        );
+        assert_ne!(empty, row, "the same, for the row role the categories list drew it in");
+    }
+
+    /// A launcher's alphabetical break is a HEADING, and the master says
+    /// which role a heading is set in exactly once, in `table.head_role`.
+    /// `sections.rs` spelled `type.label.section.*` out instead, so two
+    /// of the trio it takes from `[table]` moved with the theme and the
+    /// type did not.
+    #[test]
+    fn an_alphabetical_break_takes_the_heading_binding_whole() {
+        family_of("table.head_role");
     }
 }
