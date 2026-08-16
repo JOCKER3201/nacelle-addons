@@ -241,6 +241,34 @@ fn resolve_ids(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ThemeIds {
     }
 }
 
+/// How many drawn content boxes this widget remembers at once.
+///
+/// One per screen would do — the desktop draws the SAME instance once per
+/// screen, each with its own content box — but the count is not knowable
+/// from here, so four covers any desk this program has met with room to
+/// spare. A fifth concurrent box evicts the oldest entry, which only
+/// costs that box the fallback path until its next frame writes it back.
+const DRAWN_SLOTS: usize = 4;
+
+/// One screen's frame: the content box the host handed `draw`, and the
+/// buttons the frame put there.
+#[derive(Clone, Copy)]
+struct Drawn {
+    r: RectC,
+    rects: [RectC; 2],
+    /// When the entry was written, on the instance's own draw counter —
+    /// what "oldest" means when every slot is taken.
+    stamp: u64,
+}
+
+/// Exact equality, not a tolerance: both boxes come from the same host
+/// field, so any difference is a real layout change and never rounding.
+/// A tolerance here would keep answering with rectangles from a layout
+/// that has moved.
+fn same_box(a: RectC, b: RectC) -> bool {
+    a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h
+}
+
 /// The widget's own state: which button was pressed and when — WHICH
 /// state each button is in is this file's to remember; how long the
 /// press flash lasts is `motion.press.duration_ms`'s to say — plus the
@@ -248,18 +276,24 @@ fn resolve_ids(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ThemeIds {
 struct Control {
     pressed: [Option<Instant>; 2],
     theme: Option<ThemeIds>,
-    /// The content box the last frame drew in, and the buttons it put
-    /// there. Input is answered against THESE, never against a fresh
-    /// calculation.
+    /// The content boxes recent frames drew in, and the buttons each
+    /// frame put there — one entry per box, because ONE slot was itself
+    /// the bug. The desktop draws this single instance once per screen
+    /// with a different content box each time, so screen B's frame used
+    /// to overwrite screen A's rectangles: input from A missed the store,
+    /// fell to the fallback, and measured with whichever screen last
+    /// published a bake. Input is answered against THESE entries, never
+    /// against a fresh calculation.
     ///
-    /// WHY, and it is not caution: `button_rects` reads its height and gap
-    /// from theme tokens, the tokens are sized in `u`, and `u` comes from
-    /// the window height of whichever screen last published a bake. In a
-    /// frame that is this screen — `draw_screen` sets the viewport first.
-    /// Outside a frame it is whoever drew last, so on a desktop of unequal
-    /// monitor heights the same call answers with the OTHER screen's
-    /// button size. Measured on 2560x1440 beside 3840x2160: the boundary
-    /// between the two buttons lands 35.8 px away from the drawn one.
+    /// WHY the fresh calculation is wrong, and it is not caution:
+    /// `button_rects` reads its height and gap from theme tokens, the
+    /// tokens are sized in `u`, and `u` comes from the window height of
+    /// whichever screen last published a bake. In a frame that is this
+    /// screen — `draw_screen` sets the viewport first. Outside a frame it
+    /// is whoever drew last, so on a desktop of unequal monitor heights
+    /// the same call answers with the OTHER screen's button size.
+    /// Measured on 2560x1440 beside 3840x2160: the boundary between the
+    /// two buttons lands 35.8 px away from the drawn one.
     ///
     /// The consequence is worse than a missed press. A click that lands in
     /// the gap between where SETTINGS is drawn and where it is tested hits
@@ -270,32 +304,55 @@ struct Control {
     /// fix belongs in the toolkit — an object should record its own hit
     /// geometry and input should test the record, for every control rather
     /// than this one — and when that lands this field goes with it.
-    drawn: Option<(RectC, [RectC; 2])>,
+    drawn: [Option<Drawn>; DRAWN_SLOTS],
+    /// The draw counter behind `Drawn::stamp`.
+    frame: u64,
 }
 
-/// The buttons the last frame drew, if it drew them in THIS box.
+/// The buttons a frame drew in THIS box, whichever screen's frame it was.
 ///
 /// Split out of `hit_rects` so the decision can be stated without a host:
-/// everything that makes answering input correct is these four comparisons,
-/// and the fallback around it is the old path left alone.
-fn stored_for(drawn: Option<(RectC, [RectC; 2])>, r: RectC) -> Option<[RectC; 2]> {
-    let (box_drawn, rects) = drawn?;
-    // Compared exactly, not within a tolerance: both boxes come from the
-    // same host field, so any difference is a real layout change and never
-    // rounding. A tolerance here would keep answering with rectangles from
-    // a layout that has moved.
-    (box_drawn.x == r.x && box_drawn.y == r.y && box_drawn.w == r.w && box_drawn.h == r.h)
-        .then_some(rects)
+/// everything that makes answering input correct is these comparisons over
+/// the stored entries, and the fallback around it is the old path left
+/// alone. Every entry is searched — the box IS the key, so screen A's
+/// input finds screen A's buttons no matter which screen drew last.
+fn stored_for(drawn: &[Option<Drawn>], r: RectC) -> Option<[RectC; 2]> {
+    drawn.iter().flatten().find(|d| same_box(d.r, r)).map(|d| d.rects)
+}
+
+/// Records what a frame drew: its own box's entry replaced in place, a
+/// free slot taken otherwise, the oldest entry evicted only when every
+/// slot belongs to some other box. Each screen's frame maintains its own
+/// entry and touches nobody else's — the overwriting that used to lose
+/// screen A's rectangles to screen B's frame cannot be expressed here.
+fn record_drawn(this: &mut Control, r: RectC, rects: [RectC; 2]) {
+    this.frame += 1;
+    let entry = Drawn { r, rects, stamp: this.frame };
+    let slot = this
+        .drawn
+        .iter()
+        .position(|e| e.map(|d| same_box(d.r, r)).unwrap_or(false))
+        .or_else(|| this.drawn.iter().position(|e| e.is_none()))
+        .unwrap_or_else(|| {
+            this.drawn
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.map(|d| d.stamp).unwrap_or(0))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        });
+    this.drawn[slot] = Some(entry);
 }
 
 /// The buttons to test an event against: the ones on screen.
 ///
-/// Falls back to calculating them only when this instance has not drawn a
-/// frame yet, or when the host hands input a different content box than the
-/// last frame used — a layout change, with a redraw already on its way. The
-/// fallback is the old, viewport-dependent path, so it is narrow on purpose.
+/// Falls back to calculating them only when NO frame has drawn in this
+/// content box yet — an instance before its first frame, or a layout change
+/// with a redraw already on its way. A box another screen drew in is not
+/// such a case any more: each screen's box keeps its own entry, so the
+/// fallback — the old, viewport-dependent path — stays narrow on purpose.
 fn hit_rects(this: &mut Control, api: &HostApi, r: RectC) -> [RectC; 2] {
-    if let Some(rects) = stored_for(this.drawn, r) {
+    if let Some(rects) = stored_for(&this.drawn, r) {
         return rects;
     }
     let ctx = std::ptr::null_mut();
@@ -368,8 +425,12 @@ fn contains(r: &RectC, x: f32, y: f32) -> bool {
 }
 
 extern "C" fn create() -> *mut c_void {
-    Box::into_raw(Box::new(Control { pressed: [None, None], theme: None, drawn: None }))
-        as *mut c_void
+    Box::into_raw(Box::new(Control {
+        pressed: [None, None],
+        theme: None,
+        drawn: [None; DRAWN_SLOTS],
+        frame: 0,
+    })) as *mut c_void
 }
 
 extern "C" fn destroy(instance: *mut c_void) {
@@ -397,8 +458,11 @@ extern "C" fn draw(
     let align = t_enum(api, ctx, t.button_align);
     let rects = button_rects(h, gap, w_frac, align, r);
     // Kept for input to answer against. Everything above ran under this
-    // screen's viewport; nothing outside a frame can say the same.
-    this.drawn = Some((r, rects));
+    // screen's viewport; nothing outside a frame can say the same. Written
+    // into THIS box's entry: on a desktop of two screens the same instance
+    // draws once per screen with a different box, and each frame must keep
+    // its own record rather than overwrite the other screen's.
+    record_drawn(this, r, rects);
 
     let skew = t_px(api, ctx, t.skew);
     let px = t_px(api, ctx, t.type_size).max(t_px(api, ctx, t.type_min_px));
@@ -954,6 +1018,12 @@ mod hit_tests {
         RectC { x: 0.0, y: 0.0, w: 300.0, h }
     }
 
+    /// A fresh instance, as `create` builds one, without going through the
+    /// pointer dance — these tests only exercise the drawn-entry store.
+    fn fresh() -> Control {
+        Control { pressed: [None, None], theme: None, drawn: [None; DRAWN_SLOTS], frame: 0 }
+    }
+
     /// Input answers with the buttons a person can SEE, not with buttons
     /// measured again after the frame ended.
     ///
@@ -978,7 +1048,9 @@ mod hit_tests {
              this test can no longer tell the fix from the bug"
         );
 
-        let answered = stored_for(Some((r, drawn)), r).expect("the drawn box was not recognised");
+        let mut this = fresh();
+        record_drawn(&mut this, r, drawn);
+        let answered = stored_for(&this.drawn, r).expect("the drawn box was not recognised");
         assert_eq!(
             answered[1].y, drawn_edge,
             "input answered with buttons that were never on screen"
@@ -988,22 +1060,88 @@ mod hit_tests {
     /// A moved panel falls back rather than answering from the old place.
     ///
     /// The stored rectangles belong to the box they were drawn in. When the
-    /// host hands input a different box the layout has changed and a redraw
-    /// is already coming; answering with the previous frame's rectangles
-    /// would put the buttons where the panel no longer is.
+    /// host hands input a box NO frame has drawn in, the layout has changed
+    /// and a redraw is already coming; answering with a previous frame's
+    /// rectangles would put the buttons where the panel no longer is.
     #[test]
     fn a_different_content_box_is_not_answered_from_the_last_frame() {
         let r = box_of(TALL_H * 2.0 + TALL_GAP);
         let drawn = button_rects(TALL_H, TALL_GAP, W_FRAC, ALIGN_BOTTOM, r);
+        let mut this = fresh();
+        record_drawn(&mut this, r, drawn);
         let moved = RectC { y: r.y + 40.0, ..r };
         assert!(
-            stored_for(Some((r, drawn)), moved).is_none(),
+            stored_for(&this.drawn, moved).is_none(),
             "a panel that moved was still answered from where it used to be"
         );
         assert!(
-            stored_for(None, r).is_none(),
+            stored_for(&fresh().drawn, r).is_none(),
             "an instance that has never drawn claimed to know its buttons"
         );
+    }
+
+    /// The two-monitor frame, the case the single slot used to lose.
+    ///
+    /// The desktop draws the SAME instance once per screen, each screen
+    /// with its own content box and its own button sizes. With one slot,
+    /// screen B's frame overwrote screen A's record, so input from A found
+    /// nothing stored and fell back to the miscalculating path — the loop
+    /// the owner saw as click boxes and hover alternating per frame. With
+    /// one entry per box, drawing B leaves A's answer standing.
+    #[test]
+    fn each_screens_box_keeps_its_own_buttons_across_the_other_screens_frame() {
+        let r_tall = box_of(TALL_H * 2.0 + TALL_GAP);
+        let r_short = RectC { x: 400.0, ..box_of(SHORT_H * 2.0 + SHORT_GAP) };
+        let drawn_tall = button_rects(TALL_H, TALL_GAP, W_FRAC, ALIGN_BOTTOM, r_tall);
+        let drawn_short = button_rects(SHORT_H, SHORT_GAP, W_FRAC, ALIGN_BOTTOM, r_short);
+
+        let mut this = fresh();
+        // The frame order of one desktop pass: screen A, then screen B.
+        record_drawn(&mut this, r_tall, drawn_tall);
+        record_drawn(&mut this, r_short, drawn_short);
+
+        let for_a = stored_for(&this.drawn, r_tall)
+            .expect("screen A's box was forgotten the moment screen B drew");
+        assert_eq!(for_a[1].y, drawn_tall[1].y, "screen A answered with screen B's buttons");
+        let for_b = stored_for(&this.drawn, r_short).expect("screen B's box was not stored");
+        assert_eq!(for_b[1].y, drawn_short[1].y, "screen B answered with screen A's buttons");
+
+        // A later frame of the same boxes REPLACES in place — two screens
+        // never grow past two entries, however many frames they draw.
+        record_drawn(&mut this, r_tall, drawn_tall);
+        record_drawn(&mut this, r_short, drawn_short);
+        assert_eq!(
+            this.drawn.iter().flatten().count(),
+            2,
+            "redrawing the same two boxes grew the store instead of replacing"
+        );
+    }
+
+    /// A store past capacity evicts the OLDEST entry and only that one.
+    ///
+    /// Losing the oldest box costs it nothing but the fallback path until
+    /// its next frame writes it back; losing a newer one would reintroduce
+    /// the alternating loop for a screen that is still drawing every frame.
+    #[test]
+    fn a_full_store_evicts_the_oldest_entry_first() {
+        let mut this = fresh();
+        let boxes: Vec<RectC> = (0..DRAWN_SLOTS as u32 + 1)
+            .map(|k| RectC { x: 500.0 * k as f32, ..box_of(TALL_H * 2.0 + TALL_GAP) })
+            .collect();
+        let rects = |r: RectC| button_rects(TALL_H, TALL_GAP, W_FRAC, ALIGN_BOTTOM, r);
+        for &b in &boxes {
+            record_drawn(&mut this, b, rects(b));
+        }
+        assert!(
+            stored_for(&this.drawn, boxes[0]).is_none(),
+            "the store grew past its slots, or evicted something other than the oldest"
+        );
+        for &b in &boxes[1..] {
+            assert!(
+                stored_for(&this.drawn, b).is_some(),
+                "a box still in use was evicted while the oldest survived"
+            );
+        }
     }
 }
 
