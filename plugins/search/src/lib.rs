@@ -9,15 +9,18 @@
 //!   one the APPLICATIONS grid shows, and a chosen application is handed
 //!   to init down the same double fork. A second scan or a second launch
 //!   path would be a second launcher that drifts from the first.
-//! * files — a walk of `$HOME` on a thread of its own, with a hard cap
-//!   on depth, on answers and on entries looked at, refusing hidden
+//! * files — a walk of a directory on a thread of its own, with a hard
+//!   cap on depth, on answers and on entries looked at, refusing hidden
 //!   directories and symlinks (see [`files`]). A widget that stops the
-//!   desktop while it walks a large home is worse than no widget.
+//!   desktop while it walks a large home is worse than no widget. Which
+//!   directory, how far into it, and whether at all, is the user's —
+//!   [`config`], the one thing this panel is asked rather than knows.
 //!
 //! # What is where
 //!
+//! * [`config`] — `addons/search.ron`: the walk's root and its bounds.
 //! * [`rank`] — the relevance model: exact, then prefix, then contains.
-//! * [`files`] — the home walk and the thread it runs on.
+//! * [`files`] — the walk and the thread it runs on.
 //! * [`finder`] — the model: the query field, the ranked page, the row
 //!   the keyboard is on, and the throttle that turns a burst of typing
 //!   into one search. Every key this panel answers is decided there, and
@@ -46,13 +49,15 @@
 //! answers the ABI itself gives, never through a number that used to be
 //! the design.
 
+pub mod config;
 pub mod field;
 pub mod files;
 pub mod finder;
 pub mod rank;
 
+use crate::config::Config;
 use crate::field::FieldView;
-use crate::files::{Limits, Scan};
+use crate::files::Scan;
 use crate::finder::{Finder, Outcome};
 use crate::rank::Source;
 use nacelle::focus::{Key, KeyEv, Mods};
@@ -96,7 +101,13 @@ const WHERE_SEP: &str = " \u{2014} ";
 /// nothings, because "type something", "still looking" and "there is no
 /// such thing" are three different answers and one line for all three
 /// would be a lie in two of them.
+///
+/// The invitation has two forms for the same reason: a panel whose file
+/// walk is switched off in `addons/search.ron` still searches
+/// applications, and offering files it will not look for would be the
+/// fourth lie.
 const SAY_START: &str = "type to search applications and files";
+const SAY_START_APPS: &str = "type to search applications";
 const SAY_WORKING: &str = "searching\u{2026}";
 const SAY_NOTHING: &str = "nothing found";
 
@@ -281,12 +292,27 @@ pub struct Search {
     /// last draw recorded for the input that arrives without any.
     list: ListState,
     hits: Hits,
-    /// The home walk in flight, if one is.
+    /// The file walk in flight, if one is.
     scan: Option<Scan>,
     /// The home directory, resolved once: the environment does not
     /// change under a running desktop, and a widget that re-read it per
     /// frame would be pretending it might.
+    ///
+    /// This is the home a PATH IS READ AGAINST — the `~` in a row — and
+    /// not where the walk starts. They are the same on an unconfigured
+    /// machine and must not be the same field: a walk rooted at `/data`
+    /// would otherwise print `~/notes` for `/data/notes`.
     home: Option<PathBuf>,
+    /// What the user asked of the walk, and the root it resolves to.
+    /// Both are re-read when [`nacelle::settings::epoch`] moves and
+    /// never in between: a settings file is parsed when it changes, not
+    /// once a frame.
+    cfg: Config,
+    cfg_epoch: u32,
+    /// Where the walk starts, or `None` for a panel that is to do no
+    /// walking. Resolved with the settings so that a root the panel
+    /// cannot use is reported once rather than per query.
+    root: Option<PathBuf>,
     /// What the last draw settled on, for the click and the wheel — both
     /// arrive between frames with no geometry and no clock of their own.
     field_r: Rect,
@@ -314,6 +340,18 @@ impl Search {
     pub fn new() -> Search {
         let apps = desktop::scan();
         eprintln!("search: {} applications found", apps.len());
+        // Read before the first frame, exactly once. A host that has not
+        // installed the settings directories — or one older than the
+        // settings entries — answers the type's own defaults, which are
+        // what this panel did before it could be asked. Running on the
+        // defaults is fine; running on them WITHOUT SAYING SO, under a
+        // machine whose owner wrote a settings file, is not — see
+        // `config::unread`.
+        let (cfg, origin) = nacelle::settings::load::<Config>("search", "");
+        if let Some(say) = config::unread(origin) {
+            eprintln!("{say}");
+        }
+        let root = cfg.root();
         Search {
             finder: Finder::new(apps),
             field: FieldView::new(),
@@ -321,6 +359,15 @@ impl Search {
             hits: Hits::new(),
             scan: None,
             home: files::home(),
+            // Zero is the settings module's own word for "I have never
+            // read" — its epoch starts at 1 — so the first frame reads
+            // again and finds nothing changed. That one extra parse is
+            // what makes a file written BETWEEN this load and the first
+            // frame impossible to miss, and it is the cheapest way to
+            // have no window at all.
+            cfg_epoch: 0,
+            root,
+            cfg,
             field_r: Rect::new(0.0, 0.0, 0.0, 0.0),
             list_r: Rect::new(0.0, 0.0, 0.0, 0.0),
             pitch: 0.0,
@@ -341,6 +388,36 @@ impl Search {
             menu: None,
             stamp: desktop::stamp(),
             chrome_right: Vec::new(),
+        }
+    }
+
+    /// Re-reads `addons/search.ron` when — and only when — the host says
+    /// it may have moved.
+    ///
+    /// The gate is a `u32` comparison. Parsing a document per frame is
+    /// not a thing a widget can afford, and never re-reading one is a
+    /// settings window whose Apply changes nothing on screen.
+    fn settings(&mut self) {
+        let epoch = nacelle::settings::epoch();
+        if epoch == self.cfg_epoch {
+            return;
+        }
+        self.cfg_epoch = epoch;
+        let cfg = nacelle::settings::load::<Config>("search", "").0;
+        if cfg == self.cfg {
+            return;
+        }
+        self.cfg = cfg;
+        self.root = self.cfg.root();
+        // The files on screen were found under the old settings, so they
+        // are dropped rather than left to age: a walk that is now off,
+        // or rooted somewhere else, has no business still showing its
+        // last answer. The applications half is untouched — nothing here
+        // has an opinion about it.
+        self.scan = None;
+        self.finder.set_files(Vec::new());
+        if !self.finder.query().is_empty() {
+            self.search();
         }
     }
 
@@ -389,8 +466,8 @@ impl Search {
         // this one — every one of them is a file that exists and whose
         // name matches, so they are shown rather than blanked while the
         // walk catches up. When it answers they are replaced whole.
-        if let Some(home) = self.home.clone() {
-            self.scan = Some(Scan::start(home, q, Limits::default()));
+        if let Some(root) = self.root.clone() {
+            self.scan = Some(Scan::start(root, q, self.cfg.limits()));
         }
     }
 
@@ -511,7 +588,14 @@ impl Search {
     /// The line a panel with nothing to list draws instead of a hole.
     fn nothing(&self, sf: &mut impl Surface, r: Rect, look: &Look) {
         let say = if self.finder.query().is_empty() {
-            SAY_START
+            // What this panel will actually look at, which is not always
+            // both sources: `files: false` — and a machine whose `$HOME`
+            // this build will not guess at — leave it the applications.
+            if self.root.is_some() {
+                SAY_START
+            } else {
+                SAY_START_APPS
+            }
         } else if self.finder.armed() || self.scan.is_some() {
             SAY_WORKING
         } else {
@@ -536,6 +620,9 @@ impl Search {
         let mut sf = AbiSurface::new(api, ctx);
         self.hits.clear();
         self.now = sf.now();
+        // Before anything this frame does with the walk: a query that
+        // settles below must run under the settings as they now are.
+        self.settings();
         let look = Look::read(&mut sf);
         self.pitch = look.pitch;
         self.physics = ScrollPhysics::read(&mut sf);

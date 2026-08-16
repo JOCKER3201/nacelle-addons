@@ -1,7 +1,15 @@
 //! FILESYSTEM panel — icon grid like eDEX-UI, tracks the shell's working
 //! directory (from /proc/<pid>/cwd); clicking a directory cds the active
 //! terminal tab, clicking a file opens it with the associated application.
+//!
+//! What it lists, how it sorts, whether it follows the terminal at all
+//! and where it opens are the user's — [`config`], read from
+//! `addons/filesystem.ron`. Everything about how any of it LOOKS stays
+//! the theme's.
 
+pub mod config;
+
+use crate::config::Config;
 use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_CAPTURE,
     ACTION_NONE, ACTION_OPEN_DIR, ACTION_OPEN_FILE, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
@@ -14,6 +22,7 @@ use nacelle::view::scroll::{
 };
 use nacelle::view::virt;
 use nacelle::Rect;
+use std::cmp::Ordering;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -762,10 +771,18 @@ pub struct Filesystem {
     /// next `chrome` call — the same lifetime promise `last_path` makes
     /// for the click path.
     chrome_right: Vec<u8>,
+    /// What the user asked of the panel, re-read when
+    /// [`nacelle::settings::epoch`] moves and never in between: a
+    /// settings file is parsed when it changes, not once a frame.
+    cfg: Config,
+    cfg_epoch: u32,
 }
 
 impl Filesystem {
-    pub fn new(start: PathBuf) -> Self {
+    /// `start` is where the panel opens, which [`Config::start`] decides
+    /// — passed in rather than read here so that the tests below can
+    /// point a panel at a directory without writing a settings file.
+    pub fn new(start: PathBuf, cfg: Config) -> Self {
         let mut fs = Filesystem {
             cwd: start,
             entries: Vec::new(),
@@ -779,9 +796,39 @@ impl Filesystem {
             bar: None,
             frame_t: 0.0,
             chrome_right: Vec::new(),
+            cfg,
+            // Zero is the settings module's own word for "I have never
+            // read" — its epoch starts at 1 — so the first frame reads
+            // again and finds nothing changed. That one extra parse is
+            // what makes a file written BETWEEN `create`'s load and the
+            // first frame impossible to miss, and it is the cheapest way
+            // to have no window at all.
+            cfg_epoch: 0,
         };
         fs.refresh();
         fs
+    }
+
+    /// Re-reads `addons/filesystem.ron` when — and only when — the host
+    /// says it may have moved.
+    ///
+    /// The gate is a `u32` comparison. Parsing a document per frame is
+    /// not a thing a widget can afford, and never re-reading one is a
+    /// settings window whose Apply changes nothing on screen.
+    fn settings(&mut self) {
+        let epoch = nacelle::settings::epoch();
+        if epoch == self.cfg_epoch {
+            return;
+        }
+        self.cfg_epoch = epoch;
+        let cfg = nacelle::settings::load::<Config>("filesystem", "").0;
+        let relist = cfg.relists(&self.cfg);
+        self.cfg = cfg;
+        if relist {
+            // The directory stays; what it SHOWS is what changed, so the
+            // scroll is left where the reader put it.
+            self.refresh();
+        }
     }
 
     pub fn refresh(&mut self) {
@@ -789,6 +836,11 @@ impl Filesystem {
         self.entries.clear();
         self.error = None;
         if self.cwd.parent().is_some() {
+            // The way out is not an entry of the directory and no
+            // setting hides it: `..` begins with two dots, but it is
+            // navigation rather than a file, and a panel that could
+            // strand a reader in a directory would be a worse panel than
+            // one that shows two more characters than they asked for.
             self.entries.push(Entry {
                 name: "..".into(),
                 is_dir: true,
@@ -797,9 +849,16 @@ impl Filesystem {
         }
         match std::fs::read_dir(&self.cwd) {
             Ok(rd) => {
+                let hidden = self.cfg.hidden;
                 let mut list: Vec<Entry> = rd
                     .flatten()
                     .filter_map(|e| {
+                        // Asked before the metadata call, so a directory
+                        // full of dot files costs nothing to leave out.
+                        if !hidden && e.file_name().as_encoded_bytes().first() == Some(&b'.')
+                        {
+                            return None;
+                        }
                         let ft = e.file_type().ok()?;
                         let is_link = ft.is_symlink();
                         // Follow links (symbolic and otherwise): the target's
@@ -814,10 +873,16 @@ impl Filesystem {
                         })
                     })
                     .collect();
+                let dirs_first = self.cfg.directories_first;
                 list.sort_by(|a, b| {
-                    b.is_dir
-                        .cmp(&a.is_dir)
-                        .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                    // Kind first, then name — or name alone, for a
+                    // reader to whom the kinds do not matter. The name
+                    // comparison is the same either way: it is what
+                    // makes the order total, so nothing here can depend
+                    // on what `read_dir` happened to answer.
+                    let kind =
+                        if dirs_first { b.is_dir.cmp(&a.is_dir) } else { Ordering::Equal };
+                    kind.then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
                 });
                 self.entries.extend(list);
             }
@@ -1549,10 +1614,18 @@ fn draw_file_icon(
 // ----------------------------------------------------------- plugin
 
 extern "C" fn create() -> *mut c_void {
-    let start = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"));
-    Box::into_raw(Box::new(Filesystem::new(start))) as *mut c_void
+    // Read before the first frame, exactly once. A host that has not
+    // installed the settings directories — or one older than the
+    // settings entries — answers the type's own defaults, which are what
+    // this panel did before it could be asked. Running on the defaults
+    // is fine; running on them WITHOUT SAYING SO, under a machine whose
+    // owner wrote a settings file, is not — see `config::unread`.
+    let (cfg, origin) = nacelle::settings::load::<Config>("filesystem", "");
+    if let Some(say) = config::unread(origin) {
+        eprintln!("{say}");
+    }
+    let start = cfg.start();
+    Box::into_raw(Box::new(Filesystem::new(start, cfg))) as *mut c_void
 }
 
 extern "C" fn destroy(instance: *mut c_void) {
@@ -1572,15 +1645,25 @@ extern "C" fn draw_c(
     r: RectC,
 ) {
     let (Some(api), Some(this)) = (host(), state(instance)) else { return };
+    // Before the frame reads any of it.
+    this.settings();
     // Follow the active shell before drawing, the way this panel always
-    // has: a cd typed in the terminal moves the panel with it.
-    let mut buf = [0u8; 4096];
-    let n = (api.shell_cwd)(host_data, buf.as_mut_ptr(), buf.len() as u32) as usize;
-    if n > 0 {
-        if let Ok(path) = std::str::from_utf8(&buf[..n]) {
-            this.follow(Some(PathBuf::from(path)));
+    // has: a cd typed in the terminal moves the panel with it — unless
+    // the user asked it not to, in which case the shell is not even
+    // asked. `follow` is still called: the periodic re-read of the
+    // current directory is its other half, and a panel pinned to one
+    // directory still has to notice what happens in it.
+    let mut cwd = None;
+    if this.cfg.follow_shell {
+        let mut buf = [0u8; 4096];
+        let n = (api.shell_cwd)(host_data, buf.as_mut_ptr(), buf.len() as u32) as usize;
+        if n > 0 {
+            if let Ok(path) = std::str::from_utf8(&buf[..n]) {
+                cwd = Some(PathBuf::from(path));
+            }
         }
     }
+    this.follow(cwd);
     this.draw(api, ctx, Rect::new(r.x, r.y, r.w, r.h));
 }
 
@@ -1663,11 +1746,18 @@ extern "C" fn chrome_c(
     else {
         return 0;
     };
-    let mut buf = [0u8; 4096];
-    let n = (api.shell_cwd)(host_data, buf.as_mut_ptr(), buf.len() as u32) as usize;
-    if n > 0 {
-        if let Ok(path) = std::str::from_utf8(&buf[..n]) {
-            this.follow(Some(PathBuf::from(path)));
+    // The band is asked before the draw, so it follows the shell here
+    // too — and stops following it here too, for the same setting. The
+    // band must name the directory the tiles below it are FROM, and two
+    // different answers to "which directory" is the one thing it cannot
+    // do.
+    if this.cfg.follow_shell {
+        let mut buf = [0u8; 4096];
+        let n = (api.shell_cwd)(host_data, buf.as_mut_ptr(), buf.len() as u32) as usize;
+        if n > 0 {
+            if let Ok(path) = std::str::from_utf8(&buf[..n]) {
+                this.follow(Some(PathBuf::from(path)));
+            }
         }
     }
     this.chrome_right = format!("{}", this.cwd.display()).into_bytes();
@@ -1837,7 +1927,7 @@ mod tests {
     /// the scroll and nothing else. No test of this file touches a
     /// directory that exists.
     fn widget() -> Filesystem {
-        Filesystem::new(PathBuf::from("/nonexistent/nacelle-scroll-test"))
+        Filesystem::new(PathBuf::from("/nonexistent/nacelle-scroll-test"), Config::default())
     }
 
     fn bar() -> Bar {
@@ -1847,6 +1937,46 @@ mod tests {
             track: Rect::new(90.0, 0.0, 6.0, 100.0),
             thumb: Rect::new(90.0, 0.0, 6.0, 20.0),
         }
+    }
+
+    /// What the two listing settings actually do to a directory, on a
+    /// tree of this test's own so that nobody's home decides the answer.
+    ///
+    /// It is the only test here that reads a directory it made, and it
+    /// is here rather than beside the `Config` type because the rules
+    /// live in `refresh`: a setting nothing acts on is the failure this
+    /// catches.
+    #[test]
+    fn the_listing_settings_decide_what_the_directory_shows() {
+        let root = std::env::temp_dir()
+            .join(format!("nacelle-fs-listing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("zdir")).unwrap();
+        std::fs::write(root.join("afile"), b"x").unwrap();
+        std::fs::write(root.join(".dotfile"), b"x").unwrap();
+
+        let names = |cfg: Config| -> Vec<String> {
+            let fs = Filesystem::new(root.clone(), cfg);
+            assert!(fs.error.is_none(), "the panel could not read its own tree");
+            // `..` is navigation and is never a setting's business; the
+            // entries are what the settings decide.
+            fs.entries.iter().skip(1).map(|e| e.name.clone()).collect()
+        };
+
+        // The defaults are what this panel always did: everything shown,
+        // directories gathered above files.
+        assert_eq!(names(Config::default()), ["zdir", ".dotfile", "afile"]);
+
+        // Hidden off drops the dot file and nothing else.
+        let cfg = Config { hidden: false, ..Config::default() };
+        assert_eq!(names(cfg), ["zdir", "afile"]);
+
+        // Without the gathering, the order is the names alone — which is
+        // what puts a directory called `zdir` last.
+        let cfg = Config { directories_first: false, ..Config::default() };
+        assert_eq!(names(cfg), [".dotfile", "afile", "zdir"]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2091,7 +2221,8 @@ mod badge_shape_tests {
             rect: rec_rect,
             ..*nacelle::plugin::host_api()
         };
-        let mut fs = Filesystem::new(PathBuf::from("/nonexistent/nacelle-badge-test"));
+        let mut fs =
+            Filesystem::new(PathBuf::from("/nonexistent/nacelle-badge-test"), Config::default());
         assert!(fs.error.is_some(), "the panel found no error to badge");
         RINGS.with(|v| v.borrow_mut().clear());
         RECTS.with(|v| v.borrow_mut().clear());
@@ -2186,7 +2317,7 @@ mod tile_shape_tests {
             quad: rec_quad,
             ..*nacelle::plugin::host_api()
         };
-        let mut fs = Filesystem::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let mut fs = Filesystem::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), Config::default());
         assert!(fs.error.is_none(), "the panel could not read its own crate");
         assert!(!fs.entries.is_empty(), "no tile to draw");
         SHAPES.with(|v| v.borrow_mut().clear());

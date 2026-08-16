@@ -32,7 +32,11 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 
 /// How far a walk may go before it stops, whatever it has found.
-#[derive(Clone, Copy, Debug)]
+///
+/// Comparable because the settings are: [`crate::config`] reads its own
+/// defaults off this type, and the test that says so has to be able to
+/// ask whether the two agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Directories below the root. 0 walks the root itself only.
     pub depth: u32,

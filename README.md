@@ -94,6 +94,113 @@ application drives them identically and knows neither by name. The
 file's stem is the addon's name, and that is what ties it to its place
 in a layout.
 
+## Settings
+
+What an addon *looks like* is the theme's, always. What it *does* on
+your machine — which directory it walks, how much of it, whether it
+follows the terminal — is yours, and it lives in one file per addon:
+
+```
+~/.config/nacelle/addons/<name>.ron      your own
+/etc/xdg/nacelle/addons/<name>.ron       the packaged answer
+```
+
+The name of the file is the name of the addon. An addon that needs a
+*second* settings file gets a directory of that name instead; none of
+the ones shipped here does. The first file found is the whole answer —
+your file replaces the packaged one rather than merging with it — and
+**every key is optional**: one you do not write keeps the default below,
+so a file stating a single line is a complete and correct file. A key
+this version has never heard of is ignored, so a file written for a
+later one still loads.
+
+A file the program cannot use is *reported* — the path and the position
+— and the addon runs on its defaults until it is fixed. It is never
+ignored in silence, because a widget that quietly looks factory-fresh
+gives you no reason to suspect the file you just edited. Two failures
+count as one file: a document that is not RON at all, and a document
+that is RON and says something the addon has no room for — `hidden:
+"yes"` where a yes-or-no goes. The second is the likelier of the two
+and the one nothing but the addon can see, so it is reported by the
+same rule rather than left to a shrug.
+
+It is reported in two places. On **stderr**, once, which is where it
+is of use to anybody starting the program from a terminal; and in the
+**settings window**, under `SETTINGS — ADDONS`, which is where it is
+of use to everybody else — a desktop session's stderr goes to a
+journal nobody has open. That page names the directory your files go
+in, lists every one the program could not use, and says so plainly
+when there is nothing to report. It only ever *shows*: these files are
+written by hand, and no settings window edits them yet. When one does,
+it will save through the toolkit, which leaves the previous contents
+in `<name>.ron.bak`.
+
+Everything standing in those directories is read once at startup,
+rather than only when the addon that owns it is asked to draw. What
+the program can judge on its own — whether the file is a document at
+all — is therefore judged for every file that exists, including one
+belonging to a widget you have not placed on any board. Whether the
+document *fits* is the addon's own reading, so that half arrives when
+the addon first runs, and joins the same report.
+
+A desktop that delivers no addon settings *at all* — one older than
+these files, or one that has not been wired to them — is the worse
+failure and gets a line of its own on that page and on stderr, because
+it has no bad files to list and is ignoring every file on the machine.
+
+Two of the shipped addons have settings. The others have none, and no
+file: an empty settings file is a promise that something can be set.
+
+### `filesystem.ron` — the file browser
+
+| key | meaning | default |
+|---|---|---|
+| `start` | the directory the panel opens in; `~` is expanded, empty means your home | `""` |
+| `follow_shell` | walk with the active terminal tab's working directory | `true` |
+| `hidden` | list entries whose name begins with a dot | `true` |
+| `directories_first` | gather directories above files; otherwise sort by name alone | `true` |
+
+```ron
+// ~/.config/nacelle/addons/filesystem.ron
+(
+    hidden: false,
+    start: "~/work",
+)
+```
+
+`start` is read when the panel is created and not again: it says where
+browsing *begins*, and re-reading it would pull you out of wherever you
+had got to. Everything else takes effect at once.
+
+### `search.ron` — the search panel
+
+The applications half needs no settings: it shows what the freedesktop
+specification says is installed. Everything here is about the file walk.
+
+| key | meaning | default |
+|---|---|---|
+| `files` | walk the filesystem at all; `false` leaves you the applications | `true` |
+| `root` | where the walk starts; `~` is expanded, empty means your home | `""` |
+| `depth` | directories below the root; `0` walks the root itself only | `8` |
+| `hits` | how many files one walk keeps before it stops | `200` |
+| `visited` | how many entries it may look at before giving up on the rest | `20000` |
+
+```ron
+// ~/.config/nacelle/addons/search.ron
+(
+    root: "~/projects",
+    depth: 4,
+)
+```
+
+The walk always refuses hidden directories and symlinks, whatever the
+root — `.git` and `node_modules` are not answers anybody wants, and a
+link is not a place.
+
+The Rhai scripts in `scripts/` have no settings files: the script host
+has no entry to hand one over with, so a script is edited directly, which
+is what a script is for.
+
 > **THIS PROJECT WAS WRITTEN ENTIRELY BY ANTHROPIC'S CLAUDE AI MODELS.**
 
 > **Compiled `.so` addons are native code with the program's full

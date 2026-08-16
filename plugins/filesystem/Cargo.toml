@@ -12,6 +12,14 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
 
+# The derive for this panel's own settings type (src/config.rs). The
+# document is parsed by `nacelle::settings::load`, so `ron` is not a
+# dependency here — only the type it deserialises into is this crate's.
+# Costs no new package: serde is already in the tree, and its derive
+# brings proc-macro2, quote and syn, all of which rhai_codegen already
+# locked.
+serde = { version = "1", features = ["derive"] }
+
 [features]
 # The dlopen attach symbol. On for the shipped .so; a host that links
 # this crate statically turns it off, so several plugins' identical
