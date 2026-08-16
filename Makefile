@@ -55,7 +55,7 @@ RELDIR     = $(TARGETDIR)/release
 # widget crate means adding its name here and nowhere else.
 # launcher-core is deliberately absent: it is the launcher's shared
 # half, not a widget, and it has no attach symbol to export.
-PLUGINS = ai appcats appgrid control filesystem keyboard search shell
+PLUGINS = aichat ailoop aiphoto aisort appcats appgrid control filesystem keyboard search shell
 
 .PHONY: all plugins install install-scripts install-plugins uninstall clean
 

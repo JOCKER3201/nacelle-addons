@@ -1,0 +1,41 @@
+[package]
+name = "nacelle-widget-aisort"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "The nacelle-desktop AI SORT panel: file sorting through the nacelle-ai daemon"
+license = "MIT"
+
+[lib]
+# A widget plugin is a C-callable dynamic library: the host loads it with
+# dlopen and talks to it through plain function pointers.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
+
+# The daemon protocol's client half — the shared floor all four AI
+# widgets stand on, the way launcher-core is the launcher's. One socket,
+# JSON Lines, no threads; this crate never spells a protocol byte of its
+# own.
+nacelle-ai-client = { path = "../ai-client" }
+
+# The tool call's `args` object, built with the same escaper the client
+# crate frames commands with. Already in this tree's dependency graph
+# through libnacelle and ai-client, so linking it here adds nothing new.
+serde_json = "1"
+
+[features]
+# The dlopen attach symbol. On for the shipped .so; a host that links
+# this crate statically turns it off, so several plugins' identical
+# attach symbols cannot collide inside one binary.
+default = ["dyn"]
+dyn = []
+
+# LOCAL BUILD PATCH — this crate is a member of the nacelle-addons
+# workspace, and cargo honours `[patch]` at the workspace ROOT only ("patch
+# for the non root package will be ignored"). The block that builds this
+# tree against a libnacelle checkout beside it is passed on the command
+# line instead (cargo --config 'patch."...".libnacelle.path="..."');
+# the workspace root carries no such block, and a copy here would be a
+# warning on every build and no effect at all.

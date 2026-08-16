@@ -8,10 +8,12 @@
 # widget interface (`pointer`) instead of holding a copy of anybody's
 # geometry.
 #
-# The one crate that is NOT a widget is plugins/launcher-core: the
-# launcher's shared half, which both launcher widgets link and neither
-# owns. It exports no attach symbol and installs nothing, so no .so in
-# this tree ever carries two entry points.
+# Two crates are NOT widgets: plugins/launcher-core, the launcher's
+# shared half, which both launcher widgets link and neither owns; and
+# plugins/ai-client, the nacelle-ai daemon protocol's client half, which
+# the AI widgets link to speak to the daemon. Neither exports an attach
+# symbol and neither installs anything, so no .so in this tree ever
+# carries two entry points.
 #
 # Every widget crate also builds with its `dyn` feature off, which
 # drops the dlopen attach symbol and leaves the crate linkable — the
@@ -21,7 +23,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "plugins/ai",
+    "plugins/ai-client",
+    "plugins/aichat",
+    "plugins/ailoop",
+    "plugins/aiphoto",
+    "plugins/aisort",
     "plugins/appcats",
     "plugins/appgrid",
     "plugins/control",

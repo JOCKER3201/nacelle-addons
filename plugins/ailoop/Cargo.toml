@@ -1,0 +1,45 @@
+[package]
+name = "nacelle-widget-ailoop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "The nacelle-desktop media-loop widget — a video in, a seamless loop out, through the nacelle-ai daemon"
+license = "MIT"
+
+[lib]
+# A widget plugin is a C-callable dynamic library: the host loads it with
+# dlopen and talks to it through plain function pointers.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
+
+# The daemon protocol's client half, shared by every AI widget: one
+# socket, JSON Lines, no threads. This widget never spells a byte of the
+# wire itself — the five commands and six events live in ONE crate for
+# the four panels that speak them.
+nacelle-ai-client = { path = "../ai-client" }
+
+# For the `tool` command's args object and for reading a `done` event's
+# body. Already in the tree twice over (libnacelle and ai-client), so
+# this line adds no new package.
+serde_json = "1"
+
+# NO nacelle-launcher-core here — this panel launches nothing and scans
+# no menu. What it talks to is the daemon, and the daemon's client is
+# the one dependency above.
+
+[features]
+# The dlopen attach symbol. On for the shipped .so; a host that links
+# this crate statically turns it off, so several plugins' identical
+# attach symbols cannot collide inside one binary.
+default = ["dyn"]
+dyn = []
+
+# LOCAL BUILD PATCH — this crate is a member of the nacelle-addons
+# workspace, and cargo honours `[patch]` at the workspace ROOT only ("patch
+# for the non root package will be ignored"). The block that builds this
+# tree against a libnacelle checkout beside it is passed on the command
+# line instead (cargo --config 'patch."...".libnacelle.path="..."');
+# the workspace root carries no such block, and a copy here would be a
+# warning on every build and no effect at all.

@@ -1,0 +1,28 @@
+[package]
+name = "nacelle-ai-client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "The nacelle-ai daemon protocol's client half: one socket, JSON Lines, no threads"
+license = "MIT"
+
+[lib]
+# An `rlib` and nothing else, deliberately — the same shape as
+# launcher-core and for the same reason. This crate is not an addon: it
+# exports no `nacelle_plugin_attach`, no `WIDGET`, and there is no
+# `ai-client.so` to install. It is the code the AI widgets are BUILT
+# OUT OF, so that four panels talking to one daemon carry one protocol
+# between them instead of four copies of it.
+crate-type = ["rlib"]
+
+[dependencies]
+# The same JSON the toolkit itself parses themes with — already in this
+# tree's dependency graph through libnacelle, so linking it here adds
+# nothing new to the tree. Used for string escaping on the way out and
+# for reading the daemon's event lines on the way in.
+serde_json = "1"
+
+# getuid, for the socket's fallback path (/tmp/nacelle-$UID) on a
+# system without XDG_RUNTIME_DIR. The same crate the toolkit already
+# builds on every unix, so this too adds nothing new.
+libc = "0.2"

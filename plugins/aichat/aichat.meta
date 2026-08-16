@@ -1,0 +1,47 @@
+# The AI chat panel.
+#
+# The addon's own metadata, installed beside aichat.so and read INSTEAD
+# of it: the host has to know what a widget IS before it decides to
+# load anybody's code. The crate includes these very bytes when it is
+# linked into the program rather than shipped as a file, so the two can
+# never drift.
+#
+#   label      the name the layout editor shows (default: the file
+#              stem in capitals)
+#   ref_h      height in vh at which the widget draws at 100% scale
+#   min_h      height in vh below which its last content row would
+#              leave the screen
+#   category   board (the default), appgrid or search_and_ai — the
+#              kind of board this widget may be placed on
+#   slot       left, center or right — which column of a GENERATED
+#              arrangement this widget asks for (default: whichever
+#              side has room). There is no table of widgets in the
+#              program: where a widget stands is what it says here
+#   order      where in that column, lowest first
+#   weight     how much of a shared column it wants (default: as
+#              much of it as the widget is tall)
+#   anchor     top, bottom or bar — a pinned edge of the arrangement
+#              instead of flowing with the column
+#   essential  true: switching this widget off would leave the user
+#              no way back, so the editor never offers to remove it
+#
+# Everything is optional: an addon that names nothing is still an
+# addon, and what it does not name it does not lose.
+#
+# HOW THE FIVE SHARE THE BOARD. The search panel names no slot, so it
+# keeps the middle it has always floated to; the three AI tools (loop,
+# photo, sort) are small request panels and ask for the LEFT column; a
+# CONVERSATION is the one thing up here that is read at length, so this
+# panel asks for the RIGHT column and, through its weight, for the
+# lion's share of it. The heights are search's own pair: at ref_h the
+# transcript holds a screenful of turns over the query box; at min_h
+# the box and one wrapped turn still fit, and a chat with nowhere to
+# show its first answer is not a chat.
+
+label = CHAT
+ref_h = 30.0
+min_h = 9.0
+category = search_and_ai
+slot = right
+order = 10
+weight = 2
