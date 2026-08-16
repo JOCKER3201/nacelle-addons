@@ -260,6 +260,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "nacelle-ai-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "nacelle-launcher-core"
 version = "0.1.0"
 dependencies = [
@@ -268,10 +276,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "nacelle-widget-ai"
+name = "nacelle-widget-aichat"
 version = "0.1.0"
 dependencies = [
  "libnacelle",
+ "nacelle-ai-client",
+]
+
+[[package]]
+name = "nacelle-widget-ailoop"
+version = "0.1.0"
+dependencies = [
+ "libnacelle",
+ "nacelle-ai-client",
+ "serde_json",
+]
+
+[[package]]
+name = "nacelle-widget-aiphoto"
+version = "0.1.0"
+dependencies = [
+ "libnacelle",
+ "nacelle-ai-client",
+ "serde_json",
+]
+
+[[package]]
+name = "nacelle-widget-aisort"
+version = "0.1.0"
+dependencies = [
+ "libnacelle",
+ "nacelle-ai-client",
+ "serde_json",
 ]
 
 [[package]]
