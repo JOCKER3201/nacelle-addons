@@ -46,7 +46,7 @@ use nacelle::widget::factory::BuiltinWidget;
 use nacelle_launcher_core::desktop::AppEntry;
 use nacelle_launcher_core::sections::{HeadLook, HeadTheme, Section};
 use nacelle_launcher_core::selection::{Selection, Watch};
-use nacelle_launcher_core::tile::{Rect, TileLook, TileTheme};
+use nacelle_launcher_core::tile::{EmptyLook, EmptyTheme, Rect, TileLook, TileTheme};
 use nacelle_launcher_core::{cats, desktop, sections, tile};
 use std::ffi::c_void;
 use std::time::Instant;
@@ -69,6 +69,10 @@ fn host() -> Option<&'static HostApi> {
 struct Look {
     tile: TileLook,
     head: HeadLook,
+    /// The line this grid draws INSTEAD of its tiles. Its own look,
+    /// because "the panel has nothing to show" is its own kind of
+    /// element and the master answers it once, in `emptystate.role`.
+    empty: EmptyLook,
 }
 
 pub struct Appgrid {
@@ -103,7 +107,7 @@ pub struct Appgrid {
     last_look: Instant,
     stamp: u64,
     /// Resolved token ids, re-resolved whenever the theme epoch moves.
-    theme: Option<(TileTheme, HeadTheme)>,
+    theme: Option<(TileTheme, HeadTheme, EmptyTheme)>,
     /// `filetile.wheel_px`, cached at draw because a wheel event
     /// arrives with no drawing context to ask the theme through.
     wheel_px: f32,
@@ -234,19 +238,35 @@ impl Appgrid {
         // day the check moves — an old table simply ends before these
         // entries do.
         if api.abi_version < 5 {
-            return Look { tile: TileLook::raw(), head: HeadLook::raw() };
+            return Look {
+                tile: TileLook::raw(),
+                head: HeadLook::raw(),
+                empty: EmptyLook::raw(),
+            };
         }
         let epoch = (api.theme_epoch)(ctx);
-        if self.theme.as_ref().map(|(t, _)| t.epoch) != Some(epoch) {
-            self.theme =
-                Some((TileTheme::resolve(api, ctx, epoch), HeadTheme::resolve(api, ctx, epoch)));
+        if self.theme.as_ref().map(|(t, _, _)| t.epoch) != Some(epoch) {
+            self.theme = Some((
+                TileTheme::resolve(api, ctx, epoch),
+                HeadTheme::resolve(api, ctx, epoch),
+                EmptyTheme::resolve(api, ctx, epoch),
+            ));
         }
         match &self.theme {
-            Some((t, h)) => {
+            Some((t, h, e)) => {
                 debug_assert_eq!(t.epoch, h.epoch);
-                Look { tile: TileLook::read(api, ctx, t), head: HeadLook::read(api, ctx, h) }
+                debug_assert_eq!(t.epoch, e.epoch);
+                Look {
+                    tile: TileLook::read(api, ctx, t),
+                    head: HeadLook::read(api, ctx, h),
+                    empty: EmptyLook::read(api, ctx, e),
+                }
             }
-            None => Look { tile: TileLook::raw(), head: HeadLook::raw() },
+            None => Look {
+                tile: TileLook::raw(),
+                head: HeadLook::raw(),
+                empty: EmptyLook::raw(),
+            },
         }
     }
 
@@ -263,23 +283,22 @@ impl Appgrid {
             // Nothing found is not an error — a machine can honestly
             // have no menu, and a category can honestly be emptied by
             // the uninstall that happened between two frames — so it
-            // says so in the caption role rather than in a critical
-            // pill.
-            let name_px = look.tile.caption_px;
-            let name_sp = name_px * look.tile.caption_tracking;
-            let text = tile::recase(look.tile.caption_case, "no applications".to_string());
-            // `emptystate.y_frac` says where in the box the line sits;
-            // the role's own leading is what centres the line box on it
-            // rather than hanging it below.
-            tile::draw_text(
+            // says so in a line rather than in a critical pill.
+            //
+            // In `emptystate.role`, which is the master's answer for
+            // every panel that has nothing to show. It used to be the
+            // tile CAPTION's role, which drew this sentence at 9.6 px
+            // while the categories list beside it drew the same sentence
+            // at 13.3 px and the search panel drew it at 17.6 px.
+            tile::empty_line(
                 api,
                 ctx,
-                name_px,
-                r.cx(),
-                r.y + r.h * look.tile.empty_y - name_px * look.tile.caption_leading / 2.0,
-                &text,
-                look.tile.idle.text,
-                name_sp,
+                &look.empty,
+                r,
+                "no applications",
+                // The grid's own resting ink, so the line reads as part
+                // of the surface the tiles would have covered.
+                Some(look.tile.idle.text),
             );
             return;
         }

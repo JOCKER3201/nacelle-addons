@@ -606,6 +606,7 @@ impl Search {
         // than hanging it below.
         let y = r.y + r.h * look.empty_y - look.empty.px * look.empty.leading / 2.0;
         sf.text(
+            look.empty.face,
             look.empty.px,
             r.cx(),
             y,

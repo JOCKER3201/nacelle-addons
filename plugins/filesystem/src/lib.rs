@@ -32,7 +32,6 @@ use std::time::Instant;
 /// clamps anything past them, so a slot is chosen by the WORD a role's
 /// `face` names and never by an index into the theme's eight faces.
 const FONT_UI: u32 = 0;
-const FONT_MONO: u32 = 1;
 
 /// Which view a tooltip request comes from. This panel draws one grid,
 /// so it has one; the number goes into the request's id, which only has
@@ -136,15 +135,13 @@ fn role_id(api: &HostApi, role: &str, suffix: &str) -> u32 {
     }
 }
 
-/// The font slot a role's `face` names. A face is an OPEN word set, so
-/// it is read as a WORD: the boundary carries two slots and clamps
-/// anything past them, which would turn `display` into monospace.
+/// The font slot a role's `face` names. A face is a CLOSED word set of
+/// eight, read as a WORD and turned into a slot by the toolkit's own
+/// `nacelle::font::face_slot` — the one place that holds the master's
+/// numbering, so this side and the toolkit's side cannot answer "which
+/// family is this role" differently.
 fn face_slot(api: &HostApi, ctx: *mut c_void, id: u32) -> u32 {
-    if enum_word(api, ctx, id).starts_with("mono") {
-        FONT_MONO
-    } else {
-        FONT_UI
-    }
+    nacelle::font::face_slot(&enum_word(api, ctx, id)) as u32
 }
 
 /// Token ids this widget draws from, resolved by NAME once per epoch.
@@ -173,12 +170,21 @@ struct ThemeIds {
     glyph_detail: u32,   // component.file.glyph_detail — the fold lines
     caption_dir: u32,    // text.primary
     caption_file: u32,   // text.secondary
-    // the I/O error, an alert.banner string in a solid critical pill
-    banner_size: u32,     // type.alert.banner.size
-    banner_min: u32,      // type.alert.banner.min_px
-    banner_tracking: u32, // type.alert.banner.tracking
-    banner_leading: u32,  // type.alert.banner.leading
-    banner_case: u32,     // type.alert.banner.case
+    // type.<filetile.error_role>.* — the I/O error the panel shows
+    // instead of its tiles, in a severity.critical pill. Read through
+    // the BINDING: this file spelled `type.alert.banner.*` out, which is
+    // a second binding nobody can edit — a theme moving its banners left
+    // this one behind.
+    banner_size: u32,
+    banner_min: u32,
+    banner_tracking: u32,
+    banner_leading: u32,
+    banner_case: u32,
+    /// The slot that role's `face` names, read WITH the ids because a
+    /// face is a word and reading words is init-time work. It used to be
+    /// `FONT_UI` written into the two draw calls, which is the face
+    /// decided here rather than by the role.
+    banner_font: u32,
     badge_h: u32,         // badge.h
     badge_pad: u32,       // badge.pad_x
     badge_corner: u32,    // badge.corner — a length, or §5.0's `pill`
@@ -264,6 +270,7 @@ impl ThemeIds {
         let style_word = enum_word(api, ctx, token(api, "severity.critical.badge_style"));
         // A file name's role, as the master binds it.
         let caption_role = enum_word(api, ctx, token(api, "filetile.caption_role"));
+        let error_role = enum_word(api, ctx, token(api, "filetile.error_role"));
         // Without `mask_quad` the glow cannot be drawn at all, so the
         // class is not even asked for — the same degrade as `none`.
         let glow_class = if api.has_mask_quad() {
@@ -302,11 +309,12 @@ impl ThemeIds {
             glyph_detail: token(api, "component.file.glyph_detail"),
             caption_dir: token(api, "text.primary"),
             caption_file: token(api, "text.secondary"),
-            banner_size: token(api, "type.alert.banner.size"),
-            banner_min: token(api, "type.alert.banner.min_px"),
-            banner_tracking: token(api, "type.alert.banner.tracking"),
-            banner_leading: token(api, "type.alert.banner.leading"),
-            banner_case: token(api, "type.alert.banner.case"),
+            banner_size: role_id(api, &error_role, "size"),
+            banner_min: role_id(api, &error_role, "min_px"),
+            banner_tracking: role_id(api, &error_role, "tracking"),
+            banner_leading: role_id(api, &error_role, "leading"),
+            banner_case: role_id(api, &error_role, "case"),
+            banner_font: face_slot(api, ctx, role_id(api, &error_role, "face")),
             badge_h: token(api, "badge.h"),
             badge_pad: token(api, "badge.pad_x"),
             badge_corner: token(api, "badge.corner"),
@@ -390,6 +398,7 @@ struct Look {
     banner_tracking: f32,
     banner_leading: f32,
     banner_case: u32,
+    banner_font: u32,
     badge_h: f32,
     badge_pad: f32,
     badge_corner: f32,
@@ -469,6 +478,7 @@ impl Look {
             banner_tracking: 0.0,
             banner_leading: 1.0,
             banner_case: 0,
+            banner_font: FONT_UI,
             badge_h: 0.0,
             badge_pad: 0.0,
             badge_corner: 0.0,
@@ -577,6 +587,7 @@ impl Look {
             banner_tracking: px(t.banner_tracking),
             banner_leading: px(t.banner_leading).max(1.0),
             banner_case: (api.theme_enum)(ctx, t.banner_case),
+            banner_font: t.banner_font,
             badge_h: px(t.badge_h),
             badge_pad: px(t.badge_pad),
             badge_corner: px(t.badge_corner),
@@ -1029,7 +1040,7 @@ impl Filesystem {
             let text = recase(look.banner_case, err.clone());
             let bpx = look.banner_px;
             let track = bpx * look.banner_tracking;
-            let tw = measure(api, ctx, FONT_UI, bpx, &text, track);
+            let tw = measure(api, ctx, look.banner_font, bpx, &text, track);
             let w = (tw + 2.0 * look.badge_pad).min(r.w).max(1.0);
             let h = look.badge_h.max(1.0);
             let pill = RectC {
@@ -1080,7 +1091,7 @@ impl Filesystem {
             draw_text(
                 api,
                 ctx,
-                FONT_UI,
+                look.banner_font,
                 bpx,
                 pill.x + pill.w / 2.0,
                 pill.y + (pill.h - bpx * look.banner_leading) / 2.0,
@@ -2183,6 +2194,32 @@ mod role_tests {
         let t = nacelle::theme::resolved();
         let px = t.px(nacelle::theme::id(&role_token(&role, "size").unwrap()).unwrap());
         assert!(px > 0.0);
+    }
+
+    /// The I/O error the panel shows instead of its tiles is set in the
+    /// role `filetile.error_role` names — the same chain a file name
+    /// takes. This file spelled `type.alert.banner.*` out, which is a
+    /// second binding nobody can edit: a theme moving its banners moved
+    /// the topbar's alarm (`topbar.alarm.role`) and left this one behind.
+    #[test]
+    fn the_error_banner_role_names_a_family_the_master_declares() {
+        nacelle::theme::load();
+        let id = nacelle::theme::id("filetile.error_role").expect("filetile.error_role");
+        let role = nacelle::theme::enum_word_of(id).expect("the binding names no word");
+        assert!(!role.is_empty());
+        for suffix in ["size", "min_px", "tracking", "leading", "case", "face"] {
+            let name = role_token(&role, suffix).expect("a bound role names its family");
+            assert!(nacelle::theme::id(&name).is_some(), "the master declares no {name}");
+        }
+        // A banner and a file name are two kinds of element, so the
+        // master gives them two bindings — and this test could not tell a
+        // reader that followed one from a reader that followed the other
+        // if the two landed on one role.
+        let caption = nacelle::theme::enum_word_of(
+            nacelle::theme::id("filetile.caption_role").expect("filetile.caption_role"),
+        )
+        .expect("the binding names no word");
+        assert_ne!(role, caption, "the error banner and a file name share one role");
     }
 }
 

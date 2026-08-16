@@ -202,8 +202,8 @@ pub fn draw(
     // caches this against an edit counter that is private to the model,
     // and a field is one line — three measurements a frame against the
     // hundreds a terminal cell grid already makes.
-    let caret_x = sf.measure(role.px, &disp[..caret_at], role.track);
-    let text_w = sf.measure(role.px, &disp, role.track);
+    let caret_x = sf.measure(role.face, role.px, &disp[..caret_at], role.track);
+    let text_w = sf.measure(role.face, role.px, &disp, role.track);
     let margin = sf.px("field.scroll_margin").max(0.0).min(area.w / 2.0);
     if focused {
         if caret_x - v.scroll_px > area.w - margin {
@@ -222,14 +222,14 @@ pub fn draw(
         v.scroll_px = 0.0;
         if !placeholder.is_empty() {
             let c = sf.color("component.field.placeholder");
-            sf.text(role.px, area.x, ty, placeholder, c, role.track, Align::Left);
+            sf.text(role.face, role.px, area.x, ty, placeholder, c, role.track, Align::Left);
         }
     } else {
         let ink = sf.color("component.field.text");
         // The selection wash first, under its own ink.
         if let Some((a, b)) = sel {
-            let xa = sf.measure(role.px, &disp[..a], role.track);
-            let xb = sf.measure(role.px, &disp[..b], role.track);
+            let xa = sf.measure(role.face, role.px, &disp[..a], role.track);
+            let xb = sf.measure(role.face, role.px, &disp[..b], role.track);
             let c = sf.color("component.field.selection");
             sf.rect(Rect::new(x0 + xa, ty, xb - xa, line_h), c);
         }
@@ -260,13 +260,13 @@ pub fn draw(
             if a >= b {
                 continue;
             }
-            let rx = x0 + sf.measure(role.px, &disp[..a], role.track);
+            let rx = x0 + sf.measure(role.face, role.px, &disp[..a], role.track);
             let c = if mark { marked } else { ink };
-            sf.text(role.px, rx, ty, &disp[a..b], c, role.track, Align::Left);
+            sf.text(role.face, role.px, rx, ty, &disp[a..b], c, role.track, Align::Left);
             if mark && composing && ul > 0.0 {
                 // The composition's underline, in the composition's own
                 // ink: what marks text as not yet committed.
-                let w = sf.measure(role.px, &disp[a..b], role.track);
+                let w = sf.measure(role.face, role.px, &disp[a..b], role.track);
                 sf.rect(Rect::new(rx, ty + line_h - ul, w, ul), c);
             }
         }
@@ -286,7 +286,7 @@ pub fn draw(
                 "block" | "underline" => {
                     let g = disp[caret_at.min(disp.len())..].chars().next();
                     let s = g.map(String::from).unwrap_or_else(|| " ".to_string());
-                    let gw = sf.measure(role.px, &s, role.track);
+                    let gw = sf.measure(role.face, role.px, &s, role.track);
                     if word == "block" {
                         Rect::new(cx, r.y + (r.h - ch) / 2.0, gw, ch)
                     } else {
@@ -311,7 +311,7 @@ pub fn draw(
     v.stops.clear();
     let mut at = 0usize;
     loop {
-        let w = sf.measure(role.px, &m.value()[..at], role.track);
+        let w = sf.measure(role.face, role.px, &m.value()[..at], role.track);
         v.stops.push((x0 + w, at));
         match m.value()[at..].chars().next() {
             Some(c) => at += c.len_utf8(),
@@ -352,10 +352,22 @@ mod shape_tests {
         fn rect_outline(&mut self, _r: Rect, _w: f32, _c: Color) {}
         fn line(&mut self, _x0: f32, _y0: f32, _x1: f32, _y1: f32, _w: f32, _c: Color) {}
         fn polyline(&mut self, _p: &[[f32; 2]], _w: f32, _c: Color, _closed: bool) {}
-        fn text(&mut self, _px: f32, _x: f32, _y: f32, _s: &str, _c: Color, _t: f32, _a: Align) {}
+        #[allow(clippy::too_many_arguments)]
+        fn text(
+            &mut self,
+            _face: u8,
+            _px: f32,
+            _x: f32,
+            _y: f32,
+            _s: &str,
+            _c: Color,
+            _t: f32,
+            _a: Align,
+        ) {
+        }
         /// Half an em a character: wrong about fonts, right about
         /// monotonicity, which is all the caret arithmetic asks.
-        fn measure(&mut self, px: f32, s: &str, _track: f32) -> f32 {
+        fn measure(&mut self, _face: u8, px: f32, s: &str, _track: f32) -> f32 {
             s.chars().count() as f32 * px * 0.5
         }
         fn clip(&mut self, _r: Rect) -> bool {
