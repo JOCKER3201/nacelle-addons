@@ -248,6 +248,65 @@ fn resolve_ids(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ThemeIds {
 struct Control {
     pressed: [Option<Instant>; 2],
     theme: Option<ThemeIds>,
+    /// The content box the last frame drew in, and the buttons it put
+    /// there. Input is answered against THESE, never against a fresh
+    /// calculation.
+    ///
+    /// WHY, and it is not caution: `button_rects` reads its height and gap
+    /// from theme tokens, the tokens are sized in `u`, and `u` comes from
+    /// the window height of whichever screen last published a bake. In a
+    /// frame that is this screen — `draw_screen` sets the viewport first.
+    /// Outside a frame it is whoever drew last, so on a desktop of unequal
+    /// monitor heights the same call answers with the OTHER screen's
+    /// button size. Measured on 2560x1440 beside 3840x2160: the boundary
+    /// between the two buttons lands 35.8 px away from the drawn one.
+    ///
+    /// The consequence is worse than a missed press. A click that lands in
+    /// the gap between where SETTINGS is drawn and where it is tested hits
+    /// EXIT instead, and EXIT closes the desktop.
+    ///
+    /// Storing what was drawn makes the question unanswerable-wrong: the
+    /// rectangle a person can see IS the rectangle that answers. The real
+    /// fix belongs in the toolkit — an object should record its own hit
+    /// geometry and input should test the record, for every control rather
+    /// than this one — and when that lands this field goes with it.
+    drawn: Option<(RectC, [RectC; 2])>,
+}
+
+/// The buttons the last frame drew, if it drew them in THIS box.
+///
+/// Split out of `hit_rects` so the decision can be stated without a host:
+/// everything that makes answering input correct is these four comparisons,
+/// and the fallback around it is the old path left alone.
+fn stored_for(drawn: Option<(RectC, [RectC; 2])>, r: RectC) -> Option<[RectC; 2]> {
+    let (box_drawn, rects) = drawn?;
+    // Compared exactly, not within a tolerance: both boxes come from the
+    // same host field, so any difference is a real layout change and never
+    // rounding. A tolerance here would keep answering with rectangles from
+    // a layout that has moved.
+    (box_drawn.x == r.x && box_drawn.y == r.y && box_drawn.w == r.w && box_drawn.h == r.h)
+        .then_some(rects)
+}
+
+/// The buttons to test an event against: the ones on screen.
+///
+/// Falls back to calculating them only when this instance has not drawn a
+/// frame yet, or when the host hands input a different content box than the
+/// last frame used — a layout change, with a redraw already on its way. The
+/// fallback is the old, viewport-dependent path, so it is narrow on purpose.
+fn hit_rects(this: &mut Control, api: &HostApi, r: RectC) -> [RectC; 2] {
+    if let Some(rects) = stored_for(this.drawn, r) {
+        return rects;
+    }
+    let ctx = std::ptr::null_mut();
+    let t = theme(this, api, ctx);
+    button_rects(
+        t_px(api, ctx, t.button_h),
+        t_px(api, ctx, t.button_gap),
+        t_px(api, ctx, t.button_w_frac),
+        t_enum(api, ctx, t.button_align),
+        r,
+    )
 }
 
 /// The cached ids, re-resolved when the epoch has moved.
@@ -309,7 +368,8 @@ fn contains(r: &RectC, x: f32, y: f32) -> bool {
 }
 
 extern "C" fn create() -> *mut c_void {
-    Box::into_raw(Box::new(Control { pressed: [None, None], theme: None })) as *mut c_void
+    Box::into_raw(Box::new(Control { pressed: [None, None], theme: None, drawn: None }))
+        as *mut c_void
 }
 
 extern "C" fn destroy(instance: *mut c_void) {
@@ -336,6 +396,9 @@ extern "C" fn draw(
     let w_frac = t_px(api, ctx, t.button_w_frac);
     let align = t_enum(api, ctx, t.button_align);
     let rects = button_rects(h, gap, w_frac, align, r);
+    // Kept for input to answer against. Everything above ran under this
+    // screen's viewport; nothing outside a frame can say the same.
+    this.drawn = Some((r, rects));
 
     let skew = t_px(api, ctx, t.skew);
     let px = t_px(api, ctx, t.type_size).max(t_px(api, ctx, t.type_min_px));
@@ -544,16 +607,13 @@ extern "C" fn click(
         return;
     };
     // Input arrives outside a frame, so there is no drawing context to
-    // pass. The theme entries never read it — the parameter is room for
-    // a future per-window theme — and a null one is what "no frame"
-    // honestly is.
-    let ctx = std::ptr::null_mut();
-    let t = theme(this, api, ctx);
-    let h = t_px(api, ctx, t.button_h);
-    let gap = t_px(api, ctx, t.button_gap);
-    let w_frac = t_px(api, ctx, t.button_w_frac);
-    let align = t_enum(api, ctx, t.button_align);
-    for (i, br) in button_rects(h, gap, w_frac, align, r).iter().enumerate() {
+    // pass — and the theme entries do not take one anyway. That used to
+    // read as harmless here ("the parameter is room for a future per-window
+    // theme"), which was wrong in a way that could close the desktop: they
+    // read the ONE published bake, and outside a frame that bake belongs to
+    // whichever screen drew last. So the buttons are not recalculated; the
+    // ones on screen answer. See `Control::drawn`.
+    for (i, br) in hit_rects(this, api, r).iter().enumerate() {
         if contains(br, x, y) {
             this.pressed[i] = Some(Instant::now());
             out.kind = match i {
@@ -616,15 +676,10 @@ extern "C" fn pointer(
     let (Some(api), Some(this)) = (host(), state(instance)) else {
         return 0;
     };
-    let ctx = std::ptr::null_mut();
-    let t = theme(this, api, ctx);
-    let h = t_px(api, ctx, t.button_h);
-    let gap = t_px(api, ctx, t.button_gap);
-    let w_frac = t_px(api, ctx, t.button_w_frac);
-    let align = t_enum(api, ctx, t.button_align);
-    let over = button_rects(h, gap, w_frac, align, r)
-        .iter()
-        .any(|br| contains(br, x, y));
+    // The buttons on screen, for the same reason as `click` above: a fresh
+    // calculation here would size them from another screen's bake, and the
+    // cursor would turn into a hand over a strip where nothing is drawn.
+    let over = hit_rects(this, api, r).iter().any(|br| contains(br, x, y));
     u32::from(over)
 }
 
@@ -873,6 +928,81 @@ mod stroke_tests {
         assert!(
             nacelle::theme::id("icon.stroke_min_px").is_none(),
             "icon.stroke_min_px exists now — read it in `draw` instead of nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+
+    /// The owner's desktop, in the two unit sizes it produces.
+    ///
+    /// `u = clamp(window_h * 0.005, 4, 10)`, so a 2160-line screen sits on
+    /// the 10 px ceiling and a 1440-line one lands at 7.2. `button.h` is
+    /// 8.4u and `button.gap` is 0.35 of that, which is where these four
+    /// numbers come from — written out rather than derived, so the test
+    /// keeps stating the case even if the tokens move.
+    const TALL_H: f32 = 84.0;
+    const TALL_GAP: f32 = 29.4;
+    const SHORT_H: f32 = 60.48;
+    const SHORT_GAP: f32 = 21.168;
+    const W_FRAC: f32 = 0.8;
+    const ALIGN_BOTTOM: u32 = 2;
+
+    fn box_of(h: f32) -> RectC {
+        RectC { x: 0.0, y: 0.0, w: 300.0, h }
+    }
+
+    /// Input answers with the buttons a person can SEE, not with buttons
+    /// measured again after the frame ended.
+    ///
+    /// The two calculations differ because `button_rects` sizes itself from
+    /// theme tokens, the tokens are scaled by the window height of whichever
+    /// screen last published a bake, and input runs outside a frame — so on
+    /// a desktop of unequal monitors it measures with the other screen's
+    /// numbers. This test pins the fix by showing the two answers ARE
+    /// different and that the drawn one is the one returned.
+    #[test]
+    fn input_answers_with_the_buttons_that_were_drawn() {
+        let r = box_of(TALL_H * 2.0 + TALL_GAP);
+        let drawn = button_rects(TALL_H, TALL_GAP, W_FRAC, ALIGN_BOTTOM, r);
+        let measured_again = button_rects(SHORT_H, SHORT_GAP, W_FRAC, ALIGN_BOTTOM, r);
+
+        // If these ever agree the test proves nothing, so it says so first.
+        let drawn_edge = drawn[1].y;
+        let stale_edge = measured_again[1].y;
+        assert!(
+            (drawn_edge - stale_edge).abs() > 1.0,
+            "the two screens produced the same buttons ({drawn_edge} vs {stale_edge}); \
+             this test can no longer tell the fix from the bug"
+        );
+
+        let answered = stored_for(Some((r, drawn)), r).expect("the drawn box was not recognised");
+        assert_eq!(
+            answered[1].y, drawn_edge,
+            "input answered with buttons that were never on screen"
+        );
+    }
+
+    /// A moved panel falls back rather than answering from the old place.
+    ///
+    /// The stored rectangles belong to the box they were drawn in. When the
+    /// host hands input a different box the layout has changed and a redraw
+    /// is already coming; answering with the previous frame's rectangles
+    /// would put the buttons where the panel no longer is.
+    #[test]
+    fn a_different_content_box_is_not_answered_from_the_last_frame() {
+        let r = box_of(TALL_H * 2.0 + TALL_GAP);
+        let drawn = button_rects(TALL_H, TALL_GAP, W_FRAC, ALIGN_BOTTOM, r);
+        let moved = RectC { y: r.y + 40.0, ..r };
+        assert!(
+            stored_for(Some((r, drawn)), moved).is_none(),
+            "a panel that moved was still answered from where it used to be"
+        );
+        assert!(
+            stored_for(None, r).is_none(),
+            "an instance that has never drawn claimed to know its buttons"
         );
     }
 }
