@@ -177,14 +177,16 @@ fn button(sf: &mut impl Surface, r: Rect, caption: &str, state: State) {
 }
 
 /// The width a button asks for: its caption at the button role, plus
-/// the same inset a field gives its own text on either side. No length
-/// of this file's own — `field.pad_x` is the master's word for "the
-/// breathing room around one line in a box".
+/// the padding the master declares for a BUTTON on either side. No
+/// length of this file's own — and no borrowed one either: this used to
+/// measure with `field.pad_x`, so a theme that gave its buttons more
+/// breathing room than the box you type into got neither, and
+/// `button.pad_x` sat in the master with nothing reading it.
 fn button_w(sf: &mut impl Surface, caption: &str) -> f32 {
     let role = paint::bound_role(sf, "button.role", 1.0);
     let case = role_case(sf, "button.role");
     let cap = recase(&case, caption);
-    let pad = sf.px("field.pad_x").max(0.0);
+    let pad = sf.px("button.pad_x").max(0.0);
     sf.measure(role.face, role.px, &cap, role.track) + 2.0 * pad
 }
 
@@ -816,6 +818,7 @@ mod token_tests {
         "button.corner",
         "button.corner_style",
         "button.role",
+        "button.pad_x",
         // the story strip
         "list.row_h",
         "list.gap",
@@ -1062,6 +1065,105 @@ mod key_tests {
             assert_eq!(label_of(std::ptr::null(), 4), None);
             assert_eq!(label_of([0xffu8, 0xfe].as_ptr(), 2), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod button_tests {
+    use super::*;
+    use nacelle::theme::Color;
+
+    /// A probe with an opinion about exactly two keys, so the width a
+    /// button asks for says WHICH of them it measured itself with.
+    /// Everything else is inert: a caption's width is arithmetic, and
+    /// arithmetic needs no window.
+    struct Pads {
+        button: f32,
+        field: f32,
+    }
+    impl Surface for Pads {
+        fn ring_fill(&mut self, _: Rect, _: nacelle::draw::CornerStyle, _: f32, _: Color) {}
+        fn ring(&mut self, _: Rect, _: nacelle::draw::CornerStyle, _: f32, _: f32, _: Color) {}
+        fn rect(&mut self, _: Rect, _: Color) {}
+        fn rect_outline(&mut self, _: Rect, _: f32, _: Color) {}
+        fn line(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: Color) {}
+        fn polyline(&mut self, _: &[[f32; 2]], _: f32, _: Color, _: bool) {}
+        #[allow(clippy::too_many_arguments)]
+        fn text(&mut self, _: u8, _: f32, _: f32, _: f32, _: &str, _: Color, _: f32, _: Align) {}
+        fn measure(&mut self, _: u8, _: f32, s: &str, _: f32) -> f32 {
+            s.chars().count() as f32 * 10.0
+        }
+        fn clip(&mut self, _: Rect) -> bool {
+            false
+        }
+        fn unclip(&mut self) {}
+        fn has_token(&mut self, _: &str) -> bool {
+            false
+        }
+        fn px(&mut self, name: &str) -> f32 {
+            match name {
+                "button.pad_x" => self.button,
+                "field.pad_x" => self.field,
+                _ => 0.0,
+            }
+        }
+        fn color(&mut self, _: &str) -> Color {
+            Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+        }
+        fn bed(&mut self, _: &str) -> Color {
+            Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+        }
+        fn flag(&mut self, _: &str) -> bool {
+            false
+        }
+        fn word(&mut self, _: &str) -> String {
+            String::new()
+        }
+        fn class_state(&mut self, _: &str, _: State) -> nacelle::view::surface::StateInk {
+            nacelle::view::surface::StateInk::raw()
+        }
+        fn epoch(&mut self) -> u32 {
+            0
+        }
+        fn now(&self) -> f64 {
+            0.0
+        }
+        fn mouse(&self) -> (f32, f32) {
+            (-1.0, -1.0)
+        }
+        fn scale(&self) -> f32 {
+            1.0
+        }
+    }
+
+    /// A button is as wide as the master says a BUTTON is padded.
+    ///
+    /// It used to measure itself with `field.pad_x` — the box you type
+    /// into — so `button.pad_x` sat in the master with no reader and a
+    /// theme that padded its buttons got nothing. The two keys differ in
+    /// the master today (`@space.5` against `@space.4`), so this is not
+    /// a distinction without a difference.
+    #[test]
+    fn a_button_is_as_wide_as_the_button_padding_makes_it() {
+        const CAP: &str = "START";
+        let text = CAP.chars().count() as f32 * 10.0;
+        assert_eq!(
+            button_w(&mut Pads { button: 7.0, field: 100.0 }, CAP),
+            text + 14.0,
+            "a button's width is its caption plus `button.pad_x` on either side"
+        );
+        // Moving the FIELD's padding must not move a button by a pixel.
+        assert_eq!(
+            button_w(&mut Pads { button: 7.0, field: 999.0 }, CAP),
+            text + 14.0,
+            "the button followed `field.pad_x`, which belongs to the path box"
+        );
+        // And moving the button's own must.
+        assert_eq!(
+            button_w(&mut Pads { button: 20.0, field: 100.0 }, CAP),
+            text + 40.0,
+            "`button.pad_x` moved and the button did not"
+        );
     }
 }
 
