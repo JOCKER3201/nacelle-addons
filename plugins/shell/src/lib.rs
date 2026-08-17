@@ -133,6 +133,12 @@ struct Tokens {
     blink_on: u32,     // motion.term_cursor_blink.enabled
     blink_period: u32, // motion.term_cursor_blink.period_ms
     blink_duty: u32,   // motion.term_cursor_blink.duty
+    // the cursor's SHAPE and the two thin carets' lengths. The shape is
+    // `term.cursor.style`'s WORD; the lengths sit in `[terminal]`, the
+    // section that holds the cell grid's geometry, one section away.
+    cur_ul_h: u32,   // terminal.cursor.underline_h — the CARET's rule
+    cur_ul_gap: u32, // terminal.cursor.underline_gap
+    cur_bar_w: u32,  // terminal.cursor.bar_w
     // the SCROLL +n readout — a status pill in a corner, which is
     // precisely the images' badge (u2 §2.9): severity.info's colours,
     // the badge role's type, the badge component's box
@@ -173,6 +179,84 @@ struct Tokens {
     /// a word this build predates, no word at all — INVERTS, the
     /// master's own default and the reading that never loses a glyph.
     sel_tint: bool,
+    /// The caret's shape — `term.cursor.style`'s WORD.
+    cursor_style: CursorStyle,
+}
+
+/// The shape the caret takes, which is `term.cursor.style`'s WORD.
+///
+/// Until 2026-08-17 this widget drew a full block and nothing else, so
+/// the token, and the three lengths `[terminal]` keeps for the other two
+/// shapes, had no reader at all (audit 2026-08-17, Z17).
+///
+/// `block` is where an unknown word lands: it is the master's own
+/// default, it is the shape every frame before this one drew, and a
+/// caret whose shape a theme misspelled is still a caret — the person
+/// typing is looking straight at it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum CursorStyle {
+    /// The whole cell, with the glyph under it redrawn in the caret's
+    /// own ink so it survives being covered.
+    #[default]
+    Block,
+    /// A rule down the leading edge of the cell, `terminal.cursor.bar_w`
+    /// wide. The master spells the WORD `beam` and the length `bar_w`;
+    /// they are one shape under two of its usual names.
+    Beam,
+    /// A rule along the floor of the cell, `terminal.cursor.underline_h`
+    /// thick and `terminal.cursor.underline_gap` above the floor — the
+    /// caret's own pair, not the cell underline's `cell_underline_*`
+    /// that SGR 4 draws.
+    Underline,
+}
+
+impl CursorStyle {
+    fn of(word: &str) -> CursorStyle {
+        match word {
+            "beam" => CursorStyle::Beam,
+            "underline" => CursorStyle::Underline,
+            _ => CursorStyle::Block,
+        }
+    }
+}
+
+/// The lengths the two thin carets are cut from, resolved for the frame.
+#[derive(Clone, Copy, Default, Debug)]
+struct CursorGeom {
+    /// `terminal.cursor.underline_h`
+    underline_h: f32,
+    /// `terminal.cursor.underline_gap`
+    underline_gap: f32,
+    /// `terminal.cursor.bar_w`
+    bar_w: f32,
+}
+
+/// The caret's quad inside its cell, and whether that quad COVERS the
+/// glyph underneath.
+///
+/// The second half of the answer is the whole difference between the
+/// shapes: a block hides the character it sits on, so the character has
+/// to be laid back over it in the caret's ink, while a beam and an
+/// underline leave the grid's own glyph showing and must not draw a
+/// second copy of it.
+///
+/// Both thin shapes are floored at one device pixel, and that is
+/// arithmetic rather than a look: a theme that asked for a beam asked
+/// for a caret, and a rule of no width is not one. It is the same rule
+/// the blink already follows — the motion is decoration, the caret's
+/// visibility is not.
+fn cursor_quad(style: CursorStyle, cell: RectC, g: CursorGeom) -> (RectC, bool) {
+    match style {
+        CursorStyle::Block => (cell, true),
+        CursorStyle::Beam => (RectC { w: g.bar_w.max(1.0).min(cell.w), ..cell }, false),
+        CursorStyle::Underline => {
+            let h = g.underline_h.max(1.0).min(cell.h);
+            // The same arithmetic the cell's SGR-4 underline uses, so a
+            // caret and an underlined cell sit on one line.
+            let y = cell.y + cell.h - g.underline_gap - h;
+            (RectC { y, h, ..cell }, false)
+        }
+    }
 }
 
 /// The WORD an enum token currently resolves to — ABI 6's appended
@@ -207,6 +291,7 @@ impl Tokens {
         let c = |n: &str| (api.theme_class)(n.as_ptr(), n.len() as u32);
         let style = enum_word(api, ctx, t("severity.info.badge_style"));
         let sel_mode = enum_word(api, ctx, t("term.selection.mode"));
+        let cursor_style = enum_word(api, ctx, t("term.cursor.style"));
         // The two type bindings, followed to the roles they name.
         let tab_role = enum_word(api, ctx, t("tab.role"));
         let ind_role = enum_word(api, ctx, t("terminal.indicator.role"));
@@ -241,6 +326,9 @@ impl Tokens {
             blink_on: t("motion.term_cursor_blink.enabled"),
             blink_period: t("motion.term_cursor_blink.period_ms"),
             blink_duty: t("motion.term_cursor_blink.duty"),
+            cur_ul_h: t("terminal.cursor.underline_h"),
+            cur_ul_gap: t("terminal.cursor.underline_gap"),
+            cur_bar_w: t("terminal.cursor.bar_w"),
             ind_inset: t("terminal.indicator.inset"),
             ind_size: of(&ind_role, "size"),
             ind_min: of(&ind_role, "min_px"),
@@ -261,6 +349,7 @@ impl Tokens {
             term_bg: t("term.bg"),
             pill_solid: style == "solid",
             sel_tint: sel_mode == "tint",
+            cursor_style: CursorStyle::of(&cursor_style),
         }
     }
 }
@@ -752,13 +841,27 @@ impl Shell {
             if shown {
                 let cx = grid_r.x + view.cursor_col as f32 * cw;
                 let cy = grid_r.y + view.cursor_row as f32 * ch_h;
-                // Deliberately not clipped to the grid: the block goes
+                // Deliberately not clipped to the grid: the caret goes
                 // wherever the cursor is, which is what it has always
                 // done and what makes a cursor past the last column
                 // visible rather than silently absent. Its colours are
-                // the host's, resolved into the view like every cell's.
-                (api.rect)(ctx, RectC { x: cx, y: cy, w: cw, h: ch_h }, view.cursor_bg);
-                if view.cursor_ch != b' ' as u32 {
+                // the host's, resolved into the view like every cell's;
+                // its SHAPE is the theme's `term.cursor.style`.
+                let (quad, covers) = cursor_quad(
+                    ids.cursor_style,
+                    RectC { x: cx, y: cy, w: cw, h: ch_h },
+                    CursorGeom {
+                        underline_h: px(ids.cur_ul_h),
+                        underline_gap: px(ids.cur_ul_gap),
+                        bar_w: px(ids.cur_bar_w),
+                    },
+                );
+                (api.rect)(ctx, quad, view.cursor_bg);
+                // Only a block hid the character it sits on, so only a
+                // block owes it back. Laying it over a beam would paint
+                // a second copy of a glyph the grid loop already drew,
+                // in the wrong ink.
+                if covers && view.cursor_ch != b' ' as u32 {
                     glyph(
                         api,
                         ctx,
@@ -1146,6 +1249,78 @@ mod token_tests {
         // And the two roles really are different sizes, so the fix is
         // visible on the first screen rather than only in the names.
         assert_ne!(size(&ind), size(&badge));
+    }
+
+    /// The caret is the shape `term.cursor.style` names, cut from the
+    /// lengths `[terminal]` keeps beside it.
+    ///
+    /// All three shapes in one test because the finding is that there
+    /// was only ever one: this widget drew a full block whatever the
+    /// master said, so `term.cursor.style` and the three lengths
+    /// `terminal.cursor.*` had no reader at all (audit 2026-08-17, Z17).
+    ///
+    /// A note on spelling, because the two halves of the master do not
+    /// agree and this is where a reader finds out: the WORD for the
+    /// vertical caret is `beam`, the LENGTH that gives it its width is
+    /// `terminal.cursor.bar_w`. `bar` is not a word the master declares,
+    /// and it lands on `block` with everything else it does not know.
+    #[test]
+    fn the_caret_is_the_shape_the_master_names_at_the_lengths_beside_it() {
+        nacelle::theme::load();
+        let t = nacelle::theme::resolved();
+        let id = |n: &str| {
+            nacelle::theme::id(n).unwrap_or_else(|| panic!("the master declares no {n}"))
+        };
+        let g = CursorGeom {
+            underline_h: t.px(id("terminal.cursor.underline_h")),
+            underline_gap: t.px(id("terminal.cursor.underline_gap")),
+            bar_w: t.px(id("terminal.cursor.bar_w")),
+        };
+        // Below a device pixel the floor in `cursor_quad` would answer
+        // instead of the token, and this test would be reading the
+        // floor. The master ships @stroke.thin for both, which is more.
+        assert!(g.bar_w >= 1.0, "terminal.cursor.bar_w bakes to {} px", g.bar_w);
+        assert!(g.underline_h >= 1.0, "terminal.cursor.underline_h is {} px", g.underline_h);
+
+        // A cell of no round numbers, so nothing can match by accident.
+        let cell = RectC { x: 11.0, y: 23.0, w: 9.0, h: 21.0 };
+
+        let (q, covers) = cursor_quad(CursorStyle::Block, cell, g);
+        assert!(covers, "a block hides the glyph and has to lay it back over itself");
+        assert_eq!((q.x, q.y, q.w, q.h), (cell.x, cell.y, cell.w, cell.h));
+
+        // THE ONE THE FINDING IS ABOUT: a bar of terminal.cursor.bar_w.
+        let (q, covers) = cursor_quad(CursorStyle::Beam, cell, g);
+        assert!(!covers, "a beam stands beside the glyph, so it must not redraw it");
+        assert_eq!(q.w, g.bar_w, "the beam is not terminal.cursor.bar_w wide");
+        assert!(q.w < cell.w, "the beam filled its cell, which is a block by another name");
+        assert_eq!((q.x, q.y, q.h), (cell.x, cell.y, cell.h));
+
+        let (q, covers) = cursor_quad(CursorStyle::Underline, cell, g);
+        assert!(!covers, "an underline sits under the glyph, so it must not redraw it");
+        assert_eq!(q.h, g.underline_h, "the caret's rule is not terminal.cursor.underline_h");
+        assert!(q.h < cell.h, "the underline filled its cell");
+        assert_eq!(
+            q.y,
+            cell.y + cell.h - g.underline_gap - g.underline_h,
+            "the caret's rule ignores terminal.cursor.underline_gap"
+        );
+        assert_eq!((q.x, q.w), (cell.x, cell.w));
+
+        // And the WORD is what chooses between the three.
+        let word = nacelle::theme::enum_word_of(id("term.cursor.style"))
+            .expect("term.cursor.style names no shape");
+        assert_eq!(
+            CursorStyle::of(&word),
+            CursorStyle::Block,
+            "the master now ships `{word}`, so the default screen changed shape"
+        );
+        assert_eq!(CursorStyle::of("beam"), CursorStyle::Beam);
+        assert_eq!(CursorStyle::of("underline"), CursorStyle::Underline);
+        // A word this build predates, a misspelling, or no word at all
+        // is still a caret — and it is the one that has always been drawn.
+        assert_eq!(CursorStyle::of("bar"), CursorStyle::Block);
+        assert_eq!(CursorStyle::of(""), CursorStyle::Block);
     }
 }
 
