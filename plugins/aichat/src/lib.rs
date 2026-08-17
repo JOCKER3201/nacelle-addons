@@ -55,8 +55,8 @@ use crate::field::FieldView;
 use crate::model::{Chat, Outcome, Turn, Who};
 use nacelle::focus::{Key, KeyEv, Mods};
 use nacelle::runtime::{
-    keys, ActionC, ChromeC, HostApi, PluginApi, RectC, ABI_VERSION, ACTION_NONE,
-    SIZING_REFERENCE,
+    keys, ActionC, ChromeC, HostApi, PluginApi, RectC, ABI_VERSION, ACTION_CAPTURE,
+    ACTION_NONE, DRAG_BEGIN, DRAG_END, DRAG_MOVE, SIZING_REFERENCE,
 };
 use nacelle::theme::parse::State;
 use nacelle::theme::Color;
@@ -309,6 +309,23 @@ const NO_PHYSICS: ScrollPhysics = ScrollPhysics {
 
 const NO_RECT: Rect = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
 
+/// The transcript's bar as the last frame drew it — everything a press
+/// arriving between two frames needs to answer for itself.
+///
+/// The four numbers are the four [`ScrollView`] is asked for: the track
+/// the thumb travels in and the thumb AS DRAWN (`scrollbar.thumb_min`
+/// may have stretched it, and a grab must be tested against what the
+/// eye saw), plus the viewport and the content the offset is measured
+/// against. The file browser keeps exactly this record for exactly this
+/// reason.
+#[derive(Clone, Copy)]
+struct Bar {
+    track: Rect,
+    thumb: Rect,
+    viewport: f32,
+    content: f32,
+}
+
 pub struct AiChat {
     /// The model: the prompt, the transcript, the flight, the toggle.
     model: Chat,
@@ -328,9 +345,10 @@ pub struct AiChat {
     field_r: Rect,
     allow_r: Rect,
     deny_r: Rect,
-    /// The bar the last frame drew: track, thumb, and the viewport it
-    /// reported — a click on the track pages by exactly that height.
-    bar: Option<(Rect, Rect, f32)>,
+    /// The bar the last frame drew, or none when there was nothing to
+    /// scroll — a press on the track pages by exactly its viewport, and
+    /// a press on the thumb takes hold of it.
+    bar: Option<Bar>,
     /// The physics and the clock the last draw read, cached because a
     /// wheel event arrives with no drawing context to ask the theme
     /// through — the file browser's own arrangement.
@@ -549,7 +567,8 @@ impl AiChat {
                     sf.rect_outline(g.thumb, ink.edge_width, edge);
                 }
             }
-            self.bar = Some((g.track, g.thumb, r.h));
+            self.bar =
+                Some(Bar { track: g.track, thumb: g.thumb, viewport: r.h, content });
         }
     }
 
@@ -670,18 +689,57 @@ impl AiChat {
             self.answer(true);
             return;
         }
+        // The bar is NOT in this chain: it answers the PRESS, and a
+        // press it takes is never delivered as a click at all. See
+        // [`AiChat::press`].
         if self.deny_r.contains(x, y) {
             self.answer(false);
-            return;
         }
-        if let Some((track, thumb, viewport)) = self.bar {
-            // The track beside the thumb: one viewport toward the
-            // click — the toolkit's own page, not arithmetic invented
-            // here.
-            if track.contains(x, y) && !thumb.contains(x, y) {
-                self.scroll.page(y > thumb.y, viewport, self.frame_t);
-            }
+    }
+
+    /// A pointer press. `true` when the panel took the gesture — the
+    /// host then captures the pointer and no click is delivered when it
+    /// is let go.
+    ///
+    /// Only the bar takes a press. Everything else in this panel — the
+    /// band, the prompt box, ALLOW and DENY — is answered on the
+    /// RELEASE by [`AiChat::click`], exactly as it always has been.
+    pub fn press(&mut self, x: f32, y: f32) -> bool {
+        let Some(bar) = self.bar else { return false };
+        if !bar.track.contains(x, y) {
+            return false;
         }
+        if self.scroll.press_thumb(y, bar.thumb) {
+            return true;
+        }
+        // Beside the thumb: one viewport toward the click — the
+        // toolkit's own page, not arithmetic invented here.
+        //
+        // The press is still TAKEN, though the page has already
+        // happened by the time it is answered: the gesture was the
+        // bar's, and a press the bar answered must not arrive at
+        // [`AiChat::click`] a second time as one aimed at whatever the
+        // bar lies over. Nothing lies under it today — the transcript
+        // takes no click, and the prompt box and the two buttons are
+        // all below it — but the panel that grows something there must
+        // not have to remember this bar.
+        self.scroll.page(y >= bar.thumb.y + bar.thumb.h, bar.viewport, self.frame_t);
+        true
+    }
+
+    /// The pointer moved while it held the thumb. Only the y matters:
+    /// the thumb goes where the hand is, and a hand that wandered off
+    /// the bar sideways is still holding it.
+    pub fn drag_to(&mut self, y: f32) {
+        if let Some(bar) = self.bar {
+            self.scroll.drag(y, bar.viewport, bar.content, bar.track);
+        }
+    }
+
+    /// The pointer let go; the next frame settles the view on its
+    /// nearest whole row through `motion.scroll_settle`.
+    pub fn release(&mut self) {
+        self.scroll.release();
     }
 
     /// The wheel, over the transcript. The physics are the last draw's,
@@ -866,21 +924,41 @@ extern "C" fn chrome_c(
     (out_size as usize).min(std::mem::size_of::<ChromeC>()) as u32
 }
 
-/// This widget takes no drags: the thumb is paged and wheeled, not yet
-/// held (the toolkit's `press_thumb`/`drag` wait on the press phase
-/// carrying capture across this ABI). Declining every Begin keeps a
-/// press on the ordinary click path, which is where the buttons are.
+/// The pointer's whole gesture — the host's single capture path, and
+/// what the transcript's scroll thumb is dragged by.
+///
+/// A `Begin` anywhere but on the bar is DECLINED (`ACTION_NONE`), which
+/// leaves the press on the ordinary click path: that is how the band
+/// still toggles and how ALLOW and DENY are still answered. A `Begin`
+/// on the bar answers `ACTION_CAPTURE` — the gesture is the widget's —
+/// and the host then routes every motion here and no click at the end.
 #[allow(clippy::too_many_arguments)]
 extern "C" fn drag_c(
-    _: *mut c_void,
-    _: u32,
-    _: f32,
-    _: f32,
-    _: RectC,
-    _: f32,
-    _: f32,
-    _: *mut ActionC,
+    instance: *mut c_void,
+    phase: u32,
+    x: f32,
+    y: f32,
+    _r: RectC,
+    _win_w: f32,
+    _win_h: f32,
+    out: *mut ActionC,
 ) {
+    let mut kind = ACTION_NONE;
+    if let Some(this) = state(instance) {
+        match phase {
+            DRAG_BEGIN => {
+                kind = if this.press(x, y) { ACTION_CAPTURE } else { ACTION_NONE };
+            }
+            DRAG_MOVE => this.drag_to(y),
+            DRAG_END => this.release(),
+            // A phase from a newer host than this build knows must not
+            // be guessed at: an unknown gesture is no gesture.
+            _ => {}
+        }
+    }
+    if let Some(out) = unsafe { out.as_mut() } {
+        out.kind = kind;
+    }
 }
 
 /// No hand cursor: the buttons speak through their hover rung, and the
@@ -899,8 +977,9 @@ extern "C" fn pointer_c(
 /// Filled, and does nothing on purpose: the buttons answer the CLICK,
 /// which is press-and-release in one word, and a press rung this file
 /// drew from its own guess at the gesture would disagree with the
-/// host's. When the press phase carries something this panel wants —
-/// the thumb grab above — it arrives here and gets a body.
+/// host's. The one gesture this panel does take is the scroll thumb's,
+/// and that is `drag`'s — the single capture path, of which this entry
+/// is deliberately not a second.
 #[allow(clippy::too_many_arguments)]
 extern "C" fn button_c(
     _: *mut c_void,
@@ -1441,9 +1520,8 @@ mod wire_tests {
 #[cfg(test)]
 mod abi_tests {
     use super::*;
-    use nacelle::runtime::{
-        BUTTON_PRESS, BUTTON_RELEASE, DRAG_BEGIN, DRAG_END, DRAG_MOVE, PLUGIN_API_HAS_BUTTON,
-    };
+    use nacelle::runtime::{BUTTON_PRESS, BUTTON_RELEASE, PLUGIN_API_HAS_BUTTON};
+    use std::path::PathBuf;
 
     /// A value no entry of this widget could ever write, so "left
     /// alone" is something a test can see.
@@ -1451,24 +1529,31 @@ mod abi_tests {
         ActionC { kind: u32::MAX, index: 0, lines: 0, data: std::ptr::null(), data_len: 0 }
     }
 
+    /// A widget whose daemon does not exist, so that nothing here can
+    /// reach a socket a running desktop owns — the scroll bar is the
+    /// same bar online or off.
+    fn stranded() -> AiChat {
+        AiChat::with_client(AiClient::at(CLIENT, PathBuf::from("/nonexistent-aichat/ai.sock")))
+    }
+
     /// The inputs this widget does not use are INERT, and pinned so:
-    /// the drag captures nothing, the pointer asks for no cursor, the
-    /// press rung writes nothing, the grid reports no cells. Each is a
-    /// decision written above its entry, and a change that gives one a
-    /// body has to come past this test rather than around it.
+    /// the pointer asks for no cursor, the press rung writes nothing,
+    /// the grid reports no cells. Each is a decision written above its
+    /// entry, and a change that gives one a body has to come past this
+    /// test rather than around it.
+    ///
+    /// The DRAG used to be on this list, on the strength of a comment
+    /// claiming the ABI could not carry a capture across the boundary.
+    /// It can, and the file browser has been carrying one all along —
+    /// so the drag is now a used entry, tested below where the other
+    /// used entries are, and only the three that are still genuinely
+    /// idle are pinned here.
     #[test]
     fn the_inputs_this_widget_does_not_use_are_inert() {
         assert_eq!(API.api_size as usize, std::mem::size_of::<PluginApi>());
         assert!(API.api_size as usize >= PLUGIN_API_HAS_BUTTON);
 
         let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-
-        // The drag: every phase declined, no capture ever asked for.
-        let mut a = untouched();
-        for phase in [DRAG_BEGIN, DRAG_MOVE, DRAG_END] {
-            (API.drag)(std::ptr::null_mut(), phase, 1.0, 1.0, r, 100.0, 100.0, &mut a);
-        }
-        assert_eq!(a.kind, u32::MAX, "a drag entry that does nothing writes nothing");
 
         // The pointer: no hand cursor anywhere.
         assert_eq!((API.pointer)(std::ptr::null_mut(), 1.0, 1.0, r, 100.0, 100.0), 0);
@@ -1505,6 +1590,109 @@ mod abi_tests {
         (API.click)(std::ptr::null_mut(), 1.0, 1.0, r, 100.0, 100.0, &mut c);
         assert_eq!(c.kind, ACTION_NONE);
         (API.destroy)(inst);
+    }
+
+    /// A widget carrying the bar a frame would have drawn: a 100-px
+    /// track with a 20-px thumb at its top, over 400 px of transcript
+    /// seen through 100. Built by hand because the bar is a fact of the
+    /// last DRAW, and no test here has a host to draw through.
+    fn panel_with_a_bar() -> AiChat {
+        let mut w = stranded();
+        w.bar = Some(Bar {
+            track: Rect::new(90.0, 0.0, 6.0, 100.0),
+            thumb: Rect::new(90.0, 0.0, 6.0, 20.0),
+            viewport: 100.0,
+            content: 400.0,
+        });
+        w
+    }
+
+    /// The drag entry, driven through the TABLE: a Begin on the thumb
+    /// asks the host for the pointer, a Begin beside the bar does not.
+    /// The capture is the whole fix — without it the host delivers the
+    /// press as an ordinary click and no motion ever reaches this
+    /// widget.
+    #[test]
+    fn a_press_on_the_thumb_asks_for_the_capture_and_one_beside_it_does_not() {
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut w = panel_with_a_bar();
+        let inst = &mut w as *mut AiChat as *mut c_void;
+
+        // On the thumb: ours, and the host is told so.
+        let mut a = untouched();
+        (API.drag)(inst, DRAG_BEGIN, 92.0, 10.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(a.kind, ACTION_CAPTURE);
+        (API.drag)(inst, DRAG_END, 92.0, 10.0, r, 100.0, 100.0, &mut a);
+
+        // Beside the bar, over the transcript: not ours, so the press
+        // stays on the click path that puts the caret.
+        let mut b = untouched();
+        (API.drag)(inst, DRAG_BEGIN, 10.0, 10.0, r, 100.0, 100.0, &mut b);
+        assert_eq!(b.kind, ACTION_NONE);
+
+        // A phase from a newer host is no gesture, and a null instance
+        // is a decline rather than a crash.
+        let mut c = untouched();
+        (API.drag)(inst, 999, 92.0, 10.0, r, 100.0, 100.0, &mut c);
+        assert_eq!(c.kind, ACTION_NONE);
+        let mut d = untouched();
+        (API.drag)(std::ptr::null_mut(), DRAG_BEGIN, 92.0, 10.0, r, 100.0, 100.0, &mut d);
+        assert_eq!(d.kind, ACTION_NONE);
+    }
+
+    /// And the motion that follows the capture MOVES the transcript:
+    /// the thumb goes where the hand is, absolutely. Half the 80 px of
+    /// travel over 300 px of scrollable content is 150 px of offset.
+    #[test]
+    fn a_move_under_capture_scrolls_the_transcript() {
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut w = panel_with_a_bar();
+        let inst = &mut w as *mut AiChat as *mut c_void;
+        let mut a = untouched();
+
+        (API.drag)(inst, DRAG_BEGIN, 92.0, 0.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(a.kind, ACTION_CAPTURE);
+        assert_eq!(w.scroll.offset(), 0.0);
+        (API.drag)(inst, DRAG_MOVE, 92.0, 40.0, r, 100.0, 100.0, &mut a);
+        assert!((w.scroll.offset() - 150.0).abs() < 0.5, "{}", w.scroll.offset());
+        // Let go, and the view stops being dragged.
+        (API.drag)(inst, DRAG_END, 92.0, 40.0, r, 100.0, 100.0, &mut a);
+        assert!(!w.scroll.dragging());
+    }
+
+    /// A press BESIDE the thumb is still the bar's: it pages by one
+    /// viewport and takes the gesture, so the transcript underneath
+    /// never sees a click the hand did not aim at it.
+    #[test]
+    fn a_press_beside_the_thumb_pages_and_is_still_ours() {
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut w = panel_with_a_bar();
+        let inst = &mut w as *mut AiChat as *mut c_void;
+        let mut a = untouched();
+
+        (API.drag)(inst, DRAG_BEGIN, 92.0, 60.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(a.kind, ACTION_CAPTURE, "the bar takes the press it did not grab");
+        assert!(!w.scroll.dragging());
+        assert_eq!(w.scroll.offset(), 100.0);
+        (API.drag)(inst, DRAG_END, 92.0, 60.0, r, 100.0, 100.0, &mut a);
+
+        // The next frame draws the thumb further down; a press above it
+        // pages back the way it came.
+        w.bar = Some(Bar { thumb: Rect::new(90.0, 40.0, 6.0, 20.0), ..w.bar.unwrap() });
+        let inst = &mut w as *mut AiChat as *mut c_void;
+        (API.drag)(inst, DRAG_BEGIN, 92.0, 10.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(a.kind, ACTION_CAPTURE);
+        assert_eq!(w.scroll.offset(), 0.0);
+    }
+
+    /// Before the first frame there is no bar, and nothing is taken:
+    /// the panel must not claim a gesture over geometry it has not
+    /// drawn yet.
+    #[test]
+    fn no_bar_drawn_means_no_press_taken() {
+        let mut w = stranded();
+        assert!(!w.press(92.0, 10.0));
+        assert!(!w.scroll.dragging());
     }
 
     /// The key entry, driven through the table: a character lands in

@@ -40,7 +40,8 @@
 //! admits, and what a click on a tile does.
 
 use nacelle::runtime::{
-    ActionC, ChromeC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_NONE,
+    ActionC, ChromeC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_CAPTURE,
+    ACTION_NONE, DRAG_BEGIN, DRAG_END, DRAG_MOVE,
 };
 use nacelle::widget::factory::BuiltinWidget;
 use nacelle_launcher_core::desktop::AppEntry;
@@ -111,6 +112,13 @@ pub struct Appgrid {
     /// `filetile.wheel_px`, cached at draw because a wheel event
     /// arrives with no drawing context to ask the theme through.
     wheel_px: f32,
+    /// The bar the last frame drew, or none when there was nothing to
+    /// scroll — the rectangles AND the bottom the offset may reach,
+    /// which is everything a press arriving between two frames needs to
+    /// answer for itself.
+    bar: Option<tile::BarGeom>,
+    /// The thumb under the hand, while there is one.
+    grab: tile::ThumbGrab,
     /// The count as last handed to the host's title band, alive until
     /// the next `chrome` call.
     chrome_right: Vec<u8>,
@@ -137,6 +145,8 @@ impl Appgrid {
             stamp: desktop::stamp(),
             theme: None,
             wheel_px: 0.0,
+            bar: None,
+            grab: tile::ThumbGrab::default(),
             chrome_right: Vec::new(),
         };
         // Built at once for the choice already standing. NOT through
@@ -213,6 +223,53 @@ impl Appgrid {
         self.scroll = (self.scroll - delta).max(0.0);
     }
 
+    /// A pointer press. `true` when the grid took the gesture — the host
+    /// then captures the pointer and no click is delivered when it is
+    /// let go.
+    ///
+    /// Only the bar takes a press: everything else here is a tile, and
+    /// a tile is RUN on the release, by `click`, exactly as it always
+    /// has been.
+    pub fn press(&mut self, x: f32, y: f32) -> bool {
+        let Some(bar) = self.bar else { return false };
+        if !bar.track.contains(x, y) {
+            return false;
+        }
+        if self.grab.press(y, &bar) {
+            return true;
+        }
+        // Beside the thumb: one page toward the click, where a page is
+        // the content box the bar stands in. The press is still taken —
+        // the bar lies ON TOP of the tiles, and letting it through would
+        // launch an application the hand never aimed at.
+        let page = bar.track.h;
+        self.scroll = if y >= bar.thumb.y + bar.thumb.h {
+            (self.scroll + page).min(bar.max_px)
+        } else {
+            (self.scroll - page).max(0.0)
+        };
+        true
+    }
+
+    /// The pointer moved while it held the thumb. Only the y matters:
+    /// the thumb goes where the hand is, and a hand that wandered off
+    /// the bar sideways is still holding it.
+    ///
+    /// The offset lands on a whole row or a whole band on the next
+    /// frame, where the layout pass rounds it — the same snapping the
+    /// wheel gets, for the same reason.
+    pub fn drag_to(&mut self, y: f32) {
+        let Some(bar) = self.bar else { return };
+        if let Some(px) = self.grab.drag_to(y, &bar) {
+            self.scroll = px;
+        }
+    }
+
+    /// The pointer let go.
+    pub fn release(&mut self) {
+        self.grab.release();
+    }
+
     /// A click on a tile runs its application, detached. There is no
     /// action for the host to take: the widget owns this one itself,
     /// because `ActionC` has no code for "run this command" and
@@ -272,6 +329,10 @@ impl Appgrid {
 
     fn draw(&mut self, api: &HostApi, ctx: *mut c_void, r: Rect) {
         self.hits.clear();
+        // Cleared here rather than only on the path that draws a bar: a
+        // frame with nothing to scroll must leave no rectangle behind
+        // for the next press to take hold of.
+        self.bar = None;
         if self.follow() {
             self.rescan_view();
         }
@@ -325,6 +386,11 @@ impl Appgrid {
         // saying where it is is a defect. Rows or bands, the bar reads
         // the same four numbers.
         tile::scrollbar(api, ctx, &look.tile, area, scroll);
+        // And the same numbers again, kept for the hand: a press arrives
+        // between two frames with no geometry of its own, and `bar_geom`
+        // is the function the drawing above went through, so what is
+        // grabbed is what was seen.
+        self.bar = tile::bar_geom(&look.tile, area, scroll);
     }
 
     /// One category's applications: the tile grid, flat, further rows
@@ -553,19 +619,41 @@ extern "C" fn chrome_c(
     (out_size as usize).min(std::mem::size_of::<ChromeC>()) as u32
 }
 
-/// This widget takes no drags: declining every Begin keeps a press on
-/// the ordinary click path.
+/// The pointer's whole gesture — the host's single capture path, and
+/// what this grid's scroll thumb is dragged by.
+///
+/// A `Begin` anywhere but on the bar is DECLINED (`ACTION_NONE`), which
+/// leaves the press on the ordinary click path: that is how a tile is
+/// still run by releasing on it. A `Begin` on the bar answers
+/// `ACTION_CAPTURE` — the gesture is the widget's — and the host then
+/// routes every motion here and no click at the end.
 #[allow(clippy::too_many_arguments)]
 extern "C" fn drag_c(
-    _: *mut c_void,
-    _: u32,
-    _: f32,
-    _: f32,
-    _: RectC,
-    _: f32,
-    _: f32,
-    _: *mut ActionC,
+    instance: *mut c_void,
+    phase: u32,
+    x: f32,
+    y: f32,
+    _r: RectC,
+    _win_w: f32,
+    _win_h: f32,
+    out: *mut ActionC,
 ) {
+    let mut kind = ACTION_NONE;
+    if let Some(this) = state(instance) {
+        match phase {
+            DRAG_BEGIN => {
+                kind = if this.press(x, y) { ACTION_CAPTURE } else { ACTION_NONE };
+            }
+            DRAG_MOVE => this.drag_to(y),
+            DRAG_END => this.release(),
+            // A phase from a newer host than this build knows must not
+            // be guessed at: an unknown gesture is no gesture.
+            _ => {}
+        }
+    }
+    if let Some(out) = unsafe { out.as_mut() } {
+        out.kind = kind;
+    }
 }
 
 /// Nothing of this widget asks for the hand cursor: it is drawn, not
@@ -877,6 +965,8 @@ mod view_tests {
             stamp: 0,
             theme: None,
             wheel_px: 0.0,
+            bar: None,
+            grab: tile::ThumbGrab::default(),
             chrome_right: Vec::new(),
         };
         g.sel.poll();
@@ -936,6 +1026,118 @@ mod view_tests {
 
         // Put the board back, so the order tests run in cannot matter.
         cats_panel.set(Selection::All);
+    }
+
+    /// A grid carrying the bar a frame would have drawn: a 100-px track
+    /// with a 20-px thumb at its top, over 300 px of tiles below the
+    /// fold. Built by hand because the bar is a fact of the last DRAW,
+    /// and no test here has a host to draw through.
+    fn grid_with_a_bar() -> Appgrid {
+        let mut g = grid_over(Vec::new());
+        g.bar = Some(tile::BarGeom {
+            track: Rect::new(90.0, 0.0, 6.0, 100.0),
+            thumb: Rect::new(90.0, 0.0, 6.0, 20.0),
+            max_px: 300.0,
+        });
+        g
+    }
+
+    /// A value no entry of this widget could ever write, so "left alone"
+    /// is something a test can see.
+    fn untouched() -> ActionC {
+        ActionC { kind: u32::MAX, index: 0, lines: 0, data: std::ptr::null(), data_len: 0 }
+    }
+
+    /// The drag entry, driven through the TABLE: a Begin on the thumb
+    /// asks the host for the pointer, a Begin beside the bar does not.
+    /// The capture is the whole of it — without it the host delivers the
+    /// press as an ordinary click, launches whatever tile is under the
+    /// bar, and no motion ever reaches this widget.
+    #[test]
+    fn a_press_on_the_thumb_asks_for_the_capture_and_one_beside_it_does_not() {
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut g = grid_with_a_bar();
+        let inst = &mut g as *mut Appgrid as *mut c_void;
+
+        let mut a = untouched();
+        (API.drag)(inst, DRAG_BEGIN, 92.0, 10.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(a.kind, ACTION_CAPTURE);
+        (API.drag)(inst, DRAG_END, 92.0, 10.0, r, 100.0, 100.0, &mut a);
+
+        // Beside the bar, over the tiles: not ours, so the press stays
+        // on the click path that runs an application.
+        let mut b = untouched();
+        (API.drag)(inst, DRAG_BEGIN, 10.0, 10.0, r, 100.0, 100.0, &mut b);
+        assert_eq!(b.kind, ACTION_NONE);
+
+        // A phase from a newer host is no gesture, and a null instance
+        // is a decline rather than a crash.
+        let mut c = untouched();
+        (API.drag)(inst, 999, 92.0, 10.0, r, 100.0, 100.0, &mut c);
+        assert_eq!(c.kind, ACTION_NONE);
+        let mut d = untouched();
+        (API.drag)(std::ptr::null_mut(), DRAG_BEGIN, 92.0, 10.0, r, 100.0, 100.0, &mut d);
+        assert_eq!(d.kind, ACTION_NONE);
+    }
+
+    /// And the motion that follows the capture MOVES the page: the thumb
+    /// goes where the hand is, absolutely. Half the 80 px of travel over
+    /// 300 px below the fold is 150 px of offset.
+    #[test]
+    fn a_move_under_capture_scrolls_the_grid() {
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut g = grid_with_a_bar();
+        let inst = &mut g as *mut Appgrid as *mut c_void;
+        let mut a = untouched();
+
+        (API.drag)(inst, DRAG_BEGIN, 92.0, 0.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(a.kind, ACTION_CAPTURE);
+        assert_eq!(g.scroll, 0.0);
+        (API.drag)(inst, DRAG_MOVE, 92.0, 40.0, r, 100.0, 100.0, &mut a);
+        assert!((g.scroll - 150.0).abs() < 0.5, "{}", g.scroll);
+        // Past the bottom of the track the offset stops at the bottom of
+        // the page, never beyond it.
+        (API.drag)(inst, DRAG_MOVE, 92.0, 999.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(g.scroll, 300.0);
+        // Let go, and a later motion is nobody's.
+        (API.drag)(inst, DRAG_END, 92.0, 999.0, r, 100.0, 100.0, &mut a);
+        (API.drag)(inst, DRAG_MOVE, 92.0, 0.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(g.scroll, 300.0, "a released thumb does not follow the hand");
+    }
+
+    /// A press BESIDE the thumb is still the bar's: it pages by one
+    /// content box and takes the gesture, so the tiles underneath never
+    /// see a click the hand did not aim at them.
+    #[test]
+    fn a_press_beside_the_thumb_pages_and_is_still_ours() {
+        let r = RectC { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let mut g = grid_with_a_bar();
+        let inst = &mut g as *mut Appgrid as *mut c_void;
+        let mut a = untouched();
+
+        (API.drag)(inst, DRAG_BEGIN, 92.0, 60.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(a.kind, ACTION_CAPTURE, "the bar takes the press it did not grab");
+        assert_eq!(g.scroll, 100.0);
+        (API.drag)(inst, DRAG_END, 92.0, 60.0, r, 100.0, 100.0, &mut a);
+
+        // The next frame draws the thumb further down; a press above it
+        // pages back the way it came.
+        g.bar = Some(tile::BarGeom {
+            thumb: Rect::new(90.0, 40.0, 6.0, 20.0),
+            ..g.bar.unwrap()
+        });
+        let inst = &mut g as *mut Appgrid as *mut c_void;
+        (API.drag)(inst, DRAG_BEGIN, 92.0, 10.0, r, 100.0, 100.0, &mut a);
+        assert_eq!(a.kind, ACTION_CAPTURE);
+        assert_eq!(g.scroll, 0.0);
+    }
+
+    /// Before the first frame there is no bar, and nothing is taken: the
+    /// grid must not claim a gesture over geometry it has not drawn.
+    #[test]
+    fn no_bar_drawn_means_no_press_taken() {
+        let mut g = grid_over(Vec::new());
+        assert!(!g.press(92.0, 10.0));
     }
 }
 

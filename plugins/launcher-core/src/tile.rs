@@ -854,6 +854,11 @@ pub struct Layout {
     /// Vertical pitch between two rows, which `filetile.row_justify`
     /// may stretch past `tile + gap`.
     pub step: f32,
+    /// How far down the scroll can go, in the pixels the caller keeps
+    /// its offset in — the bottom [`layout`] clamps to, remembered
+    /// rather than recomputed so a dragged thumb and the clamp cannot
+    /// disagree.
+    pub max_px: f32,
 }
 
 /// How big one tile is in `area`, and how many fit across it.
@@ -911,7 +916,8 @@ pub fn layout(look: &TileLook, area: Rect, count: usize, scroll: &mut f32) -> La
         1
     };
     let max_off = total_rows.saturating_sub(nvis);
-    *scroll = scroll.clamp(0.0, (max_off as f32 * row_h).max(0.0));
+    let max_px = (max_off as f32 * row_h).max(0.0);
+    *scroll = scroll.clamp(0.0, max_px);
     let row_off = if row_h > 0.0 {
         ((*scroll / row_h).round() as usize).min(max_off)
     } else {
@@ -925,7 +931,7 @@ pub fn layout(look: &TileLook, area: Rect, count: usize, scroll: &mut f32) -> La
     } else {
         row_h
     };
-    Layout { tile, gap, cols, total_rows, nvis, max_off, row_off, step }
+    Layout { tile, gap, cols, total_rows, nvis, max_off, row_off, step, max_px }
 }
 
 impl Layout {
@@ -1006,16 +1012,29 @@ pub fn tile_face(
 }
 
 /// Where a scrolling column of rows currently is: how many there are,
-/// how many are on screen, which is first, and how far it can go. A
-/// grid of tiles and a list of rows differ in what a row IS and in
-/// nothing else, which is why the bar below takes this and not either
-/// widget's own layout.
+/// how many are on screen, which is first, and — in the pixels the
+/// caller keeps its own offset in — where that first one stands and how
+/// far it may go. A grid of tiles and a list of rows differ in what a
+/// row IS and in nothing else, which is why the bar below takes this
+/// and not either widget's own layout.
+///
+/// The position is a PIXEL figure and not the index beside it because
+/// the hand that drags the thumb speaks pixels: a thumb drawn from an
+/// index and grabbed in pixels agrees only where every unit is the same
+/// height. The alphabetical index's are not — a heading is shorter than
+/// a row of tiles — so said in indices the two disagree by however much
+/// the bands differ, and the thumb walks away from the hand holding it.
+/// Said in one unit they are each other's inverse by construction.
 #[derive(Clone, Copy)]
 pub struct Scroll {
     pub total: usize,
     pub nvis: usize,
+    /// The first row or band on screen.
     pub off: usize,
-    pub max_off: usize,
+    /// Where that first one's top is, measured from the column's.
+    pub px: f32,
+    /// The furthest down that top may go.
+    pub max_px: f32,
 }
 
 impl Layout {
@@ -1025,7 +1044,13 @@ impl Layout {
             total: self.total_rows,
             nvis: self.nvis,
             off: self.row_off,
-            max_off: self.max_off,
+            // Every row of a flat grid is the same height, so the top of
+            // the first one on screen is its index times the pitch the
+            // bottom was measured with. `filetile.row_justify` stretches
+            // what is DRAWN, never what is scrolled through, which is
+            // why this is `tile + gap` and not [`Layout::step`].
+            px: self.row_off as f32 * (self.tile + self.gap),
+            max_px: self.max_px,
         }
     }
 }
@@ -1040,9 +1065,26 @@ impl Layout {
 /// same answer here, so a theme asking for a bar beside the tiles got
 /// no bar at all.
 pub fn scrollbar(api: &HostApi, ctx: *mut c_void, look: &TileLook, area: Rect, s: Scroll) {
-    let (total_rows, nvis, row_off, max_off) = (s.total, s.nvis, s.off, s.max_off);
-    if !(total_rows > nvis && look.sb_mode != BarMode::None && look.sb_w > 0.0) {
-        return;
+    let Some(g) = bar_geom(look, area, s) else { return };
+    let thumb = g.thumb.c();
+    if look.thumb.fill.a > 0.0 {
+        (api.rect)(ctx, thumb, look.thumb.fill);
+    }
+    if look.thumb.edge_width > 0.0 && look.thumb.edge.a > 0.0 {
+        (api.rect_outline)(ctx, thumb, look.thumb.edge_width, look.thumb.edge);
+    }
+}
+
+/// The bar as a pair of rectangles, or none when the theme asks for no
+/// bar or there is nothing to scroll.
+///
+/// Split out of [`scrollbar`] because a bar the hand can take hold of
+/// needs the SAME two rectangles the eye was shown — a second copy of
+/// this arithmetic beside the hit test would be a thumb that is drawn
+/// in one place and grabbed in another the moment either is touched.
+pub fn bar_geom(look: &TileLook, area: Rect, s: Scroll) -> Option<BarGeom> {
+    if !(s.total > s.nvis && look.sb_mode != BarMode::None && look.sb_w > 0.0) {
+        return None;
     }
     let bw = look.sb_w;
     let bx = if look.sb_side == 0 {
@@ -1050,15 +1092,84 @@ pub fn scrollbar(api: &HostApi, ctx: *mut c_void, look: &TileLook, area: Rect, s
     } else {
         area.x + look.sb_margin
     };
-    let frac = (nvis as f32 / total_rows as f32).clamp(0.0, 1.0);
+    let frac = (s.nvis as f32 / s.total as f32).clamp(0.0, 1.0);
     let th = (area.h * frac).max(look.sb_thumb_min).min(area.h);
-    let ty = area.y + (area.h - th) * (row_off as f32 / max_off.max(1) as f32).clamp(0.0, 1.0);
-    let thumb = RectC { x: bx, y: ty, w: bw, h: th };
-    if look.thumb.fill.a > 0.0 {
-        (api.rect)(ctx, thumb, look.thumb.fill);
+    // How far down its travel the thumb sits: the offset over the
+    // bottom, both in the caller's own pixels. A column whose units are
+    // all one height reads the same either way; one whose units are not
+    // reads right only this way. A bottom of nothing is a column that
+    // cannot move, and a thumb that cannot move sits at the top.
+    let pos = if s.max_px > 0.0 { (s.px / s.max_px).clamp(0.0, 1.0) } else { 0.0 };
+    let ty = area.y + (area.h - th) * pos;
+    Some(BarGeom {
+        track: Rect::new(bx, area.y, bw, area.h),
+        thumb: Rect::new(bx, ty, bw, th),
+        max_px: s.max_px,
+    })
+}
+
+/// The bar the last frame drew: the full length the thumb travels in,
+/// the thumb AS DRAWN — `scrollbar.thumb_min` may have stretched it,
+/// and a grab must be tested against what the eye saw — and the bottom
+/// the offset behind it may reach.
+///
+/// The bottom travels WITH the rectangles rather than beside them
+/// because a drag converts between the two, and a widget keeping them in
+/// two fields is a widget that can update one and forget the other.
+#[derive(Clone, Copy)]
+pub struct BarGeom {
+    pub track: Rect,
+    pub thumb: Rect,
+    pub max_px: f32,
+}
+
+/// A thumb under the hand, between two frames.
+///
+/// The toolkit already owns this gesture in `nacelle::view::scroll`, and
+/// this is deliberately the same arithmetic and not a second opinion:
+/// the offset follows the hand ABSOLUTELY, which is the only behaviour
+/// that survives a dropped frame. What the toolkit's version cannot be
+/// given here is the offset itself — these two widgets scroll a column
+/// of ROWS they clamp themselves, in their own layout pass, so the
+/// number the drag produces has to be handed back rather than kept.
+#[derive(Clone, Copy, Default)]
+pub struct ThumbGrab {
+    /// How far down the thumb the hand took hold, and how tall the thumb
+    /// was when it did. Kept from the press so the thumb does not jump
+    /// under the finger on the first motion.
+    held: Option<(f32, f32)>,
+}
+
+impl ThumbGrab {
+    /// The pointer took hold of the thumb. `false` leaves the press for
+    /// whatever else the widget does with it.
+    pub fn press(&mut self, y: f32, bar: &BarGeom) -> bool {
+        if bar.thumb.h <= 0.0 || y < bar.thumb.y || y >= bar.thumb.y + bar.thumb.h {
+            return false;
+        }
+        self.held = Some((y - bar.thumb.y, bar.thumb.h));
+        true
     }
-    if look.thumb.edge_width > 0.0 && look.thumb.edge.a > 0.0 {
-        (api.rect_outline)(ctx, thumb, look.thumb.edge_width, look.thumb.edge);
+
+    /// Where the hand has put the offset, in the pixels the widget
+    /// scrolls in, or none while nothing is held.
+    ///
+    /// This is [`bar_geom`]'s own arithmetic run backwards: it puts the
+    /// thumb's top at `travel` times the offset over the bottom, and
+    /// this reads the offset back off the thumb's top. Grabbed and not
+    /// moved, the hand therefore returns the offset it started from.
+    pub fn drag_to(&self, y: f32, bar: &BarGeom) -> Option<f32> {
+        let (inside, thumb_h) = self.held?;
+        let travel = (bar.track.h - thumb_h).max(0.0);
+        if travel <= 0.0 {
+            return Some(0.0);
+        }
+        Some(((y - inside - bar.track.y) / travel).clamp(0.0, 1.0) * bar.max_px.max(0.0))
+    }
+
+    /// The pointer let go.
+    pub fn release(&mut self) {
+        self.held = None;
     }
 }
 
@@ -1299,5 +1410,157 @@ mod binding_tests {
     #[test]
     fn an_alphabetical_break_takes_the_heading_binding_whole() {
         family_of("table.head_role");
+    }
+}
+
+#[cfg(test)]
+mod bar_tests {
+    use super::*;
+
+    /// A bar the theme really asks for: six wide, no margin, on the
+    /// right, with a floor of four on the thumb.
+    fn look() -> TileLook {
+        TileLook {
+            sb_mode: BarMode::Overlay,
+            sb_w: 6.0,
+            sb_margin: 0.0,
+            sb_thumb_min: 4.0,
+            sb_side: 0,
+            ..TileLook::raw()
+        }
+    }
+
+    /// That bar over a grid of tiles: twenty to the side, two across,
+    /// gapless, so a row is twenty tall and the arithmetic below is the
+    /// kind a reader does in their head. No floor under the thumb —
+    /// where a thumb sits and how short it may get are two questions.
+    fn grid_look() -> TileLook {
+        TileLook { cell_pref: 20.0, cell_min: 1.0, cols: 2.0, sb_thumb_min: 0.0, ..look() }
+    }
+
+    const AREA: Rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+
+    /// A column whose units are all one height — the shape a flat grid
+    /// of tiles and a list of rows both have — said once here, so the
+    /// assertions below are about the BAR and not about either.
+    fn even(total: usize, nvis: usize, off: usize, unit: f32) -> Scroll {
+        Scroll {
+            total,
+            nvis,
+            off,
+            px: off as f32 * unit,
+            max_px: total.saturating_sub(nvis) as f32 * unit,
+        }
+    }
+
+    /// The two rectangles the hand is offered: a track down the whole
+    /// content box, and a thumb inside it whose length is the visible
+    /// share and whose position is how far down the list has come. The
+    /// track spans the box rather than the thumb, because "beside the
+    /// thumb" has to be a place a press can land.
+    #[test]
+    fn the_track_spans_the_box_and_the_thumb_says_where_the_eye_is() {
+        let top = bar_geom(&look(), AREA, even(20, 5, 0, 20.0))
+            .expect("twenty rows through five is a bar");
+        assert_eq!((top.track.x, top.track.y, top.track.w, top.track.h), (94.0, 0.0, 6.0, 100.0));
+        // A quarter on show is a quarter of the track long, at the top.
+        assert_eq!((top.thumb.x, top.thumb.y, top.thumb.w, top.thumb.h), (94.0, 0.0, 6.0, 25.0));
+        // The bar carries the bottom the offset behind it may reach, so
+        // a hand taking hold of it needs nothing else.
+        assert_eq!(top.max_px, 300.0);
+        // At the bottom of the list the thumb ends where the track does,
+        // which is what makes "the last row" visible as a position.
+        let end = bar_geom(&look(), AREA, even(20, 5, 15, 20.0)).unwrap();
+        assert_eq!(end.thumb.y + end.thumb.h, AREA.y + AREA.h);
+        // And the thumb never falls below the floor the theme sets, so a
+        // very long list still leaves something to take hold of.
+        let long = bar_geom(&look(), AREA, even(10_000, 5, 0, 20.0)).unwrap();
+        assert_eq!(long.thumb.h, 4.0);
+    }
+
+    /// No bar, no gesture: a list that fits, a theme that asks for no
+    /// bar, and a bar of no width are three ways of having nothing for
+    /// the hand to grab — and each answers none rather than a rectangle
+    /// of zero size that a press could still land in.
+    #[test]
+    fn a_list_that_fits_offers_the_hand_nothing() {
+        let fits = even(5, 5, 0, 20.0);
+        assert!(bar_geom(&look(), AREA, fits).is_none());
+        let scrolls = even(20, 5, 0, 20.0);
+        assert!(bar_geom(&TileLook { sb_mode: BarMode::None, ..look() }, AREA, scrolls).is_none());
+        assert!(bar_geom(&TileLook { sb_w: 0.0, ..look() }, AREA, scrolls).is_none());
+    }
+
+    /// The grab is ABSOLUTE: the offset is where the hand is on the
+    /// track, not how far the hand has moved. Held ten pixels down a
+    /// twenty-five-pixel thumb and carried to the middle of the box, the
+    /// list stands at the middle of its travel.
+    #[test]
+    fn the_offset_follows_the_hand_and_stops_at_both_ends() {
+        let bar = bar_geom(&look(), AREA, even(20, 5, 0, 20.0)).unwrap();
+        let mut g = ThumbGrab::default();
+        // Beside the thumb is not a grab, and nothing is held after it.
+        assert!(!g.press(60.0, &bar));
+        assert_eq!(g.drag_to(60.0, &bar), None);
+
+        assert!(g.press(10.0, &bar));
+        // 75 px of travel; the hand at 47.5 puts the thumb's top at
+        // 37.5, which is half the travel and so half the content.
+        assert_eq!(g.drag_to(47.5, &bar), Some(150.0));
+        // Past either end of the track the list stops at its own end.
+        assert_eq!(g.drag_to(-999.0, &bar), Some(0.0));
+        assert_eq!(g.drag_to(999.0, &bar), Some(300.0));
+        g.release();
+        assert_eq!(g.drag_to(47.5, &bar), None);
+    }
+
+    /// A thumb as long as its track has nowhere to travel: the answer is
+    /// the top of the list, never a division by zero.
+    #[test]
+    fn a_thumb_with_no_travel_answers_the_top() {
+        let bar = BarGeom {
+            track: Rect::new(94.0, 0.0, 6.0, 100.0),
+            thumb: Rect::new(94.0, 0.0, 6.0, 100.0),
+            max_px: 300.0,
+        };
+        let mut g = ThumbGrab::default();
+        assert!(g.press(50.0, &bar));
+        assert_eq!(g.drag_to(90.0, &bar), Some(0.0));
+    }
+
+    /// The bottom [`layout`] clamped to, said in the pixels the caller
+    /// keeps its offset in, and carried through to the bar that divides
+    /// by it.
+    ///
+    /// Nobody below this function can answer it: the caller has the
+    /// offset and not the row height, and a caller that worked the
+    /// bottom out for itself would be a second clamp with nothing
+    /// holding it to this one. The bar is where that shows — a bottom of
+    /// nothing there is a thumb that cannot be dragged anywhere and a
+    /// page that cannot be pressed down.
+    #[test]
+    fn a_grid_reports_the_bottom_it_clamped_to_and_where_it_stands() {
+        let look = grid_look();
+        // Twenty tiles two across is ten rows of twenty; five fit the
+        // hundred-tall box, so five are past the bottom and the bottom
+        // is a hundred pixels down.
+        let mut s = 0.0;
+        let l = layout(&look, AREA, 20, &mut s);
+        assert_eq!((l.cols, l.total_rows, l.nvis, l.max_off), (2, 10, 5, 5));
+        assert_eq!(l.max_px, 100.0);
+        assert_eq!((l.scroll().px, l.scroll().max_px), (0.0, 100.0));
+        assert_eq!(bar_geom(&look, AREA, l.scroll()).expect("a bar").max_px, 100.0);
+        // Scrolled past the end, the offset is pulled back to that same
+        // bottom and the bar is told the same figure, not a second one.
+        let mut s = 9999.0;
+        let l = layout(&look, AREA, 20, &mut s);
+        assert_eq!(s, 100.0);
+        assert_eq!((l.row_off, l.scroll().px, l.scroll().max_px), (5, 100.0, 100.0));
+        // A grid that fits has nowhere to go: no bottom, and no bar to
+        // divide by it.
+        let mut s = 40.0;
+        let l = layout(&look, AREA, 4, &mut s);
+        assert_eq!((l.max_off, l.max_px, s), (0, 0.0, 0.0));
+        assert!(bar_geom(&look, AREA, l.scroll()).is_none());
     }
 }

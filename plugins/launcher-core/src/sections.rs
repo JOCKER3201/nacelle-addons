@@ -278,6 +278,11 @@ pub struct Plan {
     pub nvis: usize,
     /// The furthest first-band this column can be scrolled to.
     pub max_off: usize,
+    /// The same bottom in the pixels the caller keeps its offset in —
+    /// the y of that furthest band, remembered rather than recomputed
+    /// so a dragged thumb and the clamp below cannot disagree. Bands
+    /// differ in height, so this is NOT a count times a pitch.
+    pub max_px: f32,
 }
 
 /// The bands `secs` make in `area`, and the scroll offset clamped to
@@ -319,8 +324,8 @@ pub fn plan(
         .iter()
         .position(|b| total_h - b.y <= room)
         .unwrap_or_else(|| bands.len().saturating_sub(1));
-    let max_y = bands.get(max_off).map(|b| b.y).unwrap_or(0.0);
-    *scroll = scroll.clamp(0.0, max_y.max(0.0));
+    let max_px = bands.get(max_off).map(|b| b.y).unwrap_or(0.0).max(0.0);
+    *scroll = scroll.clamp(0.0, max_px);
 
     // Which band the pixel offset has landed on: the nearest one, so a
     // notch that stops inside a band rounds rather than leaving it half
@@ -346,7 +351,7 @@ pub fn plan(
     // container.
     let nvis = nvis.max(1).min(bands.len().saturating_sub(off));
 
-    Plan { tile, gap: look.gap, cols, bands, off, nvis, max_off }
+    Plan { tile, gap: look.gap, cols, bands, off, nvis, max_off, max_px }
 }
 
 impl Plan {
@@ -358,7 +363,14 @@ impl Plan {
             total: self.bands.len(),
             nvis: self.nvis,
             off: self.off,
-            max_off: self.max_off,
+            // Read off the band, never counted: the bands are NOT all
+            // one height, so the top of the `off`-th is not `off` times
+            // anything. A bar told the index instead would stand where
+            // no hand could ever put it — a heading is ten pixels and a
+            // row of tiles is twenty, and the thumb would leave the
+            // finger dragging it by the difference.
+            px: self.bands.get(self.off).map(|b| b.y).unwrap_or(0.0),
+            max_px: self.max_px,
         }
     }
 
@@ -550,6 +562,59 @@ mod tests {
         assert!(p.bands.is_empty());
         assert_eq!((p.off, p.max_off), (0, 0));
         assert_eq!(p.scroll().total, 0);
+    }
+
+    /// The same geometry as [`look`], plus the bar a theme really asks
+    /// for beside it: six wide, on the right, no margin, and no floor
+    /// under the thumb — how short a thumb may get is a separate
+    /// question from where it stands.
+    fn look_with_bar(area_w: f32) -> TileLook {
+        TileLook {
+            sb_mode: tile::BarMode::Overlay,
+            sb_w: 6.0,
+            sb_margin: 0.0,
+            sb_thumb_min: 0.0,
+            sb_side: 0,
+            ..look(area_w)
+        }
+    }
+
+    /// The bands of an indexed column are NOT all one height, and that
+    /// is the whole reason the bar is handed a pixel rather than the
+    /// index beside it.
+    ///
+    /// A heading is ten tall here and a row of tiles twenty, so the
+    /// second band's top is a THIRD of the way down everything this
+    /// column can be scrolled through, while the second band is HALF the
+    /// bands there are to stand on. A thumb placed by the second reading
+    /// stands where no hand could have put it — grabbed and not moved it
+    /// hands back an offset half again the one it was drawn from, so the
+    /// page jumps on the first motion after the press and the thumb
+    /// walks out from under the finger holding it.
+    #[test]
+    fn the_thumb_of_an_indexed_column_stands_where_the_hand_would_put_it() {
+        let secs = of(["Ark", "Arena", "Audacity", "Blender", "Boxes"]);
+        let area = Rect::new(0.0, 0.0, 40.0, 50.0);
+        let look = look_with_bar(40.0);
+        let mut s = 10.0;
+        let p = plan(&look, 10.0, area, &secs, &mut s);
+        // Bands at 0, 10 and 30 are the three this column may stand on,
+        // so its bottom is thirty pixels and not two of anything.
+        assert_eq!((p.off, p.max_off, p.max_px), (1, 2, 30.0));
+        assert_eq!((p.scroll().px, p.scroll().max_px), (10.0, 30.0));
+        // Three bands of five on show is a thumb 30 long in a track of
+        // 50, leaving 20 of travel. A third of that travel is 6.67; the
+        // index reading would have said half of it, 10.
+        let bar = tile::bar_geom(&look, area, p.scroll()).expect("five bands through three");
+        assert!((bar.thumb.y - 20.0 / 3.0).abs() < 0.01, "{}", bar.thumb.y);
+
+        // And drawing the thumb and grabbing it are one arithmetic run
+        // each way: the hand takes hold where the thumb stands, does not
+        // move, and gets back the offset the thumb was drawn from.
+        let mut g = tile::ThumbGrab::default();
+        assert!(g.press(bar.thumb.y, &bar), "the thumb is where it was drawn");
+        let back = g.drag_to(bar.thumb.y, &bar).expect("a held thumb answers");
+        assert!((back - 10.0).abs() < 0.01, "{back}");
     }
 
     #[test]
