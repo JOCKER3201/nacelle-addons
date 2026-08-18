@@ -83,14 +83,14 @@ const RAW_STATE: StateStyleC = StateStyleC {
 };
 
 /// Rows of the class x state matrix, in the ladder's declaration order.
-/// The two this widget never enters (press, dragging) have no index here
-/// on purpose: a tab is selected, hovered, resting — or EMPTY, which is
-/// a disabled control, not a dimmer kind of occupied.
+/// The three this widget never enters (press, dragging, DISABLED) have
+/// no index here on purpose — a tab is selected, hovered or resting, and
+/// that is the whole ladder it wears. Disabled is the one worth spelling
+/// out, because this file used to reach for it: see [`tab_face`].
 const ST_IDLE: u32 = 0;
 const ST_HOVER: u32 = 1;
 const ST_SELECTED: u32 = 3;
 const ST_SELECTED_HOVER: u32 = 4;
-const ST_DISABLED: u32 = 6;
 
 /// Every token this widget reads, resolved once per theme epoch.
 #[derive(Clone, Copy, Default)]
@@ -488,6 +488,56 @@ fn tab_rect(r: RectC, pad: f32, tab_h: f32, gap: f32, count: u32, i: u32) -> Rec
     RectC { x: r.x + pad + (tw + gap) * i as f32, y: r.y + pad, w: tw, h: tab_h }
 }
 
+/// What a tab wears — the rung of the state ladder and the words on it.
+///
+/// One function for two answers because after 2026-08-18 they are one
+/// decision: an empty slot is told apart from an occupied one by its
+/// WORDS, and by nothing on the ladder at all.
+///
+/// # Why empty is not disabled
+///
+/// It was, and only while standing still: the rung went disabled at rest
+/// and hover under the pointer, so an empty slot lit up — the one thing
+/// 5.21 states cannot happen ("Disabled is first on purpose: a disabled
+/// control must never light up under the pointer"). Two ways out, and
+/// they are decided by what the slot IS to the person looking at it.
+///
+/// It is an invitation. A click on an empty slot does not fail and does
+/// not beep: the host reads the tab index, finds no session behind it
+/// and OPENS one, in the directory the active shell is standing in.
+/// `pointer` already answers "hand" over the whole strip, and this file
+/// already writes `+ Empty` under the cursor. A control that acts on a
+/// click is not a disabled control, so the lighting is right and the
+/// name was wrong — the empty slot rests on `idle` like every other tab
+/// and keeps saying what it is in the only place a difference of KIND
+/// belongs, its label.
+///
+/// The other branch — keep it disabled, drop the hover — would have to
+/// keep the click too (nothing else opens a session) and would leave a
+/// control that looks dead, gives no answer to the pointer, and works.
+/// That is a worse lie than the one this replaces.
+fn tab_face(occupied: bool, is_active: bool, hover: bool, index: u32) -> (u32, String) {
+    let rung = match (is_active, hover) {
+        (true, true) => ST_SELECTED_HOVER,
+        (true, false) => ST_SELECTED,
+        (false, true) => ST_HOVER,
+        (false, false) => ST_IDLE,
+    };
+    let label = if occupied {
+        if index == 0 { "Main shell" } else { "Shell" }
+    } else {
+        "Empty"
+    };
+    let text = if is_active {
+        format!("#{} {}", index + 1, label)
+    } else if !occupied && hover {
+        format!("+ {label}")
+    } else {
+        label.to_string()
+    };
+    (rung, text)
+}
+
 /// A frame with its corners cut off — the toolkit's `chamfer_frame`,
 /// which is a closed polyline through eight points and nothing more.
 /// Since the host took the panel's container this draws only the SCROLL
@@ -705,15 +755,11 @@ impl Shell {
             let occupied = view.tabs & (1u32 << i.min(31)) != 0;
             let is_active = i == view.tab_active;
             let hover = contains(&tr, mx, my);
-            let st = style(if is_active {
-                if hover { ST_SELECTED_HOVER } else { ST_SELECTED }
-            } else if hover {
-                ST_HOVER
-            } else if occupied {
-                ST_IDLE
-            } else {
-                ST_DISABLED
-            });
+            // The rung and the words together — one answer, because the
+            // difference between an empty slot and a full one lives in
+            // the words alone (see `tab_face`).
+            let (rung, text) = tab_face(occupied, is_active, hover, i);
+            let st = style(rung);
             let right = tr.x + tr.w;
             let bottom = tr.y + tr.h;
             // A sheared tab is a quad; without shear it is the family's
@@ -754,18 +800,6 @@ impl Shell {
                 }
             }
 
-            let label = if occupied {
-                if i == 0 { "Main shell" } else { "Shell" }
-            } else {
-                "Empty"
-            };
-            let text = if is_active {
-                format!("#{} {}", i + 1, label)
-            } else if !occupied && hover {
-                format!("+ {label}")
-            } else {
-                label.to_string()
-            };
             draw_text(
                 api,
                 ctx,
@@ -1750,5 +1784,68 @@ mod abi_tests {
             (API.button)(std::ptr::null_mut(), phase, 1.0, 1.0, r, 100.0, 100.0, &mut a);
         }
         assert_eq!(a.kind, u32::MAX, "an entry that does nothing writes nothing");
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+
+    /// The rung an empty slot wears is the rung a full one wears, and
+    /// the WORDS are the whole difference.
+    ///
+    /// Both halves in one test on purpose: either alone is satisfiable
+    /// by something nobody wants. Rungs equal and words equal would be a
+    /// strip where nothing tells the two apart; words different and
+    /// rungs different is what this replaces — disabled at rest, hover
+    /// under the pointer, a control lighting up that 5.21 says never
+    /// can. (Owner's recording, 2026-08-12; fixed 2026-08-18.)
+    #[test]
+    fn an_empty_slot_is_told_apart_by_its_words_and_never_by_its_rung() {
+        for active in [false, true] {
+            for hover in [false, true] {
+                let (empty_rung, empty_text) = tab_face(false, active, hover, 1);
+                let (full_rung, full_text) = tab_face(true, active, hover, 1);
+                assert_eq!(
+                    empty_rung, full_rung,
+                    "active={active} hover={hover}: the ladder must not know \
+                     whether a session is behind the tab"
+                );
+                assert_ne!(
+                    empty_text, full_text,
+                    "active={active} hover={hover}: then nothing at all \
+                     tells an empty slot apart"
+                );
+            }
+        }
+        // And the ladder is the ordinary one, spelled out so a rung
+        // swapped for another still fails here.
+        assert_eq!(tab_face(false, false, false, 1).0, ST_IDLE);
+        assert_eq!(tab_face(false, false, true, 1).0, ST_HOVER);
+        assert_eq!(tab_face(false, true, false, 1).0, ST_SELECTED);
+        assert_eq!(tab_face(false, true, true, 1).0, ST_SELECTED_HOVER);
+    }
+
+    /// No state this widget can be in reaches the disabled rung.
+    ///
+    /// The index is taken from the TOOLKIT's ladder rather than written
+    /// as 6 here: these numbers cross the plugin boundary as raw u32,
+    /// and a test that spelled the number itself would go on passing the
+    /// day the enum gained an eighth rung in the middle.
+    #[test]
+    fn no_tab_this_widget_draws_reaches_the_disabled_rung() {
+        let disabled = nacelle::theme::parse::State::Disabled as u32;
+        for occupied in [false, true] {
+            for active in [false, true] {
+                for hover in [false, true] {
+                    let (rung, text) = tab_face(occupied, active, hover, 0);
+                    assert_ne!(
+                        rung, disabled,
+                        "occupied={occupied} active={active} hover={hover} \
+                         ({text}) rests on the rung that must never light up"
+                    );
+                }
+            }
+        }
     }
 }
