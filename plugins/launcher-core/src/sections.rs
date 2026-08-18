@@ -14,6 +14,7 @@
 //! arrives from the theme through [`HeadLook`].
 
 use crate::tile::{self, Rect, TileLook};
+use nacelle::ui::Case;
 use nacelle::runtime::{ColorC, HostApi, RectC};
 use std::ffi::c_void;
 
@@ -165,7 +166,7 @@ pub struct HeadLook {
     pub px: f32,
     pub tracking: f32,
     pub leading: f32,
-    pub case: u32,
+    pub case: Case,
     pub font: u32,
     pub ink: ColorC,
     /// `space.2`, between the letter's line box and the rule.
@@ -184,7 +185,7 @@ impl HeadLook {
             px: 0.0,
             tracking: 0.0,
             leading: 1.0,
-            case: 0,
+            case: Case::None,
             font: tile::FONT_UI,
             ink: tile::NO_COLOR,
             gap: 0.0,
@@ -199,7 +200,7 @@ impl HeadLook {
             px: px(t.size).max(px(t.min)),
             tracking: px(t.tracking),
             leading: px(t.leading).max(1.0),
-            case: (api.theme_enum)(ctx, t.case),
+            case: Case::from_word(&tile::enum_word(api, ctx, t.case)),
             font: t.font,
             ink: (api.theme_color)(ctx, t.fg),
             gap: px(t.gap).max(0.0),
@@ -235,7 +236,7 @@ impl HeadLook {
 /// draw.
 pub fn head(api: &HostApi, ctx: *mut c_void, look: &HeadLook, area: Rect, y: f32, key: char) {
     let sp = look.px * look.tracking;
-    let text = tile::recase(look.case, key.to_string());
+    let text = tile::recase(look.case, &key.to_string());
     if look.px > 0.0 {
         tile::text(api, ctx, look.font, look.px, area.x, y, &text, look.ink, sp, 0);
     }

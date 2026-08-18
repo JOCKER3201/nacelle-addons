@@ -199,17 +199,6 @@ unsafe fn label_of<'a>(label: *const u8, label_len: u32) -> Option<&'a str> {
     std::str::from_utf8(std::slice::from_raw_parts(label, label_len as usize)).ok()
 }
 
-/// A cap in the case `type.<role>.case` asks for. Smallcaps needs
-/// per-glyph sizes only the host's font system has; through a single
-/// text call the nearest honest reading is capitals.
-fn recase(word: &str, s: &str) -> String {
-    match word {
-        "upper" | "smallcaps" => s.to_uppercase(),
-        "lower" => s.to_lowercase(),
-        _ => s.to_owned(),
-    }
-}
-
 // ----------------------------------------------------------- the widget
 
 pub struct AiSort {
@@ -362,16 +351,12 @@ impl AiSort {
         // The button is sized by its own cap, in its own role and case,
         // floored at `button.min_w` — and never more than half the
         // panel, because the box is what this panel IS.
+        // The case is the ROLE's, carried on the look. This widget spelled
+        // `type.{word}.case` from the binding by hand and then folded the
+        // transform itself, which is the fifth copy of one rule the
+        // toolkit now states once (`ui::recase`).
         let role = paint::bound_role(&mut sf, "button.role", 1.0);
-        let case = {
-            let word = sf.word("button.role");
-            if word.is_empty() {
-                String::new()
-            } else {
-                sf.word(&format!("type.{word}.case"))
-            }
-        };
-        let cap = recase(&case, LABEL_SORT);
+        let cap = role.cased(LABEL_SORT);
         let cap_w = if role.px > 0.0 {
             sf.measure(role.face, role.px, &cap, role.track)
         } else {

@@ -16,12 +16,12 @@
 //! degrades to the engine's raw look, never to the numbers that used
 //! to be the design.
 
+use nacelle::ui::Case;
 use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_EXIT,
     ACTION_NONE, ACTION_OPEN_SETTINGS, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
 };
 use nacelle::widget::factory::BuiltinWidget;
-use std::borrow::Cow;
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -39,13 +39,16 @@ const STATE_HOVER: u32 = 1;
 const STATE_PRESS: u32 = 2;
 
 // Enum word indices, in each token's declared order — `default.theme`
-// is the schema. `control.button.align = top | middle | bottom`;
-// `type.button.case = none | upper | lower | smallcaps`.
+// is the schema. `control.button.align = top | middle | bottom`.
+//
+// `type.button.case` used to be numbered here too, and is not any more:
+// an index only names a word against the schema it was interned in, and
+// this side has no schema. The word crosses through `theme_enum_word`
+// and the toolkit's own `ui::Case` reads it, so a master that reorders
+// its list — or a theme that misspells the word — answers the same here
+// as it does in the panel band.
 const ALIGN_TOP: u32 = 0;
 const ALIGN_MIDDLE: u32 = 1;
-const CASE_UPPER: u32 = 1;
-const CASE_LOWER: u32 = 2;
-const CASE_SMALLCAPS: u32 = 3;
 
 /// The host's interface, kept from the attach call. A plugin is loaded
 /// once and never unloaded, so a static is the honest shape here.
@@ -399,17 +402,6 @@ fn button_rects(h: f32, gap: f32, w_frac: f32, align: u32, r: RectC) -> [RectC; 
     ]
 }
 
-/// The label in the case `type.button.case` asks for. Smallcaps needs
-/// the per-glyph sizes only the host's font system has; through a
-/// single text call the nearest honest reading is capitals.
-fn cased(s: &str, case: u32) -> Cow<'_, str> {
-    match case {
-        CASE_UPPER | CASE_SMALLCAPS => Cow::Owned(s.to_uppercase()),
-        CASE_LOWER => Cow::Owned(s.to_lowercase()),
-        _ => Cow::Borrowed(s),
-    }
-}
-
 /// Two buttons and the gaps around them — the whole of this widget, so
 /// the box around it is exactly that tall.
 extern "C" fn sizing(instance: *mut c_void, ctx: *mut c_void, _: *const c_void) -> f32 {
@@ -468,7 +460,7 @@ extern "C" fn draw(
     let px = t_px(api, ctx, t.type_size).max(t_px(api, ctx, t.type_min_px));
     let leading = t_px(api, ctx, t.type_leading);
     let tracking = px * t_px(api, ctx, t.type_tracking);
-    let case = t_enum(api, ctx, t.type_case);
+    let case = Case::from_word(&t_word(api, ctx, t.type_case));
     let press_ms = t_px(api, ctx, t.press_ms);
 
     let (mut mx, mut my) = (0.0f32, 0.0f32);
@@ -529,7 +521,7 @@ extern "C" fn draw(
             }
         }
 
-        let label = cased(LABELS[i], case);
+        let label = nacelle::ui::recase(case, LABELS[i]);
         let bytes = label.as_bytes();
         // The glyph slot (u2 §2.12): a glyph leading the caption, the two
         // centred as one group — image 9's taskbar button. The glyphs are

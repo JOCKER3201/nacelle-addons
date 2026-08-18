@@ -149,25 +149,6 @@ unsafe fn label_of<'a>(label: *const u8, label_len: u32) -> Option<&'a str> {
 
 // ------------------------------------------------------------------ look
 
-/// The case transform a role binding's `case` token asks for, as its
-/// word. Applied here because [`Surface::text`] draws bytes as given;
-/// smallcaps needs per-glyph sizes only the host has, so through a
-/// single text call the nearest honest reading is capitals.
-fn role_case(sf: &mut impl Surface, binding: &str) -> String {
-    let role = sf.word(binding);
-    if role.is_empty() {
-        return String::new();
-    }
-    sf.word(&format!("type.{role}.case"))
-}
-
-fn recase(word: &str, s: &str) -> String {
-    match word {
-        "upper" | "smallcaps" => s.to_uppercase(),
-        "lower" => s.to_lowercase(),
-        _ => s.to_string(),
-    }
-}
 
 /// One button: the `button` class's rung for its state, under the
 /// `button.*` shape tokens and the role `button.role` binds — the same
@@ -186,8 +167,11 @@ fn button(sf: &mut impl Surface, r: Rect, caption: &str, state: State) {
     if role.px <= 0.0 {
         return;
     }
-    let case = role_case(sf, "button.role");
-    let cap = recase(&case, caption);
+    // The case is the ROLE's, carried on the look this line already
+    // holds. This widget kept its own copy of the transform — and its
+    // own copy of "which key names it" — beside a `RoleLook` that could
+    // not answer either; both are `paint::role_look`'s now.
+    let cap = role.cased(caption);
     let ty = paint::center_line_y(sf, r.y, r.h, role.px, role.leading);
     sf.text(role.face, role.px, r.cx(), ty, &cap, ink.text, role.track, Align::Center);
 }
@@ -200,8 +184,11 @@ fn button(sf: &mut impl Surface, r: Rect, caption: &str, state: State) {
 /// `button.pad_x` sat in the master with nothing reading it.
 fn button_w(sf: &mut impl Surface, caption: &str) -> f32 {
     let role = paint::bound_role(sf, "button.role", 1.0);
-    let case = role_case(sf, "button.role");
-    let cap = recase(&case, caption);
+    // The case is the ROLE's, carried on the look this line already
+    // holds. This widget kept its own copy of the transform — and its
+    // own copy of "which key names it" — beside a `RoleLook` that could
+    // not answer either; both are `paint::role_look`'s now.
+    let cap = role.cased(caption);
     let pad = sf.px("button.pad_x").max(0.0);
     sf.measure(role.face, role.px, &cap, role.track) + 2.0 * pad
 }
@@ -456,8 +443,7 @@ impl AiChat {
         if role.px <= 0.0 || role.color.a <= 0.0 {
             return;
         }
-        let case = role_case(sf, "emptystate.role");
-        let message = recase(&case, SAY_OFFLINE);
+        let message = role.cased(SAY_OFFLINE);
         let y_frac = sf.px("emptystate.y_frac");
         let lines = wrap(&message, r.w, |s| sf.measure(role.face, role.px, s, role.track));
         let pitch = role.px * role.leading.max(1.0);

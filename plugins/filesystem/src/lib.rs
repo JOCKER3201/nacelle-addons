@@ -16,6 +16,7 @@ use nacelle::runtime::{
     DRAG_BEGIN, DRAG_END, DRAG_MOVE, MASK_QUAD_ADD,
 };
 use nacelle::object::tooltip;
+use nacelle::ui::Case;
 use nacelle::widget::factory::BuiltinWidget;
 use nacelle::view::scroll::{
     scrollbar, Easing, ScrollPhysics, ScrollView, ScrollbarEdge, ScrollbarLook, ScrollbarMode, Snap,
@@ -397,7 +398,7 @@ struct Look {
     banner_px: f32,
     banner_tracking: f32,
     banner_leading: f32,
-    banner_case: u32,
+    banner_case: Case,
     banner_font: u32,
     badge_h: f32,
     badge_pad: f32,
@@ -415,7 +416,7 @@ struct Look {
     corner: f32,
     caption_px: f32,
     caption_tracking: f32,
-    caption_case: u32,
+    caption_case: Case,
     caption_font: u32,
     caption_gap: f32,
     icon_inset_x: f32,
@@ -477,7 +478,7 @@ impl Look {
             banner_px: 0.0,
             banner_tracking: 0.0,
             banner_leading: 1.0,
-            banner_case: 0,
+            banner_case: Case::None,
             banner_font: FONT_UI,
             badge_h: 0.0,
             badge_pad: 0.0,
@@ -494,7 +495,7 @@ impl Look {
             corner: 0.0,
             caption_px: 0.0,
             caption_tracking: 0.0,
-            caption_case: 0,
+            caption_case: Case::None,
             caption_font: FONT_UI,
             caption_gap: 0.0,
             icon_inset_x: 0.0,
@@ -586,7 +587,7 @@ impl Look {
             banner_px: px(t.banner_size).max(px(t.banner_min)),
             banner_tracking: px(t.banner_tracking),
             banner_leading: px(t.banner_leading).max(1.0),
-            banner_case: (api.theme_enum)(ctx, t.banner_case),
+            banner_case: Case::from_word(&enum_word(api, ctx, t.banner_case)),
             banner_font: t.banner_font,
             badge_h: px(t.badge_h),
             badge_pad: px(t.badge_pad),
@@ -601,7 +602,7 @@ impl Look {
             corner: px(t.corner),
             caption_px: px(t.caption_size).max(px(t.caption_min)),
             caption_tracking: px(t.caption_tracking),
-            caption_case: (api.theme_enum)(ctx, t.caption_case),
+            caption_case: Case::from_word(&enum_word(api, ctx, t.caption_case)),
             caption_font: t.caption_font,
             caption_gap: px(t.caption_gap),
             icon_inset_x: px(t.icon_inset_x),
@@ -1037,7 +1038,7 @@ impl Filesystem {
             // Solid mirrors `ui::badge`: the text colour is the bed and
             // `on` is the ink. Hollow is the ring-and-bed form the
             // SCROLL pill wears.
-            let text = recase(look.banner_case, err.clone());
+            let text = recase(look.banner_case, err);
             let bpx = look.banner_px;
             let track = bpx * look.banner_tracking;
             let tw = measure(api, ctx, look.banner_font, bpx, &text, track);
@@ -1309,7 +1310,7 @@ impl Filesystem {
             }
 
             // Name under the icon, trimmed by measured width.
-            let name = recase(look.caption_case, entry.name.clone());
+            let name = recase(look.caption_case, &entry.name);
             let name =
                 fit_name(api, ctx, look.caption_font, name_px, &name, tile, name_sp);
             draw_text(
@@ -1443,7 +1444,19 @@ fn row_span(
     (first, nvis.min(total.saturating_sub(first)), 0.0)
 }
 
-/// Trims text (with a trailing ellipsis) so it fits the given width.
+/// Trims text (with a trailing marker) so it fits the given width.
+///
+/// The marker is `type.ellipsis`, read off the host. It was `"\u{2026}"`
+/// written into this function, in a widget whose whole rule is that
+/// nothing here decides anything — and the master had declared the key
+/// and named this very call site in its comment ("a console theme may
+/// prefer `...` or `>`") the whole time. A host too old to answer text
+/// tokens, or a theme that states none, trims with no marker at all:
+/// the cut still happens, it simply goes unmarked, which is what a key
+/// nobody wrote honestly means.
+///
+/// Read only once the run is known NOT to fit, so a name that fits pays
+/// nothing for the key.
 fn fit_name(
     api: &HostApi,
     ctx: *mut c_void,
@@ -1456,30 +1469,29 @@ fn fit_name(
     if measure(api, ctx, font, px, text, spacing) <= max_w {
         return text.to_string();
     }
+    let cut = api.theme_text_of(ctx, "type.ellipsis");
     let chars: Vec<char> = text.chars().collect();
     let mut n = chars.len().saturating_sub(1);
     while n > 1 {
-        let cand: String = chars[..n].iter().collect::<String>() + "\u{2026}";
+        let cand: String = chars[..n].iter().collect::<String>() + cut.as_str();
         if measure(api, ctx, font, px, &cand, spacing) <= max_w {
             return cand;
         }
         n -= 1;
     }
-    "\u{2026}".to_string()
+    cut
 }
 
 /// A type role's case transform, applied here because the text entry
-/// draws bytes as given. The indices are the schema's declared order —
-/// every `*.case` in the master declares `enum: none | upper | lower |
-/// smallcaps`, and `theme_enum` indexes that list. Smallcaps needs
-/// per-glyph sizes only the host's font system has; through a single
-/// text call the nearest honest reading is capitals.
-fn recase(word: u32, s: String) -> String {
-    match word {
-        1 | 3 => s.to_uppercase(), // upper | smallcaps
-        2 => s.to_lowercase(),     // lower
-        _ => s,                    // none, or a word this build predates
-    }
+/// draws bytes as given.
+///
+/// The transform is the TOOLKIT's — `nacelle::ui::recase` — so a word the
+/// master's list does not hold answers the same way here as in the panel
+/// band. The word crosses through `theme_enum_word` and not as an INDEX
+/// into the enum: an index only names a word against the schema it was
+/// interned in, and this side has no schema at all.
+fn recase(case: Case, s: &str) -> String {
+    nacelle::ui::recase(case, s).into_owned()
 }
 
 /// A filled rectangle with its corners cut off — the toolkit's

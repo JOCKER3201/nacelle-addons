@@ -19,6 +19,7 @@ use nacelle::runtime::{
     ColorC, HostApi, RectC, StateStyleC, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
     MASK_QUAD_ADD,
 };
+use nacelle::ui::Case;
 use std::ffi::c_void;
 
 /// The font slots, as the host numbers them — the theme's own
@@ -237,7 +238,7 @@ pub struct EmptyLook {
     pub px: f32,
     pub tracking: f32,
     pub leading: f32,
-    pub case: u32,
+    pub case: Case,
     pub font: u32,
     pub ink: ColorC,
 }
@@ -252,7 +253,7 @@ impl EmptyLook {
             px: 0.0,
             tracking: 0.0,
             leading: 1.0,
-            case: 0,
+            case: Case::None,
             font: FONT_UI,
             ink: NO_COLOR,
         }
@@ -268,7 +269,7 @@ impl EmptyLook {
             // each other; the role declares 1.0 .. 2.0 and the floor is
             // what a nonsense value degrades to, not a chosen pitch.
             leading: px(t.leading).max(1.0),
-            case: (api.theme_enum)(ctx, t.case),
+            case: Case::from_word(&enum_word(api, ctx, t.case)),
             font: t.font,
             ink: (api.theme_color)(ctx, t.fg),
         }
@@ -294,7 +295,7 @@ pub fn empty_line(
         return;
     }
     let sp = look.px * look.tracking;
-    let text = recase(look.case, what.to_string());
+    let text = recase(look.case, what);
     // The fraction says where in the box the line sits; the role's own
     // leading is what centres the LINE BOX on it rather than hanging the
     // glyphs below it.
@@ -446,7 +447,7 @@ pub struct TileLook {
     pub caption_px: f32,
     pub caption_tracking: f32,
     pub caption_leading: f32,
-    pub caption_case: u32,
+    pub caption_case: Case,
     pub caption_font: u32,
     /// `motion.press.duration_ms` already scaled by `motion.scale` and
     /// turned into seconds — a reduced-motion theme sets the scale to 0
@@ -497,7 +498,7 @@ impl TileLook {
             caption_px: 0.0,
             caption_tracking: 0.0,
             caption_leading: 1.0,
-            caption_case: 0,
+            caption_case: Case::None,
             caption_font: FONT_UI,
             press_s: 0.0,
             glow_scale: 0.0,
@@ -533,7 +534,7 @@ impl TileLook {
             caption_px: px(t.caption_size).max(px(t.caption_min)),
             caption_tracking: px(t.caption_tracking),
             caption_leading: px(t.caption_leading).max(1.0),
-            caption_case: (api.theme_enum)(ctx, t.caption_case),
+            caption_case: Case::from_word(&enum_word(api, ctx, t.caption_case)),
             caption_font: t.caption_font,
             press_s: px(t.press_ms) * px(t.motion_scale) / 1000.0,
             glow_scale: px(t.glow_scale),
@@ -645,7 +646,19 @@ pub fn initial(name: &str) -> String {
     }
 }
 
-/// Trims text (with a trailing ellipsis) so it fits the given width.
+/// Trims text (with a trailing marker) so it fits the given width.
+///
+/// The marker is `type.ellipsis`, read off the host. It was `"\u{2026}"`
+/// written into this function, in a widget whose whole rule is that
+/// nothing here decides anything — and the master had declared the key
+/// and named this very call site in its comment ("a console theme may
+/// prefer `...` or `>`") the whole time. A host too old to answer text
+/// tokens, or a theme that states none, trims with no marker at all:
+/// the cut still happens, it simply goes unmarked, which is what a key
+/// nobody wrote honestly means.
+///
+/// Read only once the run is known NOT to fit, so a name that fits pays
+/// nothing for the key.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_name(
     api: &HostApi,
@@ -659,30 +672,31 @@ pub fn fit_name(
     if measure(api, ctx, font, px, text, spacing) <= max_w {
         return text.to_string();
     }
+    let cut = api.theme_text_of(ctx, "type.ellipsis");
     let chars: Vec<char> = text.chars().collect();
     let mut n = chars.len().saturating_sub(1);
     while n > 1 {
-        let cand: String = chars[..n].iter().collect::<String>() + "\u{2026}";
+        let cand: String = chars[..n].iter().collect::<String>() + cut.as_str();
         if measure(api, ctx, font, px, &cand, spacing) <= max_w {
             return cand;
         }
         n -= 1;
     }
-    "\u{2026}".to_string()
+    cut
 }
 
 /// A type role's case transform, applied here because the text entry
-/// draws bytes as given. The indices are the schema's declared order —
-/// every `*.case` declares `enum: none | upper | lower | smallcaps`,
-/// and `theme_enum` indexes that list. Smallcaps needs per-glyph sizes
-/// only the host's font system has; through a single text call the
-/// nearest honest reading is capitals.
-pub fn recase(word: u32, s: String) -> String {
-    match word {
-        1 | 3 => s.to_uppercase(), // upper | smallcaps
-        2 => s.to_lowercase(),     // lower
-        _ => s,                    // none, or a word this build predates
-    }
+/// draws bytes as given.
+///
+/// The transform itself is the TOOLKIT's — `nacelle::ui::recase`, the one
+/// applier the panel band, the window title and the unit suffix go
+/// through — so a word the master's list does not hold answers the same
+/// way on both sides of the boundary. What is left here is the crossing:
+/// the word arrives through `theme_enum_word`, not as an INDEX into the
+/// enum, because an index only names a word against the schema it was
+/// interned in and this side has no schema at all.
+pub fn recase(case: Case, s: &str) -> String {
+    nacelle::ui::recase(case, s).into_owned()
 }
 
 // ----------------------------------------------------------------- shapes
@@ -995,7 +1009,7 @@ pub fn tile_face(
 
     let px = look.caption_px;
     let sp = px * look.caption_tracking;
-    let name = recase(look.caption_case, label.to_string());
+    let name = recase(look.caption_case, label);
     let name = fit_name(api, ctx, look.caption_font, px, &name, t.w, sp);
     text(
         api,
@@ -1176,6 +1190,32 @@ impl ThumbGrab {
 #[cfg(test)]
 mod token_tests {
     use super::*;
+
+    /// The case transform is the TOOLKIT's, and a word the master's list
+    /// does not hold transforms nothing.
+    ///
+    /// This widget used to hold its own copy, keyed on the ENUM INDEX:
+    /// `1 | 3 => to_uppercase()`. Two things were wrong with it — an
+    /// index means nothing on this side of the boundary, where there is
+    /// no schema to number against, and a copy of a rule is a rule that
+    /// stops matching the original. Both end here.
+    #[test]
+    fn the_case_a_tile_sets_its_caption_in_is_the_toolkits() {
+        assert_eq!(recase(Case::from_word("upper"), "Files"), "FILES");
+        assert_eq!(recase(Case::from_word("lower"), "Files"), "files");
+        assert_eq!(recase(Case::from_word("none"), "Files"), "Files");
+        // Smallcaps is drawn as capitals until the host's font layer can
+        // set true small caps — the toolkit's approximation, not a
+        // second one taken here.
+        assert_eq!(recase(Case::from_word("smallcaps"), "Files"), "FILES");
+        // A theme with a typo gets NO transform and a line on stderr,
+        // where the index-keyed copy would have silently answered the
+        // word at that position — or, on the host side, capitals.
+        assert_eq!(recase(Case::from_word("uper"), "Files"), "Files");
+        // And a host too old to answer words at all hands back the empty
+        // string, which is a missing token and not a typo.
+        assert_eq!(recase(Case::from_word(""), "Files"), "Files");
+    }
 
     /// The tile grid's caption is set in the role the master BINDS, and
     /// the binding is followed to a family that really exists — the
