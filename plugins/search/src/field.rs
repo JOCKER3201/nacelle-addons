@@ -398,6 +398,11 @@ mod shape_tests {
                 None => theme::id(name).and_then(theme::enum_word_of).unwrap_or_default(),
             }
         }
+        /// The master's own text tokens, like `flag` and `word` beside
+        /// it: this probe stands in for a window, not for a theme.
+        fn theme_text(&mut self, name: &str) -> String {
+            theme::diagnostics().text(name).unwrap_or_default().to_string()
+        }
         fn class_state(&mut self, class: &str, state: State) -> StateInk {
             match theme::class_id(class) {
                 Some(c) => StateInk::from(theme::resolved().class_state(c, state)),

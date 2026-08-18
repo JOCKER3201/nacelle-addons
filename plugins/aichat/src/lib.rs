@@ -1200,6 +1200,11 @@ mod layout_tests {
         fn word(&mut self, _: &str) -> String {
             String::new()
         }
+        /// Nothing, like every other token this surface is asked for:
+        /// it measures runs and draws none, so no trim is reached.
+        fn theme_text(&mut self, _: &str) -> String {
+            String::new()
+        }
         fn class_state(&mut self, _: &str, _: State) -> nacelle::view::surface::StateInk {
             nacelle::view::surface::StateInk::raw()
         }
@@ -1310,6 +1315,11 @@ mod layout_tests {
             false
         }
         fn word(&mut self, _: &str) -> String {
+            String::new()
+        }
+        /// Nothing, like every other token this surface is asked for:
+        /// it measures runs and draws none, so no trim is reached.
+        fn theme_text(&mut self, _: &str) -> String {
             String::new()
         }
         fn class_state(&mut self, _: &str, _: State) -> nacelle::view::surface::StateInk {

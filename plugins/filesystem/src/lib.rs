@@ -418,6 +418,22 @@ struct Look {
     caption_tracking: f32,
     caption_case: Case,
     caption_font: u32,
+    /// `type.ellipsis` — what a file name this grid had to cut ends on.
+    ///
+    /// A STRING and not an id, because a text token is not baked into
+    /// the table the other kinds are read from: the host answers it by
+    /// scanning every text key the theme declares, under the engine's
+    /// global lock, which is why its ABI entry documents itself as
+    /// init-time. It is read HERE, once per epoch, beside the case word
+    /// and every other resolved value, and handed to [`fit_name`] —
+    /// never read on the draw path, where it cost two crossings of the
+    /// ABI and two turns of that lock for every trimmed name in the
+    /// directory, on every frame.
+    ///
+    /// EMPTY is the honest answer twice over: a theme that declares no
+    /// key, and a host too old to be asked. Both mean a cut that goes
+    /// unmarked, and a widget must not be able to tell them apart.
+    ellipsis: String,
     caption_gap: f32,
     icon_inset_x: f32,
     icon_inset_y: f32,
@@ -497,6 +513,7 @@ impl Look {
             caption_tracking: 0.0,
             caption_case: Case::None,
             caption_font: FONT_UI,
+            ellipsis: String::new(),
             caption_gap: 0.0,
             icon_inset_x: 0.0,
             icon_inset_y: 0.0,
@@ -604,6 +621,7 @@ impl Look {
             caption_tracking: px(t.caption_tracking),
             caption_case: Case::from_word(&enum_word(api, ctx, t.caption_case)),
             caption_font: t.caption_font,
+            ellipsis: api.theme_text_of(ctx, "type.ellipsis"),
             caption_gap: px(t.caption_gap),
             icon_inset_x: px(t.icon_inset_x),
             icon_inset_y: px(t.icon_inset_y),
@@ -1312,7 +1330,7 @@ impl Filesystem {
             // Name under the icon, trimmed by measured width.
             let name = recase(look.caption_case, &entry.name);
             let name =
-                fit_name(api, ctx, look.caption_font, name_px, &name, tile, name_sp);
+                fit_name(api, ctx, look.caption_font, name_px, &name, tile, name_sp, &look.ellipsis);
             draw_text(
                 api,
                 ctx,
@@ -1446,17 +1464,26 @@ fn row_span(
 
 /// Trims text (with a trailing marker) so it fits the given width.
 ///
-/// The marker is `type.ellipsis`, read off the host. It was `"\u{2026}"`
-/// written into this function, in a widget whose whole rule is that
-/// nothing here decides anything — and the master had declared the key
-/// and named this very call site in its comment ("a console theme may
-/// prefer `...` or `>`") the whole time. A host too old to answer text
-/// tokens, or a theme that states none, trims with no marker at all:
-/// the cut still happens, it simply goes unmarked, which is what a key
-/// nobody wrote honestly means.
+/// The marker is `type.ellipsis`. It was `"\u{2026}"` written into this
+/// function, in a widget whose whole rule is that nothing here decides
+/// anything — and the master had declared the key and named this very
+/// call site in its comment ("a console theme may prefer `...` or `>`")
+/// the whole time. A host too old to answer text tokens, or a theme that
+/// states none, passes the EMPTY string and the cut goes unmarked: the
+/// cut still happens, which is what a key nobody wrote honestly means.
 ///
-/// Read only once the run is known NOT to fit, so a name that fits pays
-/// nothing for the key.
+/// `cut` is a PARAMETER and not a read, and that is the whole point of
+/// it. [`nacelle::runtime::HostApi::theme_text`] is documented init-time
+/// — "call at widget init, cache, invalidate on `theme_epoch`" — because
+/// the host answers it by interning the name, reading the id back to a
+/// name and scanning every text key the theme declares, taking the
+/// engine's global lock twice on the way. Read here, that bill fell once
+/// per trimmed name per frame: a directory of two hundred long names at
+/// 60 Hz took the theme engine's lock twenty-four thousand times a
+/// second. It belongs in the per-epoch [`Look`], where the case word and
+/// every other resolved value already sits, and passing it in is how a
+/// caller is made to put it there.
+#[allow(clippy::too_many_arguments)]
 fn fit_name(
     api: &HostApi,
     ctx: *mut c_void,
@@ -1465,21 +1492,21 @@ fn fit_name(
     text: &str,
     max_w: f32,
     spacing: f32,
+    cut: &str,
 ) -> String {
     if measure(api, ctx, font, px, text, spacing) <= max_w {
         return text.to_string();
     }
-    let cut = api.theme_text_of(ctx, "type.ellipsis");
     let chars: Vec<char> = text.chars().collect();
     let mut n = chars.len().saturating_sub(1);
     while n > 1 {
-        let cand: String = chars[..n].iter().collect::<String>() + cut.as_str();
+        let cand: String = chars[..n].iter().collect::<String>() + cut;
         if measure(api, ctx, font, px, &cand, spacing) <= max_w {
             return cand;
         }
         n -= 1;
     }
-    cut
+    cut.to_string()
 }
 
 /// A type role's case transform, applied here because the text entry

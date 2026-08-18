@@ -759,7 +759,13 @@ fn row(
         - look.list.status_gap
         - lx;
     let name = tile::recase(look.list.label_case, label);
-    let name = tile::fit_name(api, ctx, font, px, &name, room.max(0.0), sp);
+    // The marker off the TILE block, which is where this plugin caches
+    // it: `type.ellipsis` is one string for the whole theme and not a
+    // property of any one role, so a second copy of it on `ListLook`
+    // would be the same key read twice per epoch to say the same thing.
+    // It is never read here — see `tile::fit_name` for what a per-frame
+    // reading of a text token costs.
+    let name = tile::fit_name(api, ctx, font, px, &name, room.max(0.0), sp, &look.tile.ellipsis);
     tile::text(
         api,
         ctx,
