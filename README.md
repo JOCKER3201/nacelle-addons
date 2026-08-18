@@ -213,9 +213,18 @@ is what a script is for.
 
 ```sh
 make                # build the compiled addons (cargo, release)
-make install        # build, then install to ~/.local/share/nacelle-desktop/addons
-sudo make install   # build, then install to /usr/local/share/nacelle-desktop/addons
+make install        # build, then install to ~/.local/share/nacelle/addons
+sudo make install   # build, then install to /usr/local/share/nacelle/addons
 ```
+
+The directory is named after the nacelle **family**, not after one of
+its programs: `nacelle-themes` installs beside it and the program looks
+there first. Installations made before 2026-08-18 landed under
+`share/nacelle-desktop` instead; nothing of theirs is moved or removed,
+because both names are read — the family's first, the old one directly
+behind it — and this installer reads both too. `make check-install`
+answers the question for your own tree: it installs into a throwaway
+directory and says where things went.
 
 `make install` builds what it installs, so one command per repository
 is still the whole story. A packager who has already built installs
@@ -231,11 +240,19 @@ already installed is never overwritten: an addon you have edited
 survives an upgrade untouched. A `.so` *is* overwritten, because nobody
 edits a shared object — it is a build artefact of this repository, and
 a stale one against a newer toolkit is a plugin the loader turns away.
-Installs from before the addons layout
+"Already installed" is asked of both directory names, so a script you
+edited under the old one is not shadowed by a factory copy laid above
+it. Installs from before the addons layout
 (`widgets/<category>/<name>/`) are migrated automatically — by the
-program at startup for your own directory, and by `make install` for a
-tree the program cannot write; either way every script is rescued into
-the new place first, never overwriting.
+program at startup for the directory it writes to, and by
+`make install` under either name; either way every script is rescued
+into the new place first, never overwriting, and only an emptied
+directory disappears.
+
+`make uninstall` takes back what this repository installed, under both
+names: the scripts it shipped that you have not edited, and the
+libraries it built. Anything else in there is somebody's, including
+every addon in a pre-addons `widgets/` tree, and it is left alone.
 
 ## Writing your own
 
