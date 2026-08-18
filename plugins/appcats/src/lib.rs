@@ -46,6 +46,7 @@ use nacelle::runtime::{
     ActionC, ChromeC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_CAPTURE,
     ACTION_NONE, CORNER_SQUARE, DRAG_BEGIN, DRAG_END, DRAG_MOVE,
 };
+use nacelle::ui::Case;
 use nacelle::widget::factory::BuiltinWidget;
 use nacelle_launcher_core::cats::{self, Category};
 use nacelle_launcher_core::desktop::{self, AppEntry};
@@ -182,11 +183,11 @@ struct ListLook {
     status_px: f32,
     status_tracking: f32,
     status_leading: f32,
-    status_case: u32,
+    status_case: Case,
     label_px: f32,
     label_tracking: f32,
     label_leading: f32,
-    label_case: u32,
+    label_case: Case,
     status_font: u32,
     label_font: u32,
 }
@@ -223,11 +224,11 @@ impl ListLook {
             status_px: 0.0,
             status_tracking: 0.0,
             status_leading: 1.0,
-            status_case: 0,
+            status_case: Case::None,
             label_px: 0.0,
             label_tracking: 0.0,
             label_leading: 1.0,
-            label_case: 0,
+            label_case: Case::None,
             status_font: tile::FONT_UI,
             label_font: tile::FONT_UI,
         }
@@ -252,11 +253,11 @@ impl ListLook {
             status_px: px(t.status_size).max(px(t.status_min)),
             status_tracking: px(t.status_tracking),
             status_leading: px(t.status_leading).max(1.0),
-            status_case: (api.theme_enum)(ctx, t.status_case),
+            status_case: Case::from_word(&tile::enum_word(api, ctx, t.status_case)),
             label_px: px(t.label_size).max(px(t.label_min)),
             label_tracking: px(t.label_tracking),
             label_leading: px(t.label_leading).max(1.0),
-            label_case: (api.theme_enum)(ctx, t.label_case),
+            label_case: Case::from_word(&tile::enum_word(api, ctx, t.label_case)),
             status_font: t.status_font,
             label_font: t.label_font,
         }
@@ -730,7 +731,7 @@ fn row(
     // arrangement.
     let cpx = look.list.status_px;
     let csp = cpx * look.list.status_tracking;
-    let count = tile::recase(look.list.status_case, right.to_string());
+    let count = tile::recase(look.list.status_case, right);
     let cx = rect.right() - look.list.pad_x;
     tile::text(
         api,
@@ -757,8 +758,14 @@ fn row(
         - tile::measure(api, ctx, look.list.status_font, cpx, &count, csp)
         - look.list.status_gap
         - lx;
-    let name = tile::recase(look.list.label_case, label.to_string());
-    let name = tile::fit_name(api, ctx, font, px, &name, room.max(0.0), sp);
+    let name = tile::recase(look.list.label_case, label);
+    // The marker off the TILE block, which is where this plugin caches
+    // it: `type.ellipsis` is one string for the whole theme and not a
+    // property of any one role, so a second copy of it on `ListLook`
+    // would be the same key read twice per epoch to say the same thing.
+    // It is never read here — see `tile::fit_name` for what a per-frame
+    // reading of a text token costs.
+    let name = tile::fit_name(api, ctx, font, px, &name, room.max(0.0), sp, &look.tile.ellipsis);
     tile::text(
         api,
         ctx,

@@ -19,6 +19,7 @@ use nacelle::runtime::{
     ColorC, HostApi, RectC, StateStyleC, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
     MASK_QUAD_ADD,
 };
+use nacelle::ui::Case;
 use std::ffi::c_void;
 
 /// The font slots, as the host numbers them — the theme's own
@@ -237,7 +238,7 @@ pub struct EmptyLook {
     pub px: f32,
     pub tracking: f32,
     pub leading: f32,
-    pub case: u32,
+    pub case: Case,
     pub font: u32,
     pub ink: ColorC,
 }
@@ -252,7 +253,7 @@ impl EmptyLook {
             px: 0.0,
             tracking: 0.0,
             leading: 1.0,
-            case: 0,
+            case: Case::None,
             font: FONT_UI,
             ink: NO_COLOR,
         }
@@ -268,7 +269,7 @@ impl EmptyLook {
             // each other; the role declares 1.0 .. 2.0 and the floor is
             // what a nonsense value degrades to, not a chosen pitch.
             leading: px(t.leading).max(1.0),
-            case: (api.theme_enum)(ctx, t.case),
+            case: Case::from_word(&enum_word(api, ctx, t.case)),
             font: t.font,
             ink: (api.theme_color)(ctx, t.fg),
         }
@@ -294,7 +295,7 @@ pub fn empty_line(
         return;
     }
     let sp = look.px * look.tracking;
-    let text = recase(look.case, what.to_string());
+    let text = recase(look.case, what);
     // The fraction says where in the box the line sits; the role's own
     // leading is what centres the LINE BOX on it rather than hanging the
     // glyphs below it.
@@ -446,8 +447,24 @@ pub struct TileLook {
     pub caption_px: f32,
     pub caption_tracking: f32,
     pub caption_leading: f32,
-    pub caption_case: u32,
+    pub caption_case: Case,
     pub caption_font: u32,
+    /// `type.ellipsis` — what a name this grid had to cut ends on.
+    ///
+    /// A STRING and not an id, because a text token is not baked into
+    /// the table the other kinds are read from: the host answers it by
+    /// scanning every text key the theme declares, under the engine's
+    /// global lock, which is why its ABI entry documents itself as
+    /// init-time. It is read HERE, once per epoch, beside the case word
+    /// and every other resolved value, and handed to
+    /// [`fit_name`] — never read on the draw path, where it cost two
+    /// crossings of the ABI and two turns of that lock per trimmed name
+    /// per frame.
+    ///
+    /// EMPTY is the honest answer twice over: a theme that declares no
+    /// key, and a host too old to be asked. Both mean a cut that goes
+    /// unmarked, and a widget must not be able to tell them apart.
+    pub ellipsis: String,
     /// `motion.press.duration_ms` already scaled by `motion.scale` and
     /// turned into seconds — a reduced-motion theme sets the scale to 0
     /// and the flash simply never shows.
@@ -497,8 +514,9 @@ impl TileLook {
             caption_px: 0.0,
             caption_tracking: 0.0,
             caption_leading: 1.0,
-            caption_case: 0,
+            caption_case: Case::None,
             caption_font: FONT_UI,
+            ellipsis: String::new(),
             press_s: 0.0,
             glow_scale: 0.0,
             sb_mode: BarMode::None,
@@ -533,8 +551,9 @@ impl TileLook {
             caption_px: px(t.caption_size).max(px(t.caption_min)),
             caption_tracking: px(t.caption_tracking),
             caption_leading: px(t.caption_leading).max(1.0),
-            caption_case: (api.theme_enum)(ctx, t.caption_case),
+            caption_case: Case::from_word(&enum_word(api, ctx, t.caption_case)),
             caption_font: t.caption_font,
+            ellipsis: api.theme_text_of(ctx, "type.ellipsis"),
             press_s: px(t.press_ms) * px(t.motion_scale) / 1000.0,
             glow_scale: px(t.glow_scale),
             sb_mode: t.sb_mode,
@@ -645,7 +664,27 @@ pub fn initial(name: &str) -> String {
     }
 }
 
-/// Trims text (with a trailing ellipsis) so it fits the given width.
+/// Trims text (with a trailing marker) so it fits the given width.
+///
+/// The marker is `type.ellipsis`. It was `"\u{2026}"` written into this
+/// function, in a widget whose whole rule is that nothing here decides
+/// anything — and the master had declared the key and named this very
+/// call site in its comment ("a console theme may prefer `...` or `>`")
+/// the whole time. A host too old to answer text tokens, or a theme that
+/// states none, passes the EMPTY string and the cut goes unmarked: the
+/// cut still happens, which is what a key nobody wrote honestly means.
+///
+/// `cut` is a PARAMETER and not a read, and that is the whole point of
+/// it. [`nacelle::runtime::HostApi::theme_text`] is documented init-time
+/// — "call at widget init, cache, invalidate on `theme_epoch`" — because
+/// the host answers it by interning the name, reading the id back to a
+/// name and scanning every text key the theme declares, and it takes the
+/// engine's global lock TWICE on the way. Read here, that bill fell once
+/// per trimmed name per frame: a directory of two hundred long names at
+/// 60 Hz took the theme engine's lock twenty-four thousand times a
+/// second. It belongs in the caller's per-epoch [`TileLook`], where the
+/// case word and every other resolved value already sits, and passing it
+/// in is how a caller is made to put it there.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_name(
     api: &HostApi,
@@ -655,6 +694,7 @@ pub fn fit_name(
     text: &str,
     max_w: f32,
     spacing: f32,
+    cut: &str,
 ) -> String {
     if measure(api, ctx, font, px, text, spacing) <= max_w {
         return text.to_string();
@@ -662,27 +702,27 @@ pub fn fit_name(
     let chars: Vec<char> = text.chars().collect();
     let mut n = chars.len().saturating_sub(1);
     while n > 1 {
-        let cand: String = chars[..n].iter().collect::<String>() + "\u{2026}";
+        let cand: String = chars[..n].iter().collect::<String>() + cut;
         if measure(api, ctx, font, px, &cand, spacing) <= max_w {
             return cand;
         }
         n -= 1;
     }
-    "\u{2026}".to_string()
+    cut.to_string()
 }
 
 /// A type role's case transform, applied here because the text entry
-/// draws bytes as given. The indices are the schema's declared order —
-/// every `*.case` declares `enum: none | upper | lower | smallcaps`,
-/// and `theme_enum` indexes that list. Smallcaps needs per-glyph sizes
-/// only the host's font system has; through a single text call the
-/// nearest honest reading is capitals.
-pub fn recase(word: u32, s: String) -> String {
-    match word {
-        1 | 3 => s.to_uppercase(), // upper | smallcaps
-        2 => s.to_lowercase(),     // lower
-        _ => s,                    // none, or a word this build predates
-    }
+/// draws bytes as given.
+///
+/// The transform itself is the TOOLKIT's — `nacelle::ui::recase`, the one
+/// applier the panel band, the window title and the unit suffix go
+/// through — so a word the master's list does not hold answers the same
+/// way on both sides of the boundary. What is left here is the crossing:
+/// the word arrives through `theme_enum_word`, not as an INDEX into the
+/// enum, because an index only names a word against the schema it was
+/// interned in and this side has no schema at all.
+pub fn recase(case: Case, s: &str) -> String {
+    nacelle::ui::recase(case, s).into_owned()
 }
 
 // ----------------------------------------------------------------- shapes
@@ -995,8 +1035,8 @@ pub fn tile_face(
 
     let px = look.caption_px;
     let sp = px * look.caption_tracking;
-    let name = recase(look.caption_case, label.to_string());
-    let name = fit_name(api, ctx, look.caption_font, px, &name, t.w, sp);
+    let name = recase(look.caption_case, label);
+    let name = fit_name(api, ctx, look.caption_font, px, &name, t.w, sp, &look.ellipsis);
     text(
         api,
         ctx,
@@ -1176,6 +1216,32 @@ impl ThumbGrab {
 #[cfg(test)]
 mod token_tests {
     use super::*;
+
+    /// The case transform is the TOOLKIT's, and a word the master's list
+    /// does not hold transforms nothing.
+    ///
+    /// This widget used to hold its own copy, keyed on the ENUM INDEX:
+    /// `1 | 3 => to_uppercase()`. Two things were wrong with it — an
+    /// index means nothing on this side of the boundary, where there is
+    /// no schema to number against, and a copy of a rule is a rule that
+    /// stops matching the original. Both end here.
+    #[test]
+    fn the_case_a_tile_sets_its_caption_in_is_the_toolkits() {
+        assert_eq!(recase(Case::from_word("upper"), "Files"), "FILES");
+        assert_eq!(recase(Case::from_word("lower"), "Files"), "files");
+        assert_eq!(recase(Case::from_word("none"), "Files"), "Files");
+        // Smallcaps is drawn as capitals until the host's font layer can
+        // set true small caps — the toolkit's approximation, not a
+        // second one taken here.
+        assert_eq!(recase(Case::from_word("smallcaps"), "Files"), "FILES");
+        // A theme with a typo gets NO transform and a line on stderr,
+        // where the index-keyed copy would have silently answered the
+        // word at that position — or, on the host side, capitals.
+        assert_eq!(recase(Case::from_word("uper"), "Files"), "Files");
+        // And a host too old to answer words at all hands back the empty
+        // string, which is a missing token and not a typo.
+        assert_eq!(recase(Case::from_word(""), "Files"), "Files");
+    }
 
     /// The tile grid's caption is set in the role the master BINDS, and
     /// the binding is followed to a family that really exists — the
@@ -1562,5 +1628,122 @@ mod bar_tests {
         let l = layout(&look, AREA, 4, &mut s);
         assert_eq!((l.max_off, l.max_px, s), (0, 0.0, 0.0));
         assert!(bar_geom(&look, AREA, l.scroll()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    //! `type.ellipsis` is an INIT-TIME token, and this is the guard that
+    //! it stays one.
+    //!
+    //! `HostApi::theme_text`'s own documentation says so — "call at
+    //! widget init, cache, invalidate on `HostApi::theme_epoch`" — and
+    //! gives the reason: the host answers a text token by scanning every
+    //! text key the theme declares, under the theme engine's global
+    //! lock. `theme_text_of` crosses the ABI TWICE on the way (once to
+    //! intern the name, once to fetch the string) and takes that lock on
+    //! each crossing. On a draw path that is a lock taken per trimmed
+    //! name per frame; a directory of two hundred cut names at 60 Hz
+    //! took it twenty-four thousand times a second.
+    //!
+    //! So the marker is a PARAMETER of [`fit_name`], read once per epoch
+    //! into the caller's `Look`. Nothing below asserts a speed: it
+    //! asserts that the entry is not reached at all while text is being
+    //! trimmed, which is the property a speed would follow from.
+
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// How many times a trim reached the host's text-token entry.
+        static TEXT_CALLS: Cell<u32> = const { Cell::new(0) };
+        /// ...and its name-interning half, which `theme_text_of` calls
+        /// first and which takes the same lock.
+        static TOKEN_CALLS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    extern "C" fn counting_text(_: *mut c_void, _: u32, _: *mut u8, _: u32) -> u32 {
+        TEXT_CALLS.with(|c| c.set(c.get() + 1));
+        0
+    }
+
+    extern "C" fn counting_token(_: *const u8, _: u32) -> u32 {
+        TOKEN_CALLS.with(|c| c.set(c.get() + 1));
+        0
+    }
+
+    /// Half an em a character: wrong about fonts, right about
+    /// monotonicity, which is all a trim asks of a measurement.
+    extern "C" fn ruler(
+        _: *mut c_void,
+        _: u32,
+        px: f32,
+        text: *const u8,
+        len: u32,
+        _: f32,
+    ) -> f32 {
+        // Every string this module measures is ASCII, so bytes are
+        // characters and the count needs no decode.
+        let n = unsafe { std::slice::from_raw_parts(text, len as usize) }.len();
+        n as f32 * px * 0.5
+    }
+
+    /// A host whose text entries are counted and whose ruler is the one
+    /// above. Everything else is the real table, so nothing here is a
+    /// second implementation of the boundary.
+    fn counted() -> HostApi {
+        TEXT_CALLS.with(|c| c.set(0));
+        TOKEN_CALLS.with(|c| c.set(0));
+        HostApi {
+            measure: ruler,
+            theme_text: counting_text,
+            theme_token: counting_token,
+            ..*nacelle::plugin::host_api()
+        }
+    }
+
+    #[test]
+    fn trimming_a_name_asks_the_host_for_no_text_token() {
+        let api = counted();
+        // Twenty characters at 10 px are 100 px wide under this ruler,
+        // so 40 px is a cut and the marker is in play.
+        let cut = fit_name(&api, std::ptr::null_mut(), FONT_UI, 10.0, "a-very-long-app-name", 40.0, 0.0, "\u{2026}");
+        assert!(cut.ends_with('\u{2026}'), "the name was not trimmed: {cut}");
+        assert_eq!(
+            (TOKEN_CALLS.with(|c| c.get()), TEXT_CALLS.with(|c| c.get())),
+            (0, 0),
+            "a trim reached the host's text-token entries; the marker \
+             belongs in the caller's per-epoch Look, not on this path"
+        );
+    }
+
+    #[test]
+    fn a_name_that_fits_is_returned_whole_and_asks_for_nothing_either() {
+        let api = counted();
+        let name = "short";
+        assert_eq!(fit_name(&api, std::ptr::null_mut(), FONT_UI, 10.0, name, 400.0, 0.0, "\u{2026}"), name);
+        assert_eq!((TOKEN_CALLS.with(|c| c.get()), TEXT_CALLS.with(|c| c.get())), (0, 0));
+    }
+
+    /// A theme that states no marker, and a host too old to be asked,
+    /// arrive here as the SAME empty string — the contract
+    /// `HostApi::theme_text` states — and a cut under it goes unmarked
+    /// rather than ending on a character this file chose.
+    #[test]
+    fn an_unstated_marker_trims_the_name_and_marks_nothing() {
+        let api = counted();
+        let cut = fit_name(&api, std::ptr::null_mut(), FONT_UI, 10.0, "a-very-long-app-name", 40.0, 0.0, "");
+        assert_eq!(cut, "a-very-l", "an unmarked cut still has to fit");
+        assert!(!cut.contains('\u{2026}'), "a marker nobody stated was drawn anyway");
+    }
+
+    /// The marker a theme DOES state is the one that ends the cut —
+    /// `>` for a console theme, which is the master's own example.
+    #[test]
+    fn the_stated_marker_is_what_the_cut_ends_on() {
+        let api = counted();
+        let cut = fit_name(&api, std::ptr::null_mut(), FONT_UI, 10.0, "a-very-long-app-name", 40.0, 0.0, ">");
+        assert!(cut.ends_with('>'), "the cut did not end on the stated marker: {cut}");
+        assert!(cut.len() * 5 <= 40, "the marked cut does not fit: {cut}");
     }
 }
