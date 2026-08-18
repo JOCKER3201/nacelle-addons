@@ -133,6 +133,16 @@ struct Tokens {
     blink_on: u32,     // motion.term_cursor_blink.enabled
     blink_period: u32, // motion.term_cursor_blink.period_ms
     blink_duty: u32,   // motion.term_cursor_blink.duty
+    // the cursor's SHAPE and the two thin carets' lengths. The shape is
+    // `term.cursor.style`'s WORD; the lengths sit in `[terminal]`, the
+    // section that holds the cell grid's geometry, one section away.
+    cur_ul_h: u32,   // terminal.cursor.underline_h — the CARET's rule
+    cur_ul_gap: u32, // terminal.cursor.underline_gap
+    cur_bar_w: u32,  // terminal.cursor.bar_w
+    // The row's own multiplier, read here for one reason: the host
+    // measured the CELL with it, and everything drawn inside the cell
+    // has to know how much of that cell is air (see `half_leading`).
+    line_height: u32, // terminal.line_height
     // the SCROLL +n readout — a status pill in a corner, which is
     // precisely the images' badge (u2 §2.9): severity.info's colours,
     // the badge role's type, the badge component's box
@@ -173,6 +183,130 @@ struct Tokens {
     /// a word this build predates, no word at all — INVERTS, the
     /// master's own default and the reading that never loses a glyph.
     sel_tint: bool,
+    /// The caret's shape — `term.cursor.style`'s WORD.
+    cursor_style: CursorStyle,
+}
+
+/// The shape the caret takes, which is `term.cursor.style`'s WORD.
+///
+/// Until 2026-08-17 this widget drew a full block and nothing else, so
+/// the token, and the three lengths `[terminal]` keeps for the other two
+/// shapes, had no reader at all (audit 2026-08-17, Z17).
+///
+/// `block` is where an unknown word lands: it is the master's own
+/// default, it is the shape every frame before this one drew, and a
+/// caret whose shape a theme misspelled is still a caret — the person
+/// typing is looking straight at it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum CursorStyle {
+    /// The whole cell, with the glyph under it redrawn in the caret's
+    /// own ink so it survives being covered.
+    #[default]
+    Block,
+    /// A rule down the leading edge of the cell, `terminal.cursor.bar_w`
+    /// wide. The WORD and the length agree — `bar` and `bar_w` — and so
+    /// does `field.caret_style`, which is the other half of the master
+    /// that names this shape.
+    Bar,
+    /// A rule under the glyph, `terminal.cursor.underline_h` thick and
+    /// `terminal.cursor.underline_gap` below the floor of the glyph's
+    /// line box — the caret's own pair, not the cell underline's
+    /// `cell_underline_*` that SGR 4 draws.
+    Underline,
+}
+
+impl CursorStyle {
+    fn of(word: &str) -> CursorStyle {
+        match word {
+            "bar" => CursorStyle::Bar,
+            "underline" => CursorStyle::Underline,
+            _ => CursorStyle::Block,
+        }
+    }
+}
+
+/// The lengths the two thin carets are cut from, resolved for the frame.
+#[derive(Clone, Copy, Default, Debug)]
+struct CursorGeom {
+    /// `terminal.cursor.underline_h`
+    underline_h: f32,
+    /// `terminal.cursor.underline_gap`
+    underline_gap: f32,
+    /// `terminal.cursor.bar_w`
+    bar_w: f32,
+    /// Half the row's air — [`half_leading`]. The underline caret hangs
+    /// off the GLYPH, so it has to know where inside the cell the glyph
+    /// was put.
+    lead: f32,
+}
+
+/// How much of a row is air, on ONE side of the glyph.
+///
+/// `terminal.line_height` multiplies the face's own line box to make the
+/// cell (libnacelle `term::Grid::measure`), so dividing the cell by that
+/// same token gives the line box back, and what is left over is air. It
+/// is shared above and below: that is what keeps the glyph in the middle
+/// of an opened-up row instead of hanging from its ceiling, and what
+/// keeps both underlines under the character rather than under the row.
+///
+/// The host measures the cell and this widget draws inside it, so this
+/// division is the one seam where the two have to agree about the same
+/// token. It belongs beside `cell_h` in the view struct, and can go
+/// there when the ABI next grows; until then it is read on both sides of
+/// the boundary, off one theme at one epoch.
+///
+/// Anything at or under 1.0 — a squeezed row, a missing token, a theme
+/// with a nonsense value — is no air at all. There is nothing to share,
+/// and a glyph lifted out of a short row would land in the row above.
+fn half_leading(cell_h: f32, line_height: f32) -> f32 {
+    // Written as a refused comparison rather than `<= 1.0` so that a NaN
+    // answers zero instead of falling through, and with max/min rather
+    // than clamp for the same reason: clamp panics on a NaN bound.
+    if !(line_height > 1.0) {
+        return 0.0;
+    }
+    ((cell_h - cell_h / line_height) * 0.5).max(0.0).min(cell_h * 0.5)
+}
+
+/// The top edge of an underline: `gap` under the floor of the glyph's
+/// LINE BOX, which is the cell's own floor while `terminal.line_height`
+/// is 1.00 and `lead` above it once a row has been opened up.
+///
+/// One function for two callers on purpose. SGR 4's cell underline and
+/// the underline caret are drawn from different tokens by different
+/// halves of this file, and a person looking at an underlined character
+/// with the cursor on it has to see one rule, not two.
+fn underline_y(cell_y: f32, cell_h: f32, lead: f32, gap: f32, h: f32) -> f32 {
+    cell_y + cell_h - lead - gap - h
+}
+
+/// The caret's quad inside its cell, and whether that quad COVERS the
+/// glyph underneath.
+///
+/// The second half of the answer is the whole difference between the
+/// shapes: a block hides the character it sits on, so the character has
+/// to be laid back over it in the caret's ink, while a beam and an
+/// underline leave the grid's own glyph showing and must not draw a
+/// second copy of it.
+///
+/// Both thin shapes are floored at one device pixel, and that is
+/// arithmetic rather than a look: a theme that asked for a beam asked
+/// for a caret, and a rule of no width is not one. It is the same rule
+/// the blink already follows — the motion is decoration, the caret's
+/// visibility is not.
+fn cursor_quad(style: CursorStyle, cell: RectC, g: CursorGeom) -> (RectC, bool) {
+    match style {
+        CursorStyle::Block => (cell, true),
+        CursorStyle::Bar => (RectC { w: g.bar_w.max(1.0).min(cell.w), ..cell }, false),
+        CursorStyle::Underline => {
+            let h = g.underline_h.max(1.0).min(cell.h);
+            // Through the same function the cell's SGR-4 underline goes
+            // through, so a caret and an underlined cell sit on one line
+            // at every line height.
+            let y = underline_y(cell.y, cell.h, g.lead, g.underline_gap, h);
+            (RectC { y, h, ..cell }, false)
+        }
+    }
 }
 
 /// The WORD an enum token currently resolves to — ABI 6's appended
@@ -207,6 +341,7 @@ impl Tokens {
         let c = |n: &str| (api.theme_class)(n.as_ptr(), n.len() as u32);
         let style = enum_word(api, ctx, t("severity.info.badge_style"));
         let sel_mode = enum_word(api, ctx, t("term.selection.mode"));
+        let cursor_style = enum_word(api, ctx, t("term.cursor.style"));
         // The two type bindings, followed to the roles they name.
         let tab_role = enum_word(api, ctx, t("tab.role"));
         let ind_role = enum_word(api, ctx, t("terminal.indicator.role"));
@@ -241,6 +376,10 @@ impl Tokens {
             blink_on: t("motion.term_cursor_blink.enabled"),
             blink_period: t("motion.term_cursor_blink.period_ms"),
             blink_duty: t("motion.term_cursor_blink.duty"),
+            cur_ul_h: t("terminal.cursor.underline_h"),
+            cur_ul_gap: t("terminal.cursor.underline_gap"),
+            cur_bar_w: t("terminal.cursor.bar_w"),
+            line_height: t("terminal.line_height"),
             ind_inset: t("terminal.indicator.inset"),
             ind_size: of(&ind_role, "size"),
             ind_min: of(&ind_role, "min_px"),
@@ -261,6 +400,7 @@ impl Tokens {
             term_bg: t("term.bg"),
             pill_solid: style == "solid",
             sel_tint: sel_mode == "tint",
+            cursor_style: CursorStyle::of(&cursor_style),
         }
     }
 }
@@ -668,6 +808,11 @@ impl Shell {
         let ul_gap = px(ids.cell_ul_gap);
         let sel_pad = px(ids.sel_pad);
         let (cw, ch_h) = (view.cell_w, view.cell_h);
+        // How far into its cell the glyph's line box starts. Zero at the
+        // master's line height of 1.00, where the cell IS the line box —
+        // so the ordinary picture is untouched — and half the air above
+        // the glyph once a theme opens the rows up.
+        let row_lead = half_leading(ch_h, px(ids.line_height));
         let ncells = (view.view_rows as usize).saturating_mul(view.view_cols as usize);
         let cells = &self.cells[..ncells.min(self.cells.len())];
         for y in 0..view.view_rows as usize {
@@ -721,15 +866,22 @@ impl Shell {
                     ink(ids.term_bg)
                 };
                 if cell.width > 0 && cell.ch != b' ' as u32 {
-                    glyph(api, ctx, cell.ch, cell.font, cx, cy, view.px, glyph_c);
+                    glyph(api, ctx, cell.ch, cell.font, cx, cy + row_lead, view.px, glyph_c);
                 }
                 if cell.width > 0 && cell.flags & CELL_UNDERLINE != 0 && ul_h > 0.0 {
                     // One cell wide even under a double-width character,
                     // as it has always been — in the glyph's current
                     // ink, so an inverted selection keeps it visible.
+                    // Under the GLYPH, not under the row: with air in
+                    // the row the two are not the same line.
                     (api.rect)(
                         ctx,
-                        RectC { x: cx, y: cy + ch_h - ul_gap - ul_h, w: cw, h: ul_h },
+                        RectC {
+                            x: cx,
+                            y: underline_y(cy, ch_h, row_lead, ul_gap, ul_h),
+                            w: cw,
+                            h: ul_h,
+                        },
                         glyph_c,
                     );
                 }
@@ -752,20 +904,36 @@ impl Shell {
             if shown {
                 let cx = grid_r.x + view.cursor_col as f32 * cw;
                 let cy = grid_r.y + view.cursor_row as f32 * ch_h;
-                // Deliberately not clipped to the grid: the block goes
+                // Deliberately not clipped to the grid: the caret goes
                 // wherever the cursor is, which is what it has always
                 // done and what makes a cursor past the last column
                 // visible rather than silently absent. Its colours are
-                // the host's, resolved into the view like every cell's.
-                (api.rect)(ctx, RectC { x: cx, y: cy, w: cw, h: ch_h }, view.cursor_bg);
-                if view.cursor_ch != b' ' as u32 {
+                // the host's, resolved into the view like every cell's;
+                // its SHAPE is the theme's `term.cursor.style`.
+                let (quad, covers) = cursor_quad(
+                    ids.cursor_style,
+                    RectC { x: cx, y: cy, w: cw, h: ch_h },
+                    CursorGeom {
+                        underline_h: px(ids.cur_ul_h),
+                        underline_gap: px(ids.cur_ul_gap),
+                        bar_w: px(ids.cur_bar_w),
+                        lead: row_lead,
+                    },
+                );
+                (api.rect)(ctx, quad, view.cursor_bg);
+                // Only a block hid the character it sits on, so only a
+                // block owes it back — and it owes it in the place the
+                // grid loop drew it, air and all. Laying it over a bar
+                // would paint a second copy of a glyph that is already
+                // there, in the wrong ink.
+                if covers && view.cursor_ch != b' ' as u32 {
                     glyph(
                         api,
                         ctx,
                         view.cursor_ch,
                         nacelle::font::FONT_MONO,
                         cx,
-                        cy,
+                        cy + row_lead,
                         view.px,
                         view.cursor_fg,
                     );
@@ -1146,6 +1314,389 @@ mod token_tests {
         // And the two roles really are different sizes, so the fix is
         // visible on the first screen rather than only in the names.
         assert_ne!(size(&ind), size(&badge));
+    }
+
+    /// The caret is the shape `term.cursor.style` names, cut from the
+    /// lengths `[terminal]` keeps beside it.
+    ///
+    /// All three shapes in one test because the finding is that there
+    /// was only ever one: this widget drew a full block whatever the
+    /// master said, so `term.cursor.style` and the three lengths
+    /// `terminal.cursor.*` had no reader at all (audit 2026-08-17, Z17).
+    ///
+    /// The three lengths are measured with numbers that are all
+    /// DIFFERENT, and different from the cell's, before the master's own
+    /// are checked. The master bakes `terminal.cursor.underline_h` and
+    /// `terminal.cursor.bar_w` from one `@stroke.thin`, so a shape cut
+    /// from the wrong one of the two would measure right anyway — the
+    /// test would be reading a coincidence in the theme instead of the
+    /// code. (Found by the adversary, 2026-08-17: swapping the two
+    /// fields inside `cursor_quad` passed.)
+    #[test]
+    fn the_caret_is_the_shape_the_master_names_at_the_lengths_beside_it() {
+        nacelle::theme::load();
+        let t = nacelle::theme::resolved();
+        let id = |n: &str| {
+            nacelle::theme::id(n).unwrap_or_else(|| panic!("the master declares no {n}"))
+        };
+        // A cell and three lengths of no round numbers, no two alike, so
+        // nothing can match by accident.
+        let cell = RectC { x: 11.0, y: 23.0, w: 9.0, h: 21.0 };
+        let g = CursorGeom { underline_h: 3.0, underline_gap: 5.0, bar_w: 7.0, lead: 0.0 };
+
+        let (q, covers) = cursor_quad(CursorStyle::Block, cell, g);
+        assert!(covers, "a block hides the glyph and has to lay it back over itself");
+        assert_eq!((q.x, q.y, q.w, q.h), (cell.x, cell.y, cell.w, cell.h));
+
+        // THE ONE THE FINDING IS ABOUT: a bar of terminal.cursor.bar_w.
+        let (q, covers) = cursor_quad(CursorStyle::Bar, cell, g);
+        assert!(!covers, "a bar stands beside the glyph, so it must not redraw it");
+        assert_eq!(q.w, g.bar_w, "the bar is not terminal.cursor.bar_w wide");
+        assert!(q.w < cell.w, "the bar filled its cell, which is a block by another name");
+        assert_eq!((q.x, q.y, q.h), (cell.x, cell.y, cell.h));
+
+        let (q, covers) = cursor_quad(CursorStyle::Underline, cell, g);
+        assert!(!covers, "an underline sits under the glyph, so it must not redraw it");
+        assert_eq!(q.h, g.underline_h, "the caret's rule is not terminal.cursor.underline_h");
+        assert!(q.h < cell.h, "the underline filled its cell");
+        assert_eq!(
+            q.y,
+            cell.y + cell.h - g.underline_gap - g.underline_h,
+            "the caret's rule ignores terminal.cursor.underline_gap"
+        );
+        assert_eq!((q.x, q.w), (cell.x, cell.w));
+
+        // And the master's own lengths are real numbers that reach the
+        // same arithmetic — the synthetic three above prove which field
+        // is read, these prove the fields are filled from the theme.
+        let baked = CursorGeom {
+            underline_h: t.px(id("terminal.cursor.underline_h")),
+            underline_gap: t.px(id("terminal.cursor.underline_gap")),
+            bar_w: t.px(id("terminal.cursor.bar_w")),
+            lead: 0.0,
+        };
+        // Below a device pixel the floor in `cursor_quad` would answer
+        // instead of the token. The master ships @stroke.thin, which is
+        // more.
+        assert!(baked.bar_w >= 1.0, "terminal.cursor.bar_w bakes to {} px", baked.bar_w);
+        assert!(
+            baked.underline_h >= 1.0,
+            "terminal.cursor.underline_h is {} px",
+            baked.underline_h
+        );
+        assert_eq!(cursor_quad(CursorStyle::Bar, cell, baked).0.w, baked.bar_w);
+        assert_eq!(
+            cursor_quad(CursorStyle::Underline, cell, baked).0.h,
+            baked.underline_h
+        );
+
+        // And the WORD is what chooses between the three.
+        let word = nacelle::theme::enum_word_of(id("term.cursor.style"))
+            .expect("term.cursor.style names no shape");
+        assert_eq!(
+            CursorStyle::of(&word),
+            CursorStyle::Block,
+            "the master now ships `{word}`, so the default screen changed shape"
+        );
+        assert_eq!(CursorStyle::of("bar"), CursorStyle::Bar);
+        assert_eq!(CursorStyle::of("underline"), CursorStyle::Underline);
+        // A word this build predates, a misspelling, or no word at all
+        // is still a caret — and it is the one that has always been
+        // drawn. `beam` is in that company on purpose: one shape has one
+        // name in this master, and here it is `bar`.
+        assert_eq!(CursorStyle::of("beam"), CursorStyle::Block);
+        assert_eq!(CursorStyle::of(""), CursorStyle::Block);
+    }
+
+    /// An opened-up row keeps its glyph in the middle, and every rule
+    /// that belongs to the glyph travels with it.
+    ///
+    /// `terminal.line_height` multiplies the CELL, and the cell is the
+    /// box the host reports and this file draws in. Before this was
+    /// worked out, the only value that did anything to the picture broke
+    /// it: the glyph stayed at the cell's ceiling while the underlines
+    /// stayed on its floor, so at 2.00 an SGR-4 rule sat some twenty
+    /// pixels under the character it belonged to (adversary, 2026-08-17).
+    #[test]
+    fn the_air_in_a_row_is_shared_and_the_rules_stay_under_the_glyph() {
+        // The master's own row at the 1080p reference, near enough: the
+        // numbers only have to be a plausible cell.
+        const CELL_H: f32 = 20.671202;
+        const GAP: f32 = 1.62;
+        const RULE: f32 = 1.62;
+
+        // 1.00 — the master's value — is no air at all, and the picture
+        // is the one this widget has always drawn.
+        assert_eq!(half_leading(CELL_H, 1.00), 0.0);
+        assert_eq!(
+            underline_y(7.0, CELL_H, half_leading(CELL_H, 1.00), GAP, RULE),
+            7.0 + CELL_H - GAP - RULE,
+            "the ordinary row moved when nothing about it changed"
+        );
+
+        // 2.00: the cell is twice the line box, so a quarter of the cell
+        // is air above the glyph and a quarter below.
+        let tall = CELL_H * 2.0;
+        let lead = half_leading(tall, 2.00);
+        assert!(
+            (lead - tall / 4.0).abs() < 0.001,
+            "half the air in a doubled row came out {lead} px, not {} px",
+            tall / 4.0
+        );
+        // The rule is under the GLYPH: the same distance below the line
+        // box's floor as in a row with no air in it at all.
+        let y = underline_y(7.0, tall, lead, GAP, RULE);
+        assert!(
+            (y - (7.0 + lead + CELL_H - GAP - RULE)).abs() < 0.001,
+            "the rule landed at {y} px, {} px from where the glyph is",
+            y - (7.0 + lead + CELL_H - GAP - RULE)
+        );
+        assert!(
+            y + RULE < 7.0 + tall - lead + 0.001,
+            "the rule fell out of the glyph's line box and into the row's air"
+        );
+
+        // The caret's rule goes through the same function, so an
+        // underlined character with the cursor on it shows ONE line.
+        let cell = RectC { x: 3.0, y: 7.0, w: 9.0, h: tall };
+        let g = CursorGeom {
+            underline_h: RULE,
+            underline_gap: GAP,
+            bar_w: 4.0,
+            lead,
+        };
+        assert_eq!(
+            cursor_quad(CursorStyle::Underline, cell, g).0.y,
+            y,
+            "the caret's rule and SGR 4's parted company in an opened-up row"
+        );
+
+        // Nonsense cannot lift a glyph out of its row: a squeezed line
+        // height, a missing token (0.0) and a NaN all mean no air.
+        assert_eq!(half_leading(CELL_H, 0.5), 0.0);
+        assert_eq!(half_leading(CELL_H, 0.0), 0.0);
+        assert_eq!(half_leading(CELL_H, f32::NAN), 0.0);
+        // And air is never more than half the row, whatever the token.
+        assert!(half_leading(CELL_H, 1.0e9) <= CELL_H / 2.0);
+    }
+}
+
+/// The grid as it actually goes down, recorded.
+///
+/// The keyboard widget's frame tests are the pattern: the host's own
+/// theme entries answer for real — they ignore the context, so a null
+/// one is enough — and only the drawing entries are replaced. `term_view`
+/// is replaced too, because that one DOES need a context and there is no
+/// terminal behind this test; a stub that reports one cell is the whole
+/// of what the grid loop needs to be watched.
+///
+/// What this reaches that a test on a pure function cannot: where the
+/// glyph is put. The rule under it is arithmetic that can be checked in
+/// isolation, but "the two of them stay together" is a statement about
+/// the loop, and the loop is what got it wrong.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// What the stub host reports the face's own line box measuring, and
+    /// one cell's width. Any numbers would do; these are the master's
+    /// own mono cell at the 1080p reference, so a failure reads like the
+    /// screen it came from.
+    const LINE_BOX: f32 = 20.671202;
+    const CELL_W: f32 = 9.396;
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Cmd {
+        Rect { x: f32, y: f32, w: f32, h: f32 },
+        Text { ch: u32, x: f32, y: f32 },
+    }
+
+    thread_local! {
+        static FRAME: RefCell<Vec<Cmd>> = const { RefCell::new(Vec::new()) };
+        /// The multiplier the stub host measured its cell with — the
+        /// HOST's half of `terminal.line_height`. The theme's half is
+        /// set to the same number by the preview in `frame`, which is
+        /// exactly the agreement the widget relies on.
+        static ROW: Cell<f32> = const { Cell::new(1.0) };
+    }
+
+    extern "C" fn rec_rect(_: *mut c_void, r: RectC, _: ColorC) {
+        FRAME.with(|f| f.borrow_mut().push(Cmd::Rect { x: r.x, y: r.y, w: r.w, h: r.h }));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    extern "C" fn rec_text(
+        _: *mut c_void,
+        _: u32,
+        _: f32,
+        x: f32,
+        y: f32,
+        text: *const u8,
+        len: u32,
+        _: ColorC,
+        _: f32,
+        _: u32,
+    ) {
+        let s = unsafe { std::slice::from_raw_parts(text, len as usize) };
+        let ch = String::from_utf8_lossy(s).chars().next().unwrap_or(' ') as u32;
+        FRAME.with(|f| f.borrow_mut().push(Cmd::Text { ch, x, y }));
+    }
+
+    /// A terminal of one row and one column, holding an underlined `A`
+    /// with the cursor on it.
+    extern "C" fn stub_view(
+        _: *const c_void,
+        _: *mut c_void,
+        req: *const TermReqC,
+        _: u32,
+        out: *mut TermViewC,
+        _: u32,
+    ) -> u32 {
+        let req = unsafe { &*req };
+        let mut v = TermViewC::empty();
+        v.flags = VIEW_LIVE | VIEW_CURSOR;
+        v.cell_w = CELL_W;
+        v.cell_h = LINE_BOX * ROW.with(|r| r.get());
+        v.px = 15.66;
+        v.ascent = 15.97;
+        v.cols = 1;
+        v.rows = 1;
+        v.cursor_ch = b'A' as u32;
+        let room = if req.cells.is_null() || req.cell_stride == 0 {
+            0
+        } else {
+            req.cells_bytes as usize / req.cell_stride as usize
+        };
+        if room == 0 {
+            // What the host does with a buffer too small: say so, and
+            // let the widget grow it and ask again.
+            v.flags |= VIEW_TRUNCATED;
+        } else {
+            v.view_cols = 1;
+            v.view_rows = 1;
+            let ink = ColorC { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+            let cell = CellC {
+                ch: b'A' as u32,
+                flags: CELL_UNDERLINE,
+                width: 1,
+                font: nacelle::font::FONT_MONO,
+                reserved: 0,
+                fg: ink,
+                bg: ink,
+            };
+            unsafe { std::ptr::write(req.cells as *mut CellC, cell) };
+        }
+        unsafe { std::ptr::write(out, v) };
+        1
+    }
+
+    fn px(name: &str) -> f32 {
+        nacelle::theme::resolved().px(nacelle::theme::id(name).expect(name))
+    }
+
+    /// One frame at a given `terminal.line_height`, and the top-left
+    /// corner of the one cell in it.
+    fn frame(line_height: f32) -> (Vec<Cmd>, f32, f32) {
+        nacelle::theme::load();
+        ROW.with(|r| r.set(line_height));
+        let value = format!("{line_height:.2}");
+        let refused = nacelle::theme::set_preview(&[("terminal.line_height", &value)]);
+        assert!(refused.is_empty(), "the engine refused {value}: {refused:?}");
+
+        let api = HostApi {
+            rect: rec_rect,
+            text: rec_text,
+            term_view: stub_view,
+            ..*nacelle::plugin::host_api()
+        };
+        FRAME.with(|f| f.borrow_mut().clear());
+        let r = RectC { x: 0.0, y: 0.0, w: 400.0, h: 200.0 };
+        let mut s = Shell::new();
+        s.draw(&api, std::ptr::null_mut(), std::ptr::null(), r);
+        let cmds = FRAME.with(|f| f.borrow().clone());
+        // The grid's own corner, by the same three tokens `draw` adds up.
+        let cell = (
+            r.x + px("terminal.pad"),
+            r.y + px("tab.pad") + px("tab.h") + px("tab.rule_gap"),
+        );
+        nacelle::theme::clear_preview();
+        (cmds, cell.0, cell.1)
+    }
+
+    /// The glyph and the rule under it are one thing, at any line height.
+    ///
+    /// `terminal.line_height` was the only token in this batch that
+    /// changes the picture on its own, and the picture it made was
+    /// broken: the host's cell grew, the glyph stayed at the cell's
+    /// ceiling and the underline stayed on its floor, so at 2.00 the
+    /// rule sat about twenty pixels under the character it belonged to
+    /// (adversary, 2026-08-17).
+    #[test]
+    fn an_opened_up_row_keeps_its_glyph_and_its_rule_together() {
+        let rule_h = px("terminal.cell_underline_h");
+        let rule_gap = px("terminal.cell_underline_gap");
+        assert!(rule_h > 0.0, "the master's SGR-4 rule has no thickness to find");
+
+        // The glyph's own anchor, and the rule's, out of one frame.
+        let glyph_and_rule = |cmds: &[Cmd], cell_y: f32, cell_h: f32| -> (f32, f32) {
+            let g = cmds
+                .iter()
+                .find_map(|c| match *c {
+                    Cmd::Text { ch, y, .. } if ch == b'A' as u32 => Some(y),
+                    _ => None,
+                })
+                .expect("the frame drew no glyph at all");
+            let r = cmds
+                .iter()
+                .find_map(|c| match *c {
+                    // The rule: one cell wide, the token's thickness,
+                    // somewhere inside the row.
+                    Cmd::Rect { y, w, h, .. }
+                        if (w - CELL_W).abs() < 0.001
+                            && (h - rule_h).abs() < 0.001
+                            && y > cell_y
+                            && y < cell_y + cell_h =>
+                    {
+                        Some(y)
+                    }
+                    _ => None,
+                })
+                .expect("the frame drew no underline under an underlined cell");
+            (g, r)
+        };
+
+        // The master's own row: no air, and the picture this widget has
+        // always drawn — glyph at the cell's top, rule on its floor.
+        let (cmds, cx, cy) = frame(1.00);
+        let (g1, r1) = glyph_and_rule(&cmds, cy, LINE_BOX);
+        assert!(
+            cmds.contains(&Cmd::Text { ch: b'A' as u32, x: cx, y: cy }),
+            "the plain row put its glyph at {g1}, not at the cell's top {cy}"
+        );
+        assert!(
+            (r1 - (cy + LINE_BOX - rule_gap - rule_h)).abs() < 0.001,
+            "the plain row's rule moved to {r1} from {}",
+            cy + LINE_BOX - rule_gap - rule_h
+        );
+
+        // Twice the row. The cell is twice as tall, the glyph drops by a
+        // quarter of it, and the rule keeps its distance FROM THE GLYPH.
+        let (cmds, _, cy) = frame(2.00);
+        let tall = LINE_BOX * 2.0;
+        let (g2, r2) = glyph_and_rule(&cmds, cy, tall);
+        let air = tall / 4.0;
+        assert!(
+            (g2 - (cy + air)).abs() < 0.001,
+            "the doubled row left its glyph at {g2}; the middle of the row is {}",
+            cy + air
+        );
+        assert!(
+            ((r2 - g2) - (r1 - g1)).abs() < 0.001,
+            "the rule sits {} px under the glyph in a doubled row and {} px in a plain one",
+            r2 - g2,
+            r1 - g1
+        );
     }
 }
 
