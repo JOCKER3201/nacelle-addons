@@ -165,6 +165,7 @@ struct ThemeIds {
     skew: u32,
     corner: u32,
     corner_style: u32,
+    button_fill: u32,
     // type.<button.role>.* — the role the master BINDS a button's
     // caption to. It named `button` and this file spelled `button` out,
     // which is the binding written twice: only one of the two moves
@@ -223,6 +224,7 @@ fn resolve_ids(api: &HostApi, ctx: *mut c_void, epoch: u32) -> ThemeIds {
         skew: tok("button.skew"),
         corner: tok("button.corner"),
         corner_style: tok("button.corner_style"),
+        button_fill: tok("component.button.fill"),
         type_size: of("size"),
         type_min_px: of("min_px"),
         type_leading: of("leading"),
@@ -504,6 +506,11 @@ extern "C" fn draw(
                 "chamfer" => CORNER_CHAMFER,
                 _ => CORNER_SQUARE,
             };
+            // The OPAQUE plate first, as object::button lays it, so the
+            // class's near-transparent idle wash rides a solid button and
+            // not the panel's own bed — one button colour in every window
+            // (JEDEN MODEL OKNA).
+            (api.ring_fill)(ctx, rc, cs, radius, t_col(api, ctx, t.button_fill));
             (api.ring_fill)(ctx, rc, cs, radius, style.fill);
             if style.edge_width > 0.0 {
                 (api.ring)(ctx, rc, cs, radius, style.edge_width, style.edge);
@@ -515,6 +522,7 @@ extern "C" fn draw(
                 br.x + br.w - skew, br.y + br.h,
                 br.x, br.y + br.h,
             ];
+            (api.quad)(ctx, pts.as_ptr(), t_col(api, ctx, t.button_fill));
             (api.quad)(ctx, pts.as_ptr(), style.fill);
             if style.edge_width > 0.0 {
                 (api.polyline)(ctx, pts.as_ptr(), 4, style.edge_width, style.edge, true);

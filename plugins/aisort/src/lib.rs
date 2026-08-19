@@ -380,6 +380,11 @@ impl AiSort {
         let corner = paint::corner_radius(&mut sf, "button.corner", button_r, 1.0);
         let cut = paint::corner_style(&mut sf, "button.corner_style");
         let state = if button_r.contains(mx, my) { State::Hover } else { State::Idle };
+        // The OPAQUE plate first, exactly as object::button lays it, so the
+        // class's 7%-alpha idle wash rides a solid button and not the
+        // plugin's own bed — one button colour in every window.
+        let plate = sf.color("component.button.fill");
+        sf.ring_fill(button_r, cut, corner, plate);
         let ink = sf.class_state("button", state);
         sf.ring_fill(button_r, cut, corner, ink.fill);
         if ink.edge_width > 0.0 {

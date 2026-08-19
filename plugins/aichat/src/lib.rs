@@ -158,6 +158,11 @@ unsafe fn label_of<'a>(label: *const u8, label_len: u32) -> Option<&'a str> {
 fn button(sf: &mut impl Surface, r: Rect, caption: &str, state: State) {
     let corner = paint::corner_radius(sf, "button.corner", r, 1.0);
     let cut = paint::corner_style(sf, "button.corner_style");
+    // The OPAQUE plate first, exactly as object::button lays it, so the
+    // class's 7%-alpha idle wash rides a solid button and not the plugin's
+    // own bed — one button colour in every window (JEDEN MODEL OKNA).
+    let plate = sf.color("component.button.fill");
+    sf.ring_fill(r, cut, corner, plate);
     let ink = sf.class_state("button", state);
     sf.ring_fill(r, cut, corner, ink.fill);
     if ink.edge_width > 0.0 {
