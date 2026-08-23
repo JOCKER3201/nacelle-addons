@@ -641,7 +641,16 @@ impl Keyboard {
                 if self.alt {
                     out.push(0x1b);
                 }
-                out.extend_from_slice(s);
+                if self.ctrl && s.len() == 3 && s[0] == 0x1b && s[1] == b'[' {
+                    // Arrow keys: xterm's modifier-parameter form (CSI 1;5 <final>).
+                    out.extend_from_slice(&s[..2]);
+                    out.extend_from_slice(b"1;5");
+                    out.push(s[2]);
+                } else if self.ctrl && s.len() == 1 {
+                    out.push(s[0] & 0x1f);
+                } else {
+                    out.extend_from_slice(s);
+                }
                 self.clear_sticky();
                 Some(out)
             }
