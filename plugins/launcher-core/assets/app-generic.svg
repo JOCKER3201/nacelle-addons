@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!--
+    The launcher's generic app icon (K8's first real, bundled SVG icon):
+    four rounded squares, the same "apps" grid every desktop's fallback
+    glyph has drawn for two decades — chosen for being unmistakably
+    GENERIC, not a stand-in for a real application's own mark, so a tile
+    drawing it never claims to be more identified than it is. Originally
+    authored for this file: plain geometry, one flat black fill, no
+    stroke — the shape [`crate::tile`]'s coverage-mask pipeline assumes
+    (see `nacelle::icon`'s own doc comment for why fill must be opaque).
+  -->
+  <rect x="3" y="3" width="8" height="8" rx="2"/>
+  <rect x="13" y="3" width="8" height="8" rx="2"/>
+  <rect x="3" y="13" width="8" height="8" rx="2"/>
+  <rect x="13" y="13" width="8" height="8" rx="2"/>
+</svg>

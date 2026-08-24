@@ -628,6 +628,71 @@ pub fn draw_text(
     text(api, ctx, FONT_UI, px, x, y, s, c, spacing, 1);
 }
 
+// ------------------------------------------------------------------- icons
+//
+// K8: a real SVG, rasterized on the HOST side into a coverage mask and
+// packed into the shared glyph atlas — never a per-icon distance field,
+// and never a texel this crate can address directly. See
+// `nacelle::icon`'s own doc comment (in libnacelle) for the rasterizer
+// and `nacelle::runtime::HostApi::icon_register`/`icon_quad` for the
+// boundary these two helpers are the plugin-side shorthand of.
+
+/// The launcher's one bundled fallback icon — four rounded squares, the
+/// generic "apps" glyph, embedded at compile time exactly like this
+/// crate's own `.meta` files (`include_str!`, `lib.rs`). `appgrid`'s own
+/// module doc names the real gap this stands in for: "`Icon=` names a
+/// name in a registry this program does not keep" — resolving THAT is a
+/// future call to [`HostApi::icon_register`] with an SVG read for the
+/// application in hand, at the same call site this constant feeds today.
+const APP_GENERIC_ICON_SVG: &[u8] = include_bytes!("../assets/app-generic.svg");
+
+/// Registers [`APP_GENERIC_ICON_SVG`] on `ctx`'s own icon atlas —
+/// [`HostApi::icon_register`] interns by NAME, so every tile drawn
+/// through the SAME `ctx` this frame reaches the one id after the
+/// first — and answers it, or `None` on a host too old to carry the
+/// icon path at all ([`HostApi::has_icon`]).
+///
+/// Called once per tile rather than cached in a `static`: an icon id is
+/// meaningful only against the [`nacelle::font::FontSystem`] instance
+/// that issued it, and a desktop with more than one output holds one
+/// instance PER output (`nacelle::font`'s own doc comment, on the atlas
+/// baked per unit size) — a single process-wide cache would hand a
+/// second monitor's draw call an id that happens to be a DIFFERENT icon
+/// on ITS atlas. The cost of asking again is one hashmap lookup by name
+/// inside `icon_register`, not a re-parse of the SVG; a per-`ctx` cache
+/// keyed by the pointer's identity would remove even that, and is named
+/// here as the follow-up rather than built now.
+fn app_generic_icon(api: &HostApi, ctx: *mut c_void) -> Option<u32> {
+    if !api.has_icon() {
+        return None;
+    }
+    let name = "nacelle.launcher.app-generic";
+    let id = (api.icon_register)(
+        ctx,
+        name.as_ptr(),
+        name.len() as u32,
+        APP_GENERIC_ICON_SVG.as_ptr(),
+        APP_GENERIC_ICON_SVG.len() as u32,
+    );
+    (id != u32::MAX).then_some(id)
+}
+
+/// Draws icon `id` centred on (`cx`, `cy`), `px` texels on a side,
+/// tinted by `c` — [`HostApi::icon_quad`] across the boundary, the
+/// icon-side twin of [`chamfer_glow`]'s `mask_quad` call a few lines
+/// above it in this file.
+fn icon_quad(api: &HostApi, ctx: *mut c_void, id: u32, px: f32, cx: f32, cy: f32, c: ColorC) {
+    let px = px.round().max(1.0);
+    let half = px / 2.0;
+    let pts: [f32; 8] = [
+        cx - half, cy - half,
+        cx + half, cy - half,
+        cx + half, cy + half,
+        cx - half, cy + half,
+    ];
+    (api.icon_quad)(ctx, id, px, pts.as_ptr(), c);
+}
+
 /// The font slot a type role's `face` token names.
 ///
 /// A face is a CLOSED word set of eight — the master declares eight
@@ -1029,8 +1094,23 @@ pub fn tile_face(
         t.h * look.icon_h,
     );
     let gpx = look.glyph_px.min(icon.h).max(0.0);
-    if !mark.is_empty() {
-        draw_text(api, ctx, gpx, icon.cx(), icon.cy() - gpx / 2.0, mark, rung.glyph, 0.0);
+    match app_generic_icon(api, ctx) {
+        // K8's first real call site: a bundled SVG, rasterized to a
+        // coverage mask and drawn tinted by the SAME colour the
+        // initial-letter mark used — the icon nobody could draw is now
+        // drawn, even though every tile draws the one GENERIC glyph
+        // today rather than the application's own art. That is the
+        // stated gap `appgrid`'s own doc comment names ("`Icon=` names
+        // a name in a registry this program does not keep") and is a
+        // change of SOURCE for a follow-up (per-app SVGs, resolved by
+        // name), not of plumbing: this call site is the plumbing.
+        Some(id) => icon_quad(api, ctx, id, gpx, icon.cx(), icon.cy(), rung.glyph),
+        // An old host (no `icon_register`/`icon_quad` — `api.has_icon()`
+        // false) draws exactly what it always drew.
+        None if !mark.is_empty() => {
+            draw_text(api, ctx, gpx, icon.cx(), icon.cy() - gpx / 2.0, mark, rung.glyph, 0.0);
+        }
+        None => {}
     }
 
     let px = look.caption_px;
@@ -1745,5 +1825,116 @@ mod trim_tests {
         let cut = fit_name(&api, std::ptr::null_mut(), FONT_UI, 10.0, "a-very-long-app-name", 40.0, 0.0, ">");
         assert!(cut.ends_with('>'), "the cut did not end on the stated marker: {cut}");
         assert!(cut.len() * 5 <= 40, "the marked cut does not fit: {cut}");
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static REGISTERED: RefCell<Vec<(String, usize)>> = const { RefCell::new(Vec::new()) };
+        static DRAWN: RefCell<Vec<(u32, f32, [f32; 8], ColorC)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    extern "C" fn rec_icon_register(
+        _: *mut c_void,
+        name: *const u8,
+        name_len: u32,
+        _svg: *const u8,
+        svg_len: u32,
+    ) -> u32 {
+        let name = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
+        let name = std::str::from_utf8(name).unwrap().to_string();
+        REGISTERED.with(|r| r.borrow_mut().push((name, svg_len as usize)));
+        // A fixed, recognizable id — never `u32::MAX`, so a caller
+        // reading it back can tell "registered" from "refused".
+        7
+    }
+
+    extern "C" fn rec_icon_quad(_: *mut c_void, id: u32, px: f32, pts: *const f32, c: ColorC) {
+        let mut p = [0.0f32; 8];
+        p.copy_from_slice(unsafe { std::slice::from_raw_parts(pts, 8) });
+        DRAWN.with(|v| v.borrow_mut().push((id, px, p, c)));
+    }
+
+    fn recording_api() -> HostApi {
+        HostApi {
+            icon_register: rec_icon_register,
+            icon_quad: rec_icon_quad,
+            ..*nacelle::plugin::host_api()
+        }
+    }
+
+    /// [`app_generic_icon`] registers the bundled SVG WHOLE — the byte
+    /// count crossing the boundary is the file's own length, not a
+    /// truncated or empty stand-in — under one stable name, which is
+    /// what lets [`nacelle::font::FontSystem::icon_id`]'s interning give
+    /// a second tile drawn through the same `ctx` this frame the SAME
+    /// id rather than a fresh parse.
+    #[test]
+    fn app_generic_icon_registers_the_bundled_svg_by_a_stable_name() {
+        let api = recording_api();
+        REGISTERED.with(|r| r.borrow_mut().clear());
+        let id = app_generic_icon(&api, std::ptr::null_mut());
+        assert_eq!(id, Some(7));
+        assert!(!APP_GENERIC_ICON_SVG.is_empty());
+        assert_eq!(
+            REGISTERED.with(|r| r.borrow().clone()),
+            vec![("nacelle.launcher.app-generic".to_string(), APP_GENERIC_ICON_SVG.len())]
+        );
+    }
+
+    /// A host from before the icon pair (`has_icon()` false) answers
+    /// `None` WITHOUT calling `icon_register` at all — the same
+    /// discipline every other `has_*` gate in this file already keeps,
+    /// and what lets [`tile_face`]'s caller fall back to the
+    /// initial-letter mark instead of reading past the end of an old
+    /// table.
+    #[test]
+    fn app_generic_icon_is_none_on_a_host_before_the_icon_pair() {
+        let api = HostApi {
+            api_size: nacelle::runtime::HOST_API_HAS_THEME_TEXT as u32,
+            ..recording_api()
+        };
+        REGISTERED.with(|r| r.borrow_mut().clear());
+        assert_eq!(app_generic_icon(&api, std::ptr::null_mut()), None);
+        assert!(REGISTERED.with(|r| r.borrow().is_empty()));
+    }
+
+    /// [`icon_quad`] centres a square box of `px` texels on `(cx, cy)`
+    /// and passes the id and colour through untouched — the same
+    /// four-corner convention [`HostApi::quad`] already uses everywhere
+    /// else in this file.
+    #[test]
+    fn icon_quad_centres_a_square_box_on_the_given_point() {
+        let api = recording_api();
+        DRAWN.with(|v| v.borrow_mut().clear());
+        let c = ColorC { r: 0.1, g: 0.2, b: 0.3, a: 1.0 };
+        icon_quad(&api, std::ptr::null_mut(), 9, 20.0, 100.0, 50.0, c);
+        let drawn = DRAWN.with(|v| v.borrow().clone());
+        assert_eq!(drawn.len(), 1);
+        let (id, px, pts, colour) = drawn[0];
+        assert_eq!(id, 9);
+        assert_eq!(px, 20.0);
+        assert_eq!((colour.r, colour.g, colour.b, colour.a), (c.r, c.g, c.b, c.a));
+        // Four corners of a 20x20 box centred on (100, 50).
+        assert_eq!(pts, [90.0, 40.0, 110.0, 40.0, 110.0, 60.0, 90.0, 60.0]);
+    }
+
+    /// A non-finite or sub-pixel `px` (the theme's own `icon.size_*`
+    /// ladder degrading, or a squeezed grid shrinking the box to
+    /// nothing) still draws a real, non-degenerate box: the same floor
+    /// [`FontSystem::icon`]'s own `px == 0` refusal makes worth having a
+    /// caller-side answer for, rather than asking the host to rasterize
+    /// a zero-texel mask every such frame.
+    #[test]
+    fn icon_quad_floors_a_sub_pixel_size_to_one_texel() {
+        let api = recording_api();
+        DRAWN.with(|v| v.borrow_mut().clear());
+        icon_quad(&api, std::ptr::null_mut(), 1, 0.2, 10.0, 10.0, NO_COLOR);
+        let drawn = DRAWN.with(|v| v.borrow().clone());
+        assert_eq!(drawn[0].1, 1.0, "a sub-pixel request must not round down to zero");
     }
 }
