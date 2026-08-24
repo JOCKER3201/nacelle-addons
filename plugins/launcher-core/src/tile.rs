@@ -15,10 +15,10 @@
 //! length — nothing drawn — never to a number that used to be the
 //! design.
 
-use nacelle::runtime::{
-    ColorC, HostApi, RectC, StateStyleC, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
-    MASK_QUAD_ADD,
-};
+use nacelle::plugin_shapes;
+use nacelle::runtime::{ColorC, HostApi, RectC, StateStyleC, CORNER_ROUND};
+#[cfg(test)]
+use nacelle::runtime::{CORNER_CHAMFER, CORNER_SQUARE};
 use nacelle::ui::Case;
 use std::ffi::c_void;
 
@@ -64,20 +64,19 @@ pub const NO_COLOR: ColorC = ColorC { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 /// so the two travel together and neither is decided here.
 #[derive(Clone, Copy)]
 pub struct Corner {
-    /// [`CORNER_SQUARE`], [`CORNER_ROUND`] or [`CORNER_CHAMFER`].
+    /// [`nacelle::runtime::CORNER_SQUARE`], [`CORNER_ROUND`] or
+    /// [`nacelle::runtime::CORNER_CHAMFER`].
     pub style: u32,
     pub radius: f32,
 }
 
-/// The cut a `*_corner_style` word names. A word this build has never
-/// heard of leaves the shape square, which is what an unstyled rectangle
-/// already is — never a cut of this file's choosing.
+/// The cut a `*_corner_style` word names — [`nacelle::corner::code_of`],
+/// the shared reader every plugin's `*_corner_style` now goes through
+/// rather than a match of its own. A word this build has never heard of
+/// leaves the shape square, which is what an unstyled rectangle already
+/// is — never a cut of this file's choosing.
 pub fn corner_style(word: &str) -> u32 {
-    match word {
-        "round" => CORNER_ROUND,
-        "chamfer" => CORNER_CHAMFER,
-        _ => CORNER_SQUARE,
-    }
+    nacelle::corner::code_of(word)
 }
 
 /// Whether a scrolling area's bar is drawn at all, and whether it costs
@@ -760,118 +759,23 @@ pub fn frame(
     // idempotent, so a caller that resolved its own sentinel first hands
     // in a plain length and gets it back.
     let cut = nacelle::theme::corner_radius(corner.radius, cell.w, cell.h);
-    let round = corner.style == CORNER_ROUND && api.has_ring();
-    if rung.fill.a > 0.0 {
-        if round {
-            (api.ring_fill)(ctx, cell, CORNER_ROUND, cut, rung.fill);
-        } else if cut > 0.0 && corner.style != CORNER_SQUARE {
-            chamfer_fill(api, ctx, cell, cut, rung.fill);
-        } else {
-            (api.rect)(ctx, cell, rung.fill);
-        }
-    }
+    // The shape itself, the degrade included, is [`nacelle::plugin_shapes`]
+    // now — ONE octagon for every plugin that needs one, in place of the
+    // copy this file carried until K7 (`chamfer_fill`/`chamfer_frame`/
+    // `chamfer_glow`/`octagon`, all gone from here).
+    plugin_shapes::ring_fill(api, ctx, cell, corner.style, cut, rung.fill);
     if rung.edge_width > 0.0 && rung.edge.a > 0.0 {
-        if round {
-            (api.ring)(ctx, cell, CORNER_ROUND, cut, rung.edge_width, rung.edge);
-        } else if cut > 0.0 && corner.style != CORNER_SQUARE {
-            chamfer_frame(api, ctx, cell, cut, rung.edge_width, rung.edge);
-        } else {
-            (api.rect_outline)(ctx, cell, rung.edge_width, rung.edge);
-        }
+        plugin_shapes::ring(api, ctx, cell, corner.style, cut, rung.edge_width, rung.edge);
         // Right after the stroke, the ring's glow — this rung's own
         // `glow_radius` and `glow_alpha` from the ladder, tinted with
         // the edge's resolved colour and scaled by the one global knob.
         // Every shipped idle rung is dark; hover and press are where the
         // ladder lights up.
-        //
-        // The halo is extruded from the octagon whatever the cut is: it
-        // is a soft light around the shape, and at a corner radius the
-        // difference between an arc's halo and a bevel's is under the
-        // sprite's own falloff.
         let alpha = (rung.glow_alpha * glow_scale).clamp(0.0, 1.0);
-        if api.has_mask_quad() && rung.glow_radius > 0.0 && alpha > 0.0 {
+        if rung.glow_radius > 0.0 && alpha > 0.0 {
             let c = ColorC { a: alpha, ..rung.edge };
-            chamfer_glow(api, ctx, cell, cut, rung.glow_radius, c);
+            plugin_shapes::ring_glow(api, ctx, cell, corner.style, cut, rung.glow_radius, c);
         }
-    }
-}
-
-/// A filled rectangle with its corners cut off — the toolkit's
-/// `chamfer_fill`, as three quads: the middle band and the two
-/// trapezoids the cut corners leave.
-pub fn chamfer_fill(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, c: ColorC) {
-    let cut = cut.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
-    let (x, y, w, h) = (r.x, r.y, r.w, r.h);
-    (api.rect)(ctx, RectC { x, y: y + cut, w, h: h - 2.0 * cut }, c);
-    let top: [f32; 8] = [x + cut, y, x + w - cut, y, x + w, y + cut, x, y + cut];
-    (api.quad)(ctx, top.as_ptr(), c);
-    let bottom: [f32; 8] =
-        [x, y + h - cut, x + w, y + h - cut, x + w - cut, y + h, x + cut, y + h];
-    (api.quad)(ctx, bottom.as_ptr(), c);
-}
-
-/// The eight points of the chamfer outline, flat, clockwise from the
-/// top-left cut. `cut = 0` collapses each corner's pair to one point.
-pub fn octagon(r: RectC, cut: f32) -> [f32; 16] {
-    let cut = cut.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
-    let (x, y, w, h) = (r.x, r.y, r.w, r.h);
-    [
-        x + cut, y,
-        x + w - cut, y,
-        x + w, y + cut,
-        x + w, y + h - cut,
-        x + w - cut, y + h,
-        x + cut, y + h,
-        x, y + h - cut,
-        x, y + cut,
-    ]
-}
-
-/// The ring of the same shape — a closed polyline through eight points.
-pub fn chamfer_frame(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, t: f32, c: ColorC) {
-    let pts = octagon(r, cut);
-    (api.polyline)(ctx, pts.as_ptr(), 8, t, c, true);
-}
-
-/// Glow OUTSIDE the ring — the outline extruded outward by `radius`,
-/// one additive quad per segment, the soft disk's cardinal strip laid
-/// across the extrusion. Nothing is emitted inside the path, so the
-/// glow never tints the fill.
-pub fn chamfer_glow(
-    api: &HostApi,
-    ctx: *mut c_void,
-    r: RectC,
-    cut: f32,
-    radius: f32,
-    c: ColorC,
-) {
-    // A theme can hand back anything, NaN included; the comparison is
-    // written so that "not a usable radius" covers it.
-    if !radius.is_finite() || radius <= 0.0 || c.a <= 0.0 {
-        return;
-    }
-    let inner = octagon(r, cut);
-    let grown = RectC {
-        x: r.x - radius,
-        y: r.y - radius,
-        w: r.w + 2.0 * radius,
-        h: r.h + 2.0 * radius,
-    };
-    let outer = octagon(grown, cut + radius);
-    // The strip's profile in the SPRITE's own space: the mask-band
-    // contract's 31..33 stretchable middle.
-    const SU: f32 = 32.0 / 64.0;
-    const VI: f32 = 31.0 / 64.0;
-    let uv: [f32; 8] = [SU, VI, SU, VI, SU, 0.0, SU, 0.0];
-    for i in 0..8 {
-        let j = (i + 1) % 8;
-        let pts: [f32; 8] = [
-            inner[2 * i], inner[2 * i + 1],
-            inner[2 * j], inner[2 * j + 1],
-            outer[2 * j], outer[2 * j + 1],
-            outer[2 * i], outer[2 * i + 1],
-        ];
-        (api.mask_quad)(ctx, pts.as_ptr(), uv.as_ptr(), c, MASK_QUAD_ADD);
     }
 }
 
@@ -1325,8 +1229,10 @@ mod sentinel_tests {
 
     extern "C" fn rec_quad(_: *mut c_void, pts: *const f32, _: ColorC) {
         let mut q = [0.0f32; 8];
-        // The ABI's quad is eight floats at `pts`; the entry is only
-        // ever reached from this file's own `chamfer_fill`.
+        // The ABI's quad is eight floats at `pts`; on a host with the
+        // ring pair this entry is never reached from `frame` at all —
+        // it is `nacelle::plugin_shapes::chamfer_fill`'s, the fallback
+        // for a host old enough to lack it.
         q.copy_from_slice(unsafe { std::slice::from_raw_parts(pts, 8) });
         QUADS.with(|v| v.borrow_mut().push(q));
     }
@@ -1386,21 +1292,51 @@ mod sentinel_tests {
         assert_eq!(radii(Corner { style: CORNER_ROUND, radius: pill }, tall), vec![20.0, 20.0]);
     }
 
-    /// The chamfer path never reaches the ring pair — it is built here,
-    /// out of quads — so it is the one cut no door below this file could
-    /// have rescued. A capsule chamfer is the widest bevel the box holds.
+    /// The chamfer path now reaches the SAME ring pair the round path
+    /// does: [`nacelle::plugin_shapes::ring_fill`] sends
+    /// [`CORNER_CHAMFER`] through [`HostApi::ring_fill`] exactly as it
+    /// sends [`CORNER_ROUND`], on any host that carries the pair —
+    /// [`HostApi::ring_fill`]'s own fast path draws the octagon on the
+    /// host's side (`draw.rs`'s `chamfer_fill_verts`), which is what
+    /// this file's `chamfer_fill` copy was rebuilding on this one before
+    /// K7. A capsule chamfer is still the widest bevel the box holds,
+    /// which is why the radius, not the shape, is what this pins.
     #[test]
-    fn a_pill_radius_cuts_the_chamfer_by_the_same_half_side() {
+    fn a_pill_radius_reaches_the_ring_pair_through_the_chamfer_style_too() {
         let pill = nacelle::theme::expr::sentinel("pill").expect("§5.0 declares pill");
         let cell = RectC { x: 0.0, y: 0.0, w: 200.0, h: 40.0 };
         let (radii, quads) = draw(Corner { style: CORNER_CHAMFER, radius: pill }, cell);
-        assert!(radii.is_empty(), "a chamfer is quads, not a ring");
-        // `chamfer_fill`'s top trapezoid: its first vertex sits one cut
-        // in from the left edge. A cut of zero — which is what the
-        // retired clamp made of the sentinel — would put it ON the edge,
-        // and the else-arm would draw a plain rect with no quad at all.
-        let top = quads.first().expect("the sentinel was read as no cut at all");
-        assert_eq!(top[0], cell.x + 20.0, "the top-left cut starts where the capsule says");
+        assert_eq!(radii, vec![20.0, 20.0], "the fill's radius and the ring's");
+        assert!(quads.is_empty(), "the ring pair drew it; no quad of this file's own was needed");
+    }
+
+    /// A host old enough to lack the ring pair still bevels a chamfer by
+    /// hand — the one rung [`nacelle::plugin_shapes::chamfer_fill`]
+    /// exists for, reached through `frame` exactly as it always was,
+    /// just no longer out of a copy this file kept for itself.
+    #[test]
+    fn an_old_host_still_bevels_a_chamfer_by_hand() {
+        let cell = RectC { x: 0.0, y: 0.0, w: 200.0, h: 40.0 };
+        let api = HostApi {
+            api_size: nacelle::runtime::HOST_API_HAS_CLIP as u32,
+            quad: rec_quad,
+            ..*nacelle::plugin::host_api()
+        };
+        assert!(!api.has_ring(), "the fixture must predate the ring pair");
+        QUADS.with(|v| v.borrow_mut().clear());
+        frame(
+            &api,
+            std::ptr::null_mut(),
+            cell,
+            Corner { style: CORNER_CHAMFER, radius: 8.0 },
+            &LIT,
+            0.0,
+        );
+        let quads = QUADS.with(|v| v.borrow().clone());
+        // The hand-rolled octagon's top trapezoid: its first vertex sits
+        // one cut in from the left edge.
+        let top = quads.first().expect("an old host must still bevel a chamfer");
+        assert_eq!(top[0], cell.x + 8.0, "the top-left cut starts where the length says");
     }
 
     /// A length is still a length: the sentinel reading must not move

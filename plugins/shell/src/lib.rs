@@ -21,11 +21,12 @@
 //! name, and the only appearance this file owns is the raw grey a
 //! missing theme answers.
 
+use nacelle::plugin_shapes;
 use nacelle::runtime::{
     ActionC, CellC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, TermReqC,
     TermSelectC, TermViewC, ABI_VERSION, ACTION_NONE, ACTION_SCROLL_TERMINAL,
     ACTION_SELECT_TAB, ACTION_TERM_SELECT, CELL_ABSENT, CELL_HAS_BG, CELL_SELECTED,
-    CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
+    CORNER_CHAMFER, CORNER_SQUARE,
     CELL_UNDERLINE, DRAG_BEGIN, DRAG_END, SELECT_KIND_CELLS, SELECT_OP_BEGIN, SELECT_OP_END,
     SELECT_OP_EXTEND, VIEW_CURSOR, VIEW_LIVE, VIEW_TRUNCATED,
 };
@@ -538,38 +539,6 @@ fn tab_face(occupied: bool, is_active: bool, hover: bool, index: u32) -> (u32, S
     (rung, text)
 }
 
-/// A frame with its corners cut off — the toolkit's `chamfer_frame`,
-/// which is a closed polyline through eight points and nothing more.
-/// Since the host took the panel's container this draws only the SCROLL
-/// pill's ring, when `badge.corner` cuts one.
-fn chamfer(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, t: f32, c: ColorC) {
-    let (x, y, w, h) = (r.x, r.y, r.w, r.h);
-    let pts: [f32; 16] = [
-        x + cut, y,
-        x + w - cut, y,
-        x + w, y + cut,
-        x + w, y + h - cut,
-        x + w - cut, y + h,
-        x + cut, y + h,
-        x, y + h - cut,
-        x, y + cut,
-    ];
-    (api.polyline)(ctx, pts.as_ptr(), 8, t, c, true);
-}
-
-/// The filled version — the toolkit's `chamfer_fill`, as three quads:
-/// the middle band and the two trapezoids the cut corners leave.
-fn chamfer_fill(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, c: ColorC) {
-    let cut = cut.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
-    let (x, y, w, h) = (r.x, r.y, r.w, r.h);
-    (api.rect)(ctx, RectC { x, y: y + cut, w, h: h - 2.0 * cut }, c);
-    let top: [f32; 8] = [x + cut, y, x + w - cut, y, x + w, y + cut, x, y + cut];
-    (api.quad)(ctx, top.as_ptr(), c);
-    let bottom: [f32; 8] =
-        [x, y + h - cut, x + w, y + h - cut, x + w - cut, y + h, x + cut, y + h];
-    (api.quad)(ctx, bottom.as_ptr(), c);
-}
-
 pub struct Shell {
     /// Grown once and reused; never shrunk, because the frame after a
     /// resize would only grow it again.
@@ -768,11 +737,7 @@ impl Shell {
             // to know how an arc is tessellated.
             let ring = skew <= 0.0 && api.has_ring();
             let (cs, radius) = if ring {
-                let cs = match enum_word(api, ctx, ids.tab_corner_style).as_str() {
-                    "round" => CORNER_ROUND,
-                    "chamfer" => CORNER_CHAMFER,
-                    _ => CORNER_SQUARE,
-                };
+                let cs = nacelle::corner::code_of(&enum_word(api, ctx, ids.tab_corner_style));
                 (cs, px(ids.tab_corner))
             } else {
                 (CORNER_SQUARE, 0.0)
@@ -1011,9 +976,15 @@ impl Shell {
                 (bed(ids.info_fill), ink(ids.info_text))
             };
             if cut > 0.0 {
-                chamfer_fill(api, ctx, pill, cut.min(h / 2.0), fill);
+                // The ring pair and its degrade are `nacelle::plugin_shapes`'s
+                // now: a host that carries `ring_fill`/`ring` draws this
+                // pill on its own fast path, and a host too old for the
+                // pair still bevels it by hand, the same shape this file
+                // used to build unconditionally.
+                let cut = cut.min(h / 2.0);
+                plugin_shapes::ring_fill(api, ctx, pill, CORNER_CHAMFER, cut, fill);
                 if !ids.pill_solid && border > 0.0 {
-                    chamfer(api, ctx, pill, cut.min(h / 2.0), border, ink(ids.info_edge));
+                    plugin_shapes::ring(api, ctx, pill, CORNER_CHAMFER, cut, border, ink(ids.info_edge));
                 }
             } else {
                 // `pill` is a negative sentinel until R5 lands: square it is.

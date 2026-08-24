@@ -42,3 +42,15 @@ members = [
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# ------------------------------------------------------------------------
+# TEMPORARY, for the `feat/chamfer-abi` fleet only.
+#
+# This batch adds `HostApi::ring_glow` (an APPENDED ABI entry — the
+# version-6 growth contract, so ABI_VERSION stays 6), `corner::code_of`
+# and the `plugin_shapes` module, and the widgets here read all three.
+# Until libnacelle's side is merged and the lock re-pinned, they have to
+# build against the worktree beside this one. REMOVE THIS BLOCK BEFORE
+# MERGING.
+[patch."https://github.com/JOCKER3201/libnacelle"]
+libnacelle = { path = "../libnacelle" }

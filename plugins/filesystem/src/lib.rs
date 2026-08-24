@@ -10,10 +10,11 @@
 pub mod config;
 
 use crate::config::Config;
+use nacelle::plugin_shapes;
 use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_CAPTURE,
-    ACTION_NONE, ACTION_OPEN_DIR, ACTION_OPEN_FILE, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
-    DRAG_BEGIN, DRAG_END, DRAG_MOVE, MASK_QUAD_ADD,
+    ACTION_NONE, ACTION_OPEN_DIR, ACTION_OPEN_FILE, CORNER_ROUND, CORNER_SQUARE, DRAG_BEGIN,
+    DRAG_END, DRAG_MOVE,
 };
 use nacelle::object::tooltip;
 use nacelle::ui::Case;
@@ -91,16 +92,14 @@ fn token(api: &HostApi, name: &str) -> u32 {
     (api.theme_token)(name.as_ptr(), name.len() as u32)
 }
 
-/// The cut a corner word names. A word this build has never heard of —
-/// and `chevron` and `hexagon` are two the presets already have —
+/// The cut a corner word names — [`nacelle::corner::code_of`], the
+/// shared reader every plugin's `*_corner_style` now goes through
+/// rather than a match of its own. A word this build has never heard
+/// of — and `chevron` and `hexagon` are two the presets already have —
 /// leaves the shape square, which is what an unstyled rectangle already
 /// is, never a cut of this file's choosing.
 fn corner_style(word: &str) -> u32 {
-    match word {
-        "round" => CORNER_ROUND,
-        "chamfer" => CORNER_CHAMFER,
-        _ => CORNER_SQUARE,
-    }
+    nacelle::corner::code_of(word)
 }
 
 /// The WORD an enum token currently resolves to — ABI 6's appended
@@ -403,9 +402,10 @@ struct Look {
     badge_h: f32,
     badge_pad: f32,
     badge_corner: f32,
-    /// [`CORNER_SQUARE`], [`CORNER_ROUND`] or [`CORNER_CHAMFER`] — the
-    /// word `shape.badge.corners`' style slot holds, decoded once per
-    /// epoch beside the ids.
+    /// [`CORNER_SQUARE`], [`CORNER_ROUND`] or
+    /// [`nacelle::runtime::CORNER_CHAMFER`] — the word
+    /// `shape.badge.corners`' style slot holds, decoded once per epoch
+    /// beside the ids.
     badge_cut: u32,
     empty_y: f32,
     gap: f32,
@@ -1086,26 +1086,23 @@ impl Filesystem {
             // outliving its reason and the shipped theme's ONE capsule
             // in this panel was a square. The translation is the
             // toolkit's, never a copy of the rule.
+            //
+            // The dispatch between the ring pair and a host too old for
+            // it is [`nacelle::plugin_shapes`] now, not a match kept
+            // here — the fill and the stroke of every ring this file
+            // draws go through the one door the tile grid does.
             let cut = nacelle::theme::corner_radius(look.badge_corner, pill.w, pill.h);
-            if api.has_ring() {
-                (api.ring_fill)(ctx, pill, look.badge_cut, cut, fill);
-                if !look.error_solid && look.badge_border > 0.0 {
-                    (api.ring)(ctx, pill, look.badge_cut, cut, look.badge_border, look.error_edge);
-                }
-            } else if cut > 0.0 && look.badge_cut != CORNER_SQUARE {
-                // A host too old for the ring pair bevels what it can:
-                // visibly plainer than the arc the theme asked for,
-                // never a different shape from a different rule.
-                let cut = cut.min(h / 2.0);
-                chamfer_fill(api, ctx, pill, cut, fill);
-                if !look.error_solid && look.badge_border > 0.0 {
-                    chamfer_frame(api, ctx, pill, cut, look.badge_border, look.error_edge);
-                }
-            } else {
-                (api.rect)(ctx, pill, fill);
-                if !look.error_solid && look.badge_border > 0.0 {
-                    (api.rect_outline)(ctx, pill, look.badge_border, look.error_edge);
-                }
+            plugin_shapes::ring_fill(api, ctx, pill, look.badge_cut, cut, fill);
+            if !look.error_solid && look.badge_border > 0.0 {
+                plugin_shapes::ring(
+                    api,
+                    ctx,
+                    pill,
+                    look.badge_cut,
+                    cut,
+                    look.badge_border,
+                    look.error_edge,
+                );
             }
             draw_text(
                 api,
@@ -1253,34 +1250,24 @@ impl Filesystem {
             let rung = if trect.contains(mx, my) { &look.hover } else { &look.idle };
             let cell = RectC { x, y, w: tile, h: tile };
             let cut = nacelle::theme::corner_radius(look.corner, tile, tile);
-            let round = api.has_ring();
-            if rung.fill.a > 0.0 {
-                if round {
-                    (api.ring_fill)(ctx, cell, CORNER_ROUND, cut, rung.fill);
-                } else if cut > 0.0 {
-                    chamfer_fill(api, ctx, cell, cut, rung.fill);
-                } else {
-                    (api.rect)(ctx, cell, rung.fill);
-                }
-            }
+            // The ring pair and its degrade are `nacelle::plugin_shapes`'s
+            // now, the same door the badge above and the launcher grid's
+            // `tile::frame` draw through — CORNER_ROUND is the header's
+            // own rule for this token, stated in the comment above and
+            // never the drawing code's to pick.
+            plugin_shapes::ring_fill(api, ctx, cell, CORNER_ROUND, cut, rung.fill);
             if rung.edge_width > 0.0 && rung.edge.a > 0.0 {
-                if round {
-                    (api.ring)(ctx, cell, CORNER_ROUND, cut, rung.edge_width, rung.edge);
-                } else if cut > 0.0 {
-                    chamfer_frame(api, ctx, cell, cut, rung.edge_width, rung.edge);
-                } else {
-                    (api.rect_outline)(ctx, cell, rung.edge_width, rung.edge);
-                }
+                plugin_shapes::ring(api, ctx, cell, CORNER_ROUND, cut, rung.edge_width, rung.edge);
                 // Right after the stroke, the ring's glow — the class
                 // `shape.icon_tile.glow` names (ABI 6), tinted with the
                 // edge's own resolved colour (the `element` rule, the
                 // only arm the host honours either) at the class's alpha
-                // times `glow.alpha_scale`: `panel_edge_glow`'s recipe,
-                // reached over `mask_quad`. Every shipped default is
-                // off; a theme opts a class in and the squares light up.
+                // times `glow.alpha_scale`: `panel_edge_glow`'s recipe.
+                // Every shipped default is off; a theme opts a class in
+                // and the squares light up.
                 if look.glow_on && look.glow_radius > 0.0 && look.glow_alpha > 0.0 {
                     let c = ColorC { a: look.glow_alpha, ..rung.edge };
-                    chamfer_glow(api, ctx, cell, cut, look.glow_radius, c);
+                    plugin_shapes::ring_glow(api, ctx, cell, CORNER_ROUND, cut, look.glow_radius, c);
                 }
             }
 
@@ -1519,83 +1506,6 @@ fn fit_name(
 /// interned in, and this side has no schema at all.
 fn recase(case: Case, s: &str) -> String {
     nacelle::ui::recase(case, s).into_owned()
-}
-
-/// A filled rectangle with its corners cut off — the toolkit's
-/// `chamfer_fill`, as three quads: the middle band and the two
-/// trapezoids the cut corners leave.
-fn chamfer_fill(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, c: ColorC) {
-    let cut = cut.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
-    let (x, y, w, h) = (r.x, r.y, r.w, r.h);
-    (api.rect)(ctx, RectC { x, y: y + cut, w, h: h - 2.0 * cut }, c);
-    let top: [f32; 8] = [x + cut, y, x + w - cut, y, x + w, y + cut, x, y + cut];
-    (api.quad)(ctx, top.as_ptr(), c);
-    let bottom: [f32; 8] =
-        [x, y + h - cut, x + w, y + h - cut, x + w - cut, y + h, x + cut, y + h];
-    (api.quad)(ctx, bottom.as_ptr(), c);
-}
-
-/// The eight points of the chamfer outline, flat, clockwise from the
-/// top-left cut. `cut = 0` collapses each corner's pair to one point.
-fn octagon(r: RectC, cut: f32) -> [f32; 16] {
-    let cut = cut.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
-    let (x, y, w, h) = (r.x, r.y, r.w, r.h);
-    [
-        x + cut, y,
-        x + w - cut, y,
-        x + w, y + cut,
-        x + w, y + h - cut,
-        x + w - cut, y + h,
-        x + cut, y + h,
-        x, y + h - cut,
-        x, y + cut,
-    ]
-}
-
-/// The ring of the same shape — a closed polyline through eight points.
-fn chamfer_frame(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, t: f32, c: ColorC) {
-    let pts = octagon(r, cut);
-    (api.polyline)(ctx, pts.as_ptr(), 8, t, c, true);
-}
-
-/// Glow OUTSIDE the ring — `DrawList::glow_ring`'s technique reached
-/// through ABI 6's `mask_quad`: the outline extruded outward by `radius`,
-/// one additive quad per segment, the soft disk's 2-texel cardinal strip
-/// laid across the extrusion (u pinned to the stretchable middle, v from
-/// the disk's peak on the path to the sprite's zero at the outer rim).
-/// The outer path is the chamfer octagon of the grown rect with the cut
-/// grown by the same radius — `Corner::inset(-radius)`, as the host grows
-/// it — so a chamfered corner glows along its diagonal and a square
-/// corner (`cut = 0`: the inner pair collapses to one point) mitres.
-/// Nothing is emitted inside the path, so the glow never tints the fill.
-fn chamfer_glow(api: &HostApi, ctx: *mut c_void, r: RectC, cut: f32, radius: f32, c: ColorC) {
-    if !(radius > 0.0) || c.a <= 0.0 {
-        return;
-    }
-    let inner = octagon(r, cut);
-    let grown = RectC {
-        x: r.x - radius,
-        y: r.y - radius,
-        w: r.w + 2.0 * radius,
-        h: r.h + 2.0 * radius,
-    };
-    let outer = octagon(grown, cut + radius);
-    // The strip's profile in the SPRITE's own space: the mask-band
-    // contract's 31..33 stretchable middle (r1 §4.2), the same numbers
-    // `glow_ring` maps into the atlas band.
-    const SU: f32 = 32.0 / 64.0;
-    const VI: f32 = 31.0 / 64.0;
-    let uv: [f32; 8] = [SU, VI, SU, VI, SU, 0.0, SU, 0.0];
-    for i in 0..8 {
-        let j = (i + 1) % 8;
-        let pts: [f32; 8] = [
-            inner[2 * i], inner[2 * i + 1],
-            inner[2 * j], inner[2 * j + 1],
-            outer[2 * j], outer[2 * j + 1],
-            outer[2 * i], outer[2 * i + 1],
-        ];
-        (api.mask_quad)(ctx, pts.as_ptr(), uv.as_ptr(), c, MASK_QUAD_ADD);
-    }
 }
 
 fn draw_folder_icon(api: &HostApi, ctx: *mut c_void, r: Rect, c: ColorC, stroke: f32) {

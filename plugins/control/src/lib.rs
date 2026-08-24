@@ -19,7 +19,7 @@
 use nacelle::ui::Case;
 use nacelle::runtime::{
     ActionC, ChromeC, ColorC, HostApi, PluginApi, RectC, StateStyleC, ABI_VERSION, ACTION_EXIT,
-    ACTION_NONE, ACTION_OPEN_SETTINGS, CORNER_CHAMFER, CORNER_ROUND, CORNER_SQUARE,
+    ACTION_NONE, ACTION_OPEN_SETTINGS,
 };
 use nacelle::widget::factory::BuiltinWidget;
 use std::ffi::c_void;
@@ -501,11 +501,7 @@ extern "C" fn draw(
         let rc = RectC { x: br.x, y: br.y, w: br.w, h: br.h };
         if api.has_ring() && skew <= 0.0 {
             let radius = t_px(api, ctx, t.corner);
-            let cs = match t_word(api, ctx, t.corner_style).as_str() {
-                "round" => CORNER_ROUND,
-                "chamfer" => CORNER_CHAMFER,
-                _ => CORNER_SQUARE,
-            };
+            let cs = nacelle::corner::code_of(&t_word(api, ctx, t.corner_style));
             // The OPAQUE plate first, as object::button lays it, so the
             // class's near-transparent idle wash rides a solid button and
             // not the panel's own bed — one button colour in every window
